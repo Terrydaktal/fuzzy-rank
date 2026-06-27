@@ -242,12 +242,6 @@ What is path-specific here:
 - basename outranking parent components
 - parent-depth-sensitive `path_position`
 - path token separators such as `/`, `\\`, `-`, `_`, `.`, and whitespace
-- scope distinctions like:
-  - basename
-  - basename token
-  - other component
-  - other component token
-  - full path
 
 This is the adapter to use for filesystem path search.
 
@@ -258,16 +252,23 @@ This is the adapter to use for filesystem path search.
 - `match_qualities`
 - `match_path_position`
 - `match_penalty`
+- `exact_match`
+- `compare_exact_path_matches`
 
-This normal path ordering is adapter-local. It does not use `ranking.rs`.
+The exact-path comparator now lives in the crate.
+Its sort-key order is:
+
+1. descending `score`
+2. `position`
+3. `structure`
+4. `path`
 
 The exact-path helpers effectively expose these keys:
 
 1. keyword matchability through `match_qualities`
 2. summed path position through `match_path_position`
 3. summed structural penalty through `match_penalty`
-
-Callers then decide how to combine those values with score/frecency.
+4. caller-provided `score`
 
 ### `path::typo`
 
@@ -284,12 +285,11 @@ The exact typo sort key order is:
 1. `distance`
 2. `operations`
 3. `ratio_milli`
-4. `scope`
-5. `position`
-6. `structure`
-7. descending `score`
-8. `path_depth`
-9. `key`
+4. `position`
+5. `structure`
+6. descending `score`
+7. `path_depth`
+8. `key`
 
 Shared versus adapter-local:
 
@@ -299,7 +299,6 @@ Shared versus adapter-local:
   - `ratio_milli`
   - the tuple ordering in `compare_path_typo_sort_keys`
 - adapter-local:
-  - `scope`
   - `position`
   - `structure`
   - `path_depth`
@@ -570,7 +569,6 @@ What is not fully shared:
 - the meaning of `position`
 - the meaning of `structure`
 - field construction
-- scope construction
 - some normal non-typo path ordering helpers
 - some metadata-specific candidate generation and matching logic
 

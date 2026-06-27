@@ -1,5 +1,3 @@
-use std::fmt::{self, Display, Formatter};
-
 use crate::core::{OperationProfile, bounded_damerau_levenshtein, max_typos};
 use crate::path::Score;
 use crate::ranking::{
@@ -10,33 +8,11 @@ use crate::token_match::{
     PositionedToken, aligned_token_distance, best_token_match, partitioned_token_distance,
 };
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
-pub enum MatchScope {
-    Basename = 0,
-    BasenameToken = 1,
-    OtherComponent = 2,
-    OtherComponentToken = 3,
-    FullPath = 4,
-}
-
-impl Display for MatchScope {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Basename => write!(f, "basename"),
-            Self::BasenameToken => write!(f, "basename-token"),
-            Self::OtherComponent => write!(f, "component"),
-            Self::OtherComponentToken => write!(f, "component-token"),
-            Self::FullPath => write!(f, "path"),
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug)]
 pub struct PathMatch<'a> {
     pub path: &'a str,
     pub distance: usize,
     pub ratio: f64,
-    pub scope: MatchScope,
     pub path_position: usize,
     pub structure: usize,
     pub operations: OperationProfile,
@@ -45,12 +21,11 @@ pub struct PathMatch<'a> {
 }
 
 impl<'a> PathMatch<'a> {
-    fn sort_key(&self) -> PathTypoSortKey<'_, MatchScope> {
+    fn sort_key(&self) -> PathTypoSortKey<'_> {
         PathTypoSortKey {
             distance: self.distance,
             operations: self.operations,
             ratio_milli: ratio_milli(self.distance, self.compared_len()),
-            scope: self.scope,
             position: self.path_position,
             structure: self.structure,
             score: self.score,
@@ -248,25 +223,19 @@ fn best_match_inner<'a>(
         path_depth,
     };
 
-    let mut best = candidate_for_text(&ctx, basename, MatchScope::Basename, 0);
+    let mut best = candidate_for_text(&ctx, basename, 0);
+    update_best(&mut best, candidate_for_token_sequence(&ctx, basename, 0));
     update_best(
         &mut best,
-        candidate_for_token_sequence(&ctx, basename, MatchScope::Basename, 0),
+        candidate_for_compound_component(&ctx, basename, 0),
     );
     update_best(
         &mut best,
-        candidate_for_compound_component(&ctx, basename, MatchScope::Basename, 0),
-    );
-    update_best(
-        &mut best,
-        candidate_for_component_sequence(&ctx, &components, MatchScope::OtherComponent),
+        candidate_for_component_sequence(&ctx, &components),
     );
 
     for token in split_path_tokens(basename) {
-        update_best(
-            &mut best,
-            candidate_for_text(&ctx, token, MatchScope::BasenameToken, 0),
-        );
+        update_best(&mut best, candidate_for_text(&ctx, token, 0));
     }
 
     for (idx, component) in components[..components.len().saturating_sub(1)]
@@ -276,28 +245,20 @@ fn best_match_inner<'a>(
         let path_position = basename_idx - idx;
         update_best(
             &mut best,
-            candidate_for_text(&ctx, component, MatchScope::OtherComponent, path_position),
+            candidate_for_text(&ctx, component, path_position),
         );
         update_best(
             &mut best,
-            candidate_for_compound_component(
-                &ctx,
-                component,
-                MatchScope::OtherComponent,
-                path_position,
-            ),
+            candidate_for_compound_component(&ctx, component, path_position),
         );
         for token in split_path_tokens(component) {
-            update_best(
-                &mut best,
-                candidate_for_text(&ctx, token, MatchScope::OtherComponentToken, path_position),
-            );
+            update_best(&mut best, candidate_for_text(&ctx, token, path_position));
         }
     }
 
     update_best(
         &mut best,
-        candidate_for_text(&ctx, &lower_path, MatchScope::FullPath, basename_idx + 1),
+        candidate_for_text(&ctx, &lower_path, basename_idx + 1),
     );
     best
 }
@@ -330,12 +291,9 @@ fn best_basename_match_inner<'a>(
         limit,
         path_depth,
     };
-    let mut best = candidate_for_text(&ctx, basename, MatchScope::Basename, 0);
+    let mut best = candidate_for_text(&ctx, basename, 0);
     for token in split_path_tokens(basename) {
-        update_best(
-            &mut best,
-            candidate_for_text(&ctx, token, MatchScope::BasenameToken, 0),
-        );
+        update_best(&mut best, candidate_for_text(&ctx, token, 0));
     }
     best.filter(|candidate| candidate.distance <= full_limit)
 }
@@ -362,7 +320,7 @@ fn best_match_single_token<'a>(
         path_depth,
     };
 
-    let mut best = candidate_for_text(&ctx, basename, MatchScope::Basename, 0);
+    let mut best = candidate_for_text(&ctx, basename, 0);
     if best
         .as_ref()
         .is_some_and(|candidate| candidate.distance <= 1)
@@ -370,10 +328,7 @@ fn best_match_single_token<'a>(
         return best;
     }
     for token in split_path_tokens(basename) {
-        update_best(
-            &mut best,
-            candidate_for_text(&ctx, token, MatchScope::BasenameToken, 0),
-        );
+        update_best(&mut best, candidate_for_text(&ctx, token, 0));
     }
     if best
         .as_ref()
@@ -389,19 +344,16 @@ fn best_match_single_token<'a>(
         let path_position = basename_idx - idx;
         update_best(
             &mut best,
-            candidate_for_text(&ctx, component, MatchScope::OtherComponent, path_position),
+            candidate_for_text(&ctx, component, path_position),
         );
         for token in split_path_tokens(component) {
-            update_best(
-                &mut best,
-                candidate_for_text(&ctx, token, MatchScope::OtherComponentToken, path_position),
-            );
+            update_best(&mut best, candidate_for_text(&ctx, token, path_position));
         }
     }
 
     update_best(
         &mut best,
-        candidate_for_text(&ctx, lower_path, MatchScope::FullPath, basename_idx + 1),
+        candidate_for_text(&ctx, lower_path, basename_idx + 1),
     );
     best
 }
@@ -429,7 +381,6 @@ struct MatchContext<'a, 'q> {
 fn candidate_for_text<'a>(
     ctx: &MatchContext<'a, '_>,
     candidate: &str,
-    scope: MatchScope,
     path_position: usize,
 ) -> Option<PathMatch<'a>> {
     if candidate.is_empty() {
@@ -448,13 +399,18 @@ fn candidate_for_text<'a>(
         return None;
     }
 
+    let (position_rank, structure) = if split_path_tokens(ctx.query).len() == 1 {
+        token_relative_match_shape(ctx.query, candidate, ctx.limit).unwrap_or((0, 0))
+    } else {
+        (0, 0)
+    };
+
     Some(PathMatch {
         path: ctx.path,
         distance,
         ratio,
-        scope,
-        path_position: path_position * 3,
-        structure: 0,
+        path_position: path_position * 3 + position_rank,
+        structure,
         operations,
         score: ctx.score,
         path_depth: ctx.path_depth,
@@ -464,7 +420,6 @@ fn candidate_for_text<'a>(
 fn candidate_for_token_sequence<'a>(
     ctx: &MatchContext<'a, '_>,
     candidate: &str,
-    scope: MatchScope,
     path_position: usize,
 ) -> Option<PathMatch<'a>> {
     let query_tokens = split_path_tokens(ctx.query);
@@ -498,7 +453,6 @@ fn candidate_for_token_sequence<'a>(
         path: ctx.path,
         distance,
         ratio,
-        scope,
         path_position: path_metric,
         structure,
         operations,
@@ -510,7 +464,6 @@ fn candidate_for_token_sequence<'a>(
 fn candidate_for_compound_component<'a>(
     ctx: &MatchContext<'a, '_>,
     candidate: &str,
-    scope: MatchScope,
     path_position: usize,
 ) -> Option<PathMatch<'a>> {
     let query_tokens = split_path_tokens(ctx.query);
@@ -530,7 +483,6 @@ fn candidate_for_compound_component<'a>(
         path: ctx.path,
         distance,
         ratio,
-        scope,
         path_position: path_position * 3 * query_tokens.len() + position_metric,
         structure,
         operations,
@@ -542,7 +494,6 @@ fn candidate_for_compound_component<'a>(
 fn candidate_for_component_sequence<'a>(
     ctx: &MatchContext<'a, '_>,
     components: &[&str],
-    scope: MatchScope,
 ) -> Option<PathMatch<'a>> {
     let query_tokens = split_path_tokens(ctx.query);
     if query_tokens.len() < 2 {
@@ -578,7 +529,6 @@ fn candidate_for_component_sequence<'a>(
         path: ctx.path,
         distance,
         ratio,
-        scope,
         path_position,
         structure,
         operations,
@@ -593,6 +543,29 @@ fn path_components(path: &str) -> Vec<&str> {
         .collect()
 }
 
+fn token_relative_match_shape(
+    query: &str,
+    candidate: &str,
+    limit: usize,
+) -> Option<(usize, usize)> {
+    let mut best = None;
+    for token in split_path_tokens(candidate) {
+        let Some((_, penalty, position_rank, _, _)) = best_token_match(query, token, limit) else {
+            continue;
+        };
+        let shape = (position_rank, penalty);
+        best = Some(match best {
+            None => shape,
+            Some(current) if shape < current => shape,
+            Some(current) => current,
+        });
+        if best == Some((0, 0)) {
+            break;
+        }
+    }
+    best
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -600,21 +573,25 @@ mod tests {
     #[test]
     fn typo_matches_basename() {
         let candidate = best_match("/home/lewis/xfce4-terminal", 10.0, "xfce4-terinal").unwrap();
-        assert_eq!(candidate.scope, MatchScope::Basename);
         assert_eq!(candidate.distance, 1);
+    }
+
+    #[test]
+    fn single_token_component_matches_use_token_relative_position() {
+        let candidate = best_match("/home/lewis/tasks/config", 10.0, "onfig").unwrap();
+        assert_eq!(candidate.path_position, 1);
+        assert_eq!(candidate.structure, 1);
     }
 
     #[test]
     fn basename_token_prefixes_do_not_count_as_typos() {
         let candidate = best_match("/home/lewis/xfce4-terminal", 10.0, "xzfce-ter").unwrap();
-        assert_eq!(candidate.scope, MatchScope::Basename);
         assert_eq!(candidate.distance, 1);
     }
 
     #[test]
     fn spaced_query_tokens_can_match_single_compound_token() {
         let candidate = best_match("/home/lewis/applicationlauncher", 10.0, "app laucnh").unwrap();
-        assert_eq!(candidate.scope, MatchScope::Basename);
         assert_eq!(candidate.path_position, 0);
         assert_eq!(candidate.distance, 1);
         assert!(candidate.structure > 0);
@@ -623,7 +600,6 @@ mod tests {
     #[test]
     fn missing_space_query_can_match_single_compound_token() {
         let candidate = best_match("/home/lewis/applicationlauncher", 10.0, "applaunch").unwrap();
-        assert_eq!(candidate.scope, MatchScope::Basename);
         assert_eq!(candidate.path_position, 0);
         assert_eq!(candidate.distance, 1);
         assert!(candidate.structure > 0);
@@ -632,7 +608,6 @@ mod tests {
     #[test]
     fn spaced_query_tokens_can_match_component_sequence() {
         let candidate = best_match("/home/lewis/tasks/config", 10.0, "tasks cinfig").unwrap();
-        assert_eq!(candidate.scope, MatchScope::OtherComponent);
         assert_eq!(candidate.path_position, 3);
         assert_eq!(candidate.distance, 1);
         assert_eq!(candidate.structure, 0);
@@ -664,7 +639,6 @@ mod tests {
             "tasks cinfig",
         )
         .unwrap();
-        assert_eq!(candidate.scope, MatchScope::OtherComponent);
         assert_eq!(candidate.path_position, 4);
         assert_eq!(candidate.distance, 1);
         assert_eq!(candidate.structure, 13);
@@ -678,7 +652,6 @@ mod tests {
             "ap laun",
         )
         .unwrap();
-        assert_eq!(candidate.scope, MatchScope::OtherComponent);
         assert_eq!(candidate.distance, 0);
         assert_eq!(candidate.path_position, 12);
     }
@@ -697,21 +670,18 @@ mod tests {
     #[test]
     fn long_queries_use_half_length_typo_limit() {
         let candidate = best_match("/home/lewis/xfce4-terminal", 10.0, "xgce4-tremriianl").unwrap();
-        assert_eq!(candidate.scope, MatchScope::Basename);
         assert_eq!(candidate.distance, 5);
     }
 
     #[test]
     fn typo_matches_component_token() {
         let candidate = best_match("/home/lewis/xfce4-terminal", 10.0, "x4ce4").unwrap();
-        assert_eq!(candidate.scope, MatchScope::BasenameToken);
         assert_eq!(candidate.distance, 1);
     }
 
     #[test]
     fn five_character_queries_allow_half_length_typos() {
         let candidate = best_match("/home/lewis/xfce4-terminal", 10.0, "zgce4").unwrap();
-        assert_eq!(candidate.scope, MatchScope::BasenameToken);
         assert_eq!(candidate.distance, 2);
         assert_eq!(candidate.ratio, 0.4);
     }
@@ -761,7 +731,6 @@ mod tests {
         ];
         sort_matches(&mut matches);
         assert_eq!(matches[0].path, "/home/lewis/xfce4-terminal");
-        assert_eq!(matches[0].scope, MatchScope::BasenameToken);
     }
 
     #[test]
@@ -775,7 +744,7 @@ mod tests {
     }
 
     #[test]
-    fn frecency_breaks_ties_after_distance_ratio_and_scope() {
+    fn frecency_breaks_ties_after_distance_ratio_position_and_structure() {
         let mut matches = vec![
             best_match("/tmp/xfce4-terminal", 1.0, "x4ce4").unwrap(),
             best_match("/var/xfce4-utility", 100.0, "x4ce4").unwrap(),
@@ -783,7 +752,6 @@ mod tests {
         sort_matches(&mut matches);
         assert_eq!(matches[0].path, "/var/xfce4-utility");
         assert_eq!(matches[0].distance, matches[1].distance);
-        assert_eq!(matches[0].scope, matches[1].scope);
         assert_eq!(matches[0].ratio, matches[1].ratio);
     }
 }

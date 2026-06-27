@@ -210,11 +210,10 @@ pub fn ratio_milli(distance: usize, compared_len: usize) -> usize {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct PathTypoSortKey<'a, Scope> {
+pub struct PathTypoSortKey<'a> {
     pub distance: usize,
     pub operations: OperationProfile,
     pub ratio_milli: usize,
-    pub scope: Scope,
     pub position: usize,
     pub structure: usize,
     pub score: f64,
@@ -222,15 +221,14 @@ pub struct PathTypoSortKey<'a, Scope> {
     pub key: &'a str,
 }
 
-pub fn compare_path_typo_sort_keys<Scope: Ord>(
-    left: &PathTypoSortKey<'_, Scope>,
-    right: &PathTypoSortKey<'_, Scope>,
+pub fn compare_path_typo_sort_keys(
+    left: &PathTypoSortKey<'_>,
+    right: &PathTypoSortKey<'_>,
 ) -> Ordering {
     left.distance
         .cmp(&right.distance)
         .then_with(|| left.operations.cmp(&right.operations))
         .then_with(|| left.ratio_milli.cmp(&right.ratio_milli))
-        .then_with(|| left.scope.cmp(&right.scope))
         .then_with(|| left.position.cmp(&right.position))
         .then_with(|| left.structure.cmp(&right.structure))
         .then_with(|| right.score.total_cmp(&left.score))
@@ -238,12 +236,11 @@ pub fn compare_path_typo_sort_keys<Scope: Ord>(
         .then_with(|| left.key.cmp(right.key))
 }
 
-pub fn path_typo_keys_are_ambiguous<Scope: PartialEq>(
-    left: &PathTypoSortKey<'_, Scope>,
-    right: &PathTypoSortKey<'_, Scope>,
+pub fn path_typo_keys_are_ambiguous(
+    left: &PathTypoSortKey<'_>,
+    right: &PathTypoSortKey<'_>,
 ) -> bool {
     left.distance == right.distance
-        && left.scope == right.scope
         && left.position == right.position
         && left.structure == right.structure
         && left.ratio_milli.abs_diff(right.ratio_milli) <= 20
