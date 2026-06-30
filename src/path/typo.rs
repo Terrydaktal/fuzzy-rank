@@ -625,7 +625,8 @@ mod tests {
                 OperationProfile {
                     substitutions: 1,
                     insert_delete: 0,
-                    transpositions: 0
+                    transpositions: 0,
+                    keyboard_distance: 2,
                 },
             ))
         );

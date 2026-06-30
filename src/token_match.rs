@@ -137,6 +137,8 @@ fn partitioned_token_distance_impl(
                     substitutions: operations.substitutions + tail_operations.substitutions,
                     insert_delete: operations.insert_delete + tail_operations.insert_delete,
                     transpositions: operations.transpositions + tail_operations.transpositions,
+                    keyboard_distance: operations.keyboard_distance
+                        + tail_operations.keyboard_distance,
                 },
             )
         };

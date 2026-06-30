@@ -9,6 +9,7 @@ pub struct StructuralRank {
     pub token_index: usize,
     pub token_span_delta: usize,
     pub start_idx: usize,
+    pub matched_char_len: usize,
     pub field_len: usize,
 }
 
@@ -43,12 +44,14 @@ impl PartialOrd for StructuralRank {
 pub struct DistanceRank {
     pub distance: usize,
     pub ratio_milli: usize,
+    pub keyboard_distance: usize,
     pub field_priority: u8,
     pub variant_scope: u8,
     pub position_class: u8,
     pub token_index: usize,
     pub token_span_delta: usize,
     pub start_idx: usize,
+    pub matched_char_len: usize,
     pub field_len: usize,
 }
 
@@ -57,6 +60,7 @@ impl Ord for DistanceRank {
         (
             self.distance,
             self.ratio_milli,
+            self.keyboard_distance,
             self.field_priority,
             self.variant_scope,
             self.position_class,
@@ -68,6 +72,7 @@ impl Ord for DistanceRank {
             .cmp(&(
                 other.distance,
                 other.ratio_milli,
+                other.keyboard_distance,
                 other.field_priority,
                 other.variant_scope,
                 other.position_class,
@@ -94,6 +99,7 @@ pub struct AbbreviationRank {
     pub gap_span: usize,
     pub gap_count: usize,
     pub start_idx: usize,
+    pub matched_char_len: usize,
     pub field_len: usize,
 }
 
@@ -136,6 +142,16 @@ pub enum SearchRank {
     Typo(DistanceRank),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MatchProvenance {
+    pub field_priority: u8,
+    pub variant_scope: Option<u8>,
+    pub token_index: usize,
+    pub start_idx: usize,
+    pub matched_char_len: usize,
+    pub field_len: usize,
+}
+
 impl Ord for SearchRank {
     fn cmp(&self, other: &Self) -> Ordering {
         match (self, other) {
@@ -156,6 +172,37 @@ impl Ord for SearchRank {
 impl PartialOrd for SearchRank {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
+    }
+}
+
+impl SearchRank {
+    pub fn provenance(&self) -> MatchProvenance {
+        match self {
+            SearchRank::Structural(rank) => MatchProvenance {
+                field_priority: rank.field_priority,
+                variant_scope: None,
+                token_index: rank.token_index,
+                start_idx: rank.start_idx,
+                matched_char_len: rank.matched_char_len,
+                field_len: rank.field_len,
+            },
+            SearchRank::Abbreviation(rank) => MatchProvenance {
+                field_priority: rank.field_priority,
+                variant_scope: Some(rank.variant_scope),
+                token_index: rank.token_index,
+                start_idx: rank.start_idx,
+                matched_char_len: rank.matched_char_len,
+                field_len: rank.field_len,
+            },
+            SearchRank::Fuzzy(rank) | SearchRank::Typo(rank) => MatchProvenance {
+                field_priority: rank.field_priority,
+                variant_scope: Some(rank.variant_scope),
+                token_index: rank.token_index,
+                start_idx: rank.start_idx,
+                matched_char_len: rank.matched_char_len,
+                field_len: rank.field_len,
+            },
+        }
     }
 }
 

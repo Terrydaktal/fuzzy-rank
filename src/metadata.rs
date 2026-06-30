@@ -1,7 +1,9 @@
+use crate::core::keyboard_substitution_cost;
 use crate::ranking::{
     AbbreviationRank, DistanceRank, SearchRank, StructuralRank, compare_search_results, ratio_milli,
 };
 use crate::text::{normalize_compact_alnum, split_search_tokens, to_lowercase};
+use std::cmp::Ordering;
 
 pub type Score = f64;
 
@@ -31,12 +33,9 @@ pub struct MetadataQuery {
 
 impl MetadataQuery {
     pub fn new(query: &str) -> Option<Self> {
-        let query = query.trim();
-        if query.is_empty() {
-            return None;
-        }
+        let query = normalize_metadata_query(query)?;
         Some(Self {
-            query: query.to_string(),
+            query,
             allow_typo: false,
         })
     }
@@ -59,6 +58,20 @@ impl MetadataQuery {
                 .or_else(|| best_fuzzy_rank(&self.query, candidate.fields).map(SearchRank::Fuzzy))
         }
     }
+}
+
+fn normalize_metadata_query(query: &str) -> Option<String> {
+    let lowered = to_lowercase(query.trim());
+    if lowered.is_empty() {
+        return None;
+    }
+
+    let tokens = split_search_tokens(&lowered);
+    if tokens.is_empty() {
+        return None;
+    }
+
+    Some(tokens.join(" "))
 }
 
 pub fn sort_matches(matches: &mut [(MetadataCandidate<'_>, SearchRank)]) {
@@ -100,13 +113,42 @@ pub fn dedup_push_search_field<'a>(
     });
 }
 
-fn fuzzy_match_details(query: &str, target: &str) -> Option<(usize, usize)> {
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct MetadataEditCost {
+    distance: usize,
+    keyboard_distance: usize,
+}
+
+impl MetadataEditCost {
+    fn infinite(limit: usize) -> Self {
+        Self {
+            distance: limit + 1,
+            keyboard_distance: usize::MAX / 4,
+        }
+    }
+}
+
+impl Ord for MetadataEditCost {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.distance
+            .cmp(&other.distance)
+            .then_with(|| self.keyboard_distance.cmp(&other.keyboard_distance))
+    }
+}
+
+impl PartialOrd for MetadataEditCost {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+fn fuzzy_match_details(query: &str, target: &str) -> Option<(usize, usize, usize)> {
     let query_lower = to_lowercase(query);
     let target_lower = to_lowercase(target);
 
     let q_len = query_lower.chars().count();
     if q_len == 0 {
-        return Some((0, 0));
+        return Some((0, 0, 0));
     }
 
     let t_len = target_lower.chars().count();
@@ -116,24 +158,46 @@ fn fuzzy_match_details(query: &str, target: &str) -> Option<(usize, usize)> {
         return None;
     }
 
-    let inf = limit + 1;
     let query_chars: Vec<char> = query_lower.chars().collect();
     let target_chars: Vec<char> = target_lower.chars().collect();
 
+    let inf = MetadataEditCost::infinite(limit);
     let mut prev_prev = vec![inf; t_len + 1];
-    let mut prev = vec![0; t_len + 1];
+    let mut prev = vec![MetadataEditCost::default(); t_len + 1];
+    for cell in prev.iter_mut() {
+        *cell = MetadataEditCost {
+            distance: 0,
+            keyboard_distance: 0,
+        };
+    }
     let mut curr = vec![inf; t_len + 1];
 
     for i in 1..=q_len {
         curr.fill(inf);
-        curr[0] = i;
+        curr[0] = MetadataEditCost {
+            distance: i,
+            keyboard_distance: i,
+        };
 
         let mut row_min = inf;
         for j in 1..=t_len {
-            let cost = usize::from(query_chars[i - 1] != target_chars[j - 1]);
-            let deletion = prev[j] + 1;
-            let insertion = curr[j - 1] + 1;
-            let substitution = prev[j - 1] + cost;
+            let deletion = MetadataEditCost {
+                distance: prev[j].distance + 1,
+                keyboard_distance: prev[j].keyboard_distance + 1,
+            };
+            let insertion = MetadataEditCost {
+                distance: curr[j - 1].distance + 1,
+                keyboard_distance: curr[j - 1].keyboard_distance + 1,
+            };
+            let substitution = if query_chars[i - 1] == target_chars[j - 1] {
+                prev[j - 1]
+            } else {
+                MetadataEditCost {
+                    distance: prev[j - 1].distance + 1,
+                    keyboard_distance: prev[j - 1].keyboard_distance
+                        + keyboard_substitution_cost(query_chars[i - 1], target_chars[j - 1]),
+                }
+            };
             let mut cell = deletion.min(insertion).min(substitution);
 
             if i > 1
@@ -141,14 +205,17 @@ fn fuzzy_match_details(query: &str, target: &str) -> Option<(usize, usize)> {
                 && query_chars[i - 1] == target_chars[j - 2]
                 && query_chars[i - 2] == target_chars[j - 1]
             {
-                cell = cell.min(prev_prev[j - 2] + 1);
+                cell = cell.min(MetadataEditCost {
+                    distance: prev_prev[j - 2].distance + 1,
+                    keyboard_distance: prev_prev[j - 2].keyboard_distance,
+                });
             }
 
             curr[j] = cell;
             row_min = row_min.min(cell);
         }
 
-        if row_min > limit {
+        if row_min.distance > limit {
             return None;
         }
 
@@ -156,17 +223,18 @@ fn fuzzy_match_details(query: &str, target: &str) -> Option<(usize, usize)> {
         std::mem::swap(&mut prev, &mut curr);
     }
 
-    let mut min_distance = inf;
+    let mut min_cost = inf;
     let mut best_end_idx = 0;
     let search_start = q_len.saturating_sub(limit).max(1);
     for (j, value) in prev.iter().enumerate().take(t_len + 1).skip(search_start) {
-        if *value < min_distance {
-            min_distance = *value;
+        if *value < min_cost {
+            min_cost = *value;
             best_end_idx = j;
         }
     }
 
-    (min_distance <= limit).then_some((min_distance, best_end_idx.saturating_sub(q_len)))
+    (min_cost.distance <= limit)
+        .then_some((min_cost.distance, min_cost.keyboard_distance, best_end_idx.saturating_sub(q_len)))
 }
 
 fn is_search_token_separator(c: char) -> bool {
@@ -264,6 +332,7 @@ fn best_structural_rank(query: &str, fields: &[SearchField<'_>]) -> Option<Struc
                 token_index,
                 token_span_delta,
                 start_idx,
+                matched_char_len: query_len,
                 field_len,
             };
             if best_rank.as_ref().is_none_or(|current| rank < *current) {
@@ -368,6 +437,7 @@ fn best_abbreviation_rank(query: &str, fields: &[SearchField<'_>]) -> Option<Abb
                 gap_span,
                 gap_count,
                 start_idx,
+                matched_char_len: matched_span,
                 field_len,
             };
             if best_rank.as_ref().is_none_or(|current| rank < *current) {
@@ -413,7 +483,7 @@ fn best_fuzzy_rank(query: &str, fields: &[SearchField<'_>]) -> Option<DistanceRa
         }
 
         for (variant_scope, candidate_query, candidate_target) in candidates {
-            let Some((distance, start_idx)) =
+            let Some((distance, keyboard_distance, start_idx)) =
                 fuzzy_match_details(&candidate_query, &candidate_target)
             else {
                 continue;
@@ -430,12 +500,14 @@ fn best_fuzzy_rank(query: &str, fields: &[SearchField<'_>]) -> Option<DistanceRa
             let rank = DistanceRank {
                 distance,
                 ratio_milli,
+                keyboard_distance,
                 field_priority: field.priority,
                 variant_scope,
                 position_class,
                 token_index,
                 token_span_delta,
                 start_idx,
+                matched_char_len: matched_len,
                 field_len,
             };
             if best_rank.as_ref().is_none_or(|current| rank < *current) {
@@ -481,7 +553,7 @@ fn best_typo_rank(query: &str, fields: &[SearchField<'_>]) -> Option<DistanceRan
         }
 
         for (variant_scope, candidate_query, candidate_target) in candidates {
-            let Some((distance, start_idx)) =
+            let Some((distance, keyboard_distance, start_idx)) =
                 fuzzy_match_details(&candidate_query, &candidate_target)
             else {
                 continue;
@@ -498,12 +570,14 @@ fn best_typo_rank(query: &str, fields: &[SearchField<'_>]) -> Option<DistanceRan
             let rank = DistanceRank {
                 distance,
                 ratio_milli,
+                keyboard_distance,
                 field_priority: field.priority,
                 variant_scope,
                 position_class,
                 token_index,
                 token_span_delta,
                 start_idx,
+                matched_char_len: matched_len,
                 field_len,
             };
             if best_rank.as_ref().is_none_or(|current| rank < *current) {
@@ -626,5 +700,87 @@ mod tests {
         ];
         sort_matches(&mut matches);
         assert_eq!(matches[0].0.key, "b");
+    }
+
+    #[test]
+    fn trailing_punctuation_is_ignored_in_query() {
+        let fields = [SearchField {
+            priority: 0,
+            value: "film - codex - ~/Dev/film - Terminal",
+        }];
+        let candidate = MetadataCandidate {
+            key: "window:film",
+            fields: &fields,
+            score: 1.0,
+        };
+        let plain = MetadataQuery::new("fil")
+            .unwrap()
+            .with_typo_fallback(true)
+            .search_rank(candidate)
+            .unwrap();
+        let punctuated = MetadataQuery::new("fil,")
+            .unwrap()
+            .with_typo_fallback(true)
+            .search_rank(candidate)
+            .unwrap();
+        assert_eq!(plain, punctuated);
+    }
+
+    #[test]
+    fn normalized_punctuation_query_beats_unrelated_fish_window() {
+        let film_fields = [SearchField {
+            priority: 0,
+            value: "film - codex - ~/Dev/film - Terminal",
+        }];
+        let fish_fields = [SearchField {
+            priority: 0,
+            value: "~ - fish - Terminal",
+        }];
+        let film = MetadataCandidate {
+            key: "window:film",
+            fields: &film_fields,
+            score: 1.0,
+        };
+        let fish = MetadataCandidate {
+            key: "window:fish",
+            fields: &fish_fields,
+            score: 1.0,
+        };
+        let query = MetadataQuery::new("fil,").unwrap().with_typo_fallback(true);
+        let mut matches = vec![
+            (film, query.search_rank(film).unwrap()),
+            (fish, query.search_rank(fish).unwrap()),
+        ];
+        sort_matches(&mut matches);
+        assert_eq!(matches[0].0.key, "window:film");
+    }
+
+    #[test]
+    fn nearby_key_typo_beats_distant_key_typo_for_metadata() {
+        let near_fields = [SearchField {
+            priority: 0,
+            value: "film - codex - ~/Dev/film - Terminal",
+        }];
+        let far_fields = [SearchField {
+            priority: 0,
+            value: "pilm - codex - ~/Dev/pilm - Terminal",
+        }];
+        let near = MetadataCandidate {
+            key: "window:film",
+            fields: &near_fields,
+            score: 1.0,
+        };
+        let far = MetadataCandidate {
+            key: "window:pilm",
+            fields: &far_fields,
+            score: 1.0,
+        };
+        let query = MetadataQuery::new("gilm").unwrap().with_typo_fallback(true);
+        let mut matches = vec![
+            (near, query.search_rank(near).unwrap()),
+            (far, query.search_rank(far).unwrap()),
+        ];
+        sort_matches(&mut matches);
+        assert_eq!(matches[0].0.key, "window:film");
     }
 }
