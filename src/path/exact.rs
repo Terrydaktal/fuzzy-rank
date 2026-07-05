@@ -16,8 +16,9 @@ pub enum MatchQuality {
 pub struct ExactPathMatch<'a> {
     pub path: &'a str,
     pub score: Score,
+    pub insertions: usize,
     pub position: usize,
-    pub structure: usize,
+    pub path_depth: usize,
 }
 
 pub fn exact_match<'a>(
@@ -28,8 +29,9 @@ pub fn exact_match<'a>(
     Some(ExactPathMatch {
         path,
         score,
+        insertions: match_penalty(path, keywords)?,
         position: match_path_position(path, keywords)?,
-        structure: match_penalty(path, keywords)?,
+        path_depth: path_depth(path),
     })
 }
 
@@ -40,8 +42,9 @@ pub fn compare_exact_path_matches(
     right
         .score
         .total_cmp(&left.score)
+        .then_with(|| left.insertions.cmp(&right.insertions))
         .then_with(|| left.position.cmp(&right.position))
-        .then_with(|| left.structure.cmp(&right.structure))
+        .then_with(|| left.path_depth.cmp(&right.path_depth))
         .then_with(|| left.path.cmp(right.path))
 }
 
@@ -147,6 +150,10 @@ fn match_quality(path: &str, idx: usize, keyword_len: usize) -> MatchQuality {
     }
 }
 
+fn path_depth(path: &str) -> usize {
+    path.chars().filter(|ch| path::is_separator(*ch)).count()
+}
+
 fn match_position_penalty(path: &str, idx: usize, keyword_len: usize) -> usize {
     let end = idx + keyword_len;
     let token_start = path[..idx]
@@ -211,20 +218,20 @@ mod tests {
     }
 
     #[test]
-    fn compare_exact_path_matches_prefers_score_then_position_then_structure() {
+    fn compare_exact_path_matches_prefers_score_then_insertions_then_position_then_path_depth() {
         let keywords = ["tasks", "onfig"];
         let keywords = keywords.into_iter().map(str::to_string).collect::<Vec<_>>();
-        let lower_structure = exact_match("/home/lewis/tasks/config", &keywords, 10.0).unwrap();
-        let higher_structure =
+        let lower_insertions = exact_match("/home/lewis/tasks/config", &keywords, 10.0).unwrap();
+        let higher_insertions =
             exact_match("/home/lewis/tasks/redragonmouseconfig", &keywords, 10.0).unwrap();
         let higher_score = exact_match("/home/lewis/tasks/config", &keywords, 20.0).unwrap();
 
         assert_eq!(
-            compare_exact_path_matches(higher_score, lower_structure),
+            compare_exact_path_matches(higher_score, lower_insertions),
             std::cmp::Ordering::Less
         );
         assert_eq!(
-            compare_exact_path_matches(lower_structure, higher_structure),
+            compare_exact_path_matches(lower_insertions, higher_insertions),
             std::cmp::Ordering::Less
         );
     }

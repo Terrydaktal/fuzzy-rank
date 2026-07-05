@@ -13,7 +13,7 @@ It is structured as:
 The goal is to keep the hard parts implemented once, while still allowing different match semantics for:
 
 - filesystem paths
-- shell commands
+- shell command history
 - application and window metadata
 - chat and message text
 
@@ -33,7 +33,7 @@ fuzzy-rank/
     ├── path/
     │   ├── exact.rs
     │   └── typo.rs
-    ├── command.rs
+    ├── command_history.rs
     ├── message.rs
     └── metadata.rs
 ```
@@ -51,14 +51,14 @@ These modules are intended to be reused by all adapters:
 - `text`
 - `token_match`
 
-They own the generic machinery. They do not own path-specific, command-specific, or metadata-specific policy.
+They own the generic machinery. They do not own path-specific, command-history-specific, or metadata-specific policy.
 
 ### Adapter layers
 
 These modules are domain-specific adapters:
 
 - `path`
-- `command`
+- `command_history`
 - `message`
 - `metadata`
 
@@ -86,7 +86,8 @@ Owns the low-level edit-distance engine:
 
 This module is responsible for:
 
-- counting substitutions, insert/delete operations, and transpositions
+- computing bounded intended-to-typed Damerau-Levenshtein distance
+- tracking weighted typo-likelihood penalties for substitutions, insertions, deletions, and transpositions
 - supporting bounded early-exit behavior
 - providing a consistent raw typo distance to all adapters
 
@@ -94,7 +95,7 @@ This module does not know anything about:
 
 - paths
 - basename vs dirname
-- command argv position
+- shell-history command-token policy
 - app/window field priority
 - frecency calculation
 
@@ -133,7 +134,6 @@ This module does not decide:
 Owns shared text preparation helpers:
 
 - lowercasing
-- missing-space separator variant generation
 - token splitting
 - compact alphanumeric normalization
 - cheap signal/prefilter checks
@@ -141,7 +141,6 @@ Owns shared text preparation helpers:
 Current helpers include:
 
 - `to_lowercase`
-- `separator_variants`
 - `token_has_signal`
 - `has_query_signal`
 - `split_whitespace_tokens`
@@ -177,15 +176,15 @@ The following behavior remains adapter-specific on purpose.
 
 ### Frecency calculation
 
-This crate accepts numeric `score` inputs, but does not compute them.
+This crate accepts caller-owned priority inputs, but does not compute them.
 
 Examples:
 
 - zoxide computes directory frecency itself, then passes `score` into `path`
-- a shell-history consumer should compute command history frecency itself, then pass `score` into `command`
+- a shell-history consumer should compute command history recency itself, then pass `recency` into `command_history`
 - an application launcher should compute app/window recency or launch counts itself, then pass `score` into `metadata`
 
-The crate uses scores in ranking, but it does not define one universal frecency model.
+The crate uses those caller-owned priorities in ranking, but it does not define one universal frecency or recency model.
 
 ### Candidate extraction
 
@@ -196,7 +195,7 @@ Each caller is responsible for:
 - loading its own data
 - building candidates
 - deciding which fields to expose
-- deciding the score value for each candidate
+- deciding the priority value for each candidate
 
 ### Domain semantics
 
@@ -205,7 +204,7 @@ The adapters intentionally do not share exact semantics, because the data is dif
 Examples:
 
 - path search cares about basename vs parent components
-- command search cares about executable vs later argv tokens
+- command-history search cares about typo quality over command tokens, then recency
 - message search cares about phrase continuity and token coverage
 - metadata search cares about field priority such as title vs class vs description
 
@@ -259,16 +258,22 @@ The exact-path comparator now lives in the crate.
 Its sort-key order is:
 
 1. descending `score`
-2. `position`
-3. `structure`
-4. `path`
+2. `insertions`
+3. `position`
+4. `path_depth`
+5. `path`
 
 The exact-path helpers effectively expose these keys:
 
 1. keyword matchability through `match_qualities`
-2. summed path position through `match_path_position`
-3. summed structural penalty through `match_penalty`
-4. caller-provided `score`
+2. contiguous unmatched token slack through `match_penalty`
+3. summed path position through `match_path_position`
+4. path depth through `exact_match`
+5. caller-provided `score`
+
+For exact-path ordering, `insertions` is the contiguous unmatched character count around the matched
+keyword span(s) inside the chosen token/component. That makes `application` rank closer to
+`applications` than to `applicationlauncher`.
 
 ### `path::typo`
 
@@ -282,79 +287,106 @@ The exact-path helpers effectively expose these keys:
 Typo path matching uses the shared `PathTypoSortKey` comparator from `ranking.rs`.
 The exact typo sort key order is:
 
-1. `distance`
-2. `operations`
-3. `ratio_milli`
-4. `position`
-5. descending `score`
-6. `structure`
-7. `path_depth`
-8. `key`
+1. weighted core typo cost
+2. `position`
+3. descending `score`
+4. `internal_breaks`
+5. `insertions`
+6. `path_depth`
+7. `key`
+
+Here path typo ranking splits the operation profile into two stages between raw edit count and path-specific position. It is directional:
+
+- candidate path token/component = intended text
+- query text = what the user actually typed
+
+So omitted separators/characters are treated as deletions from the intended candidate, while extra typed characters are treated as insertions into the typed query.
+
+The path-specific comparator uses:
+
+- weighted core typo cost for substitutions, deletions, and transpositions
+- then `position`, ascending, so basename/start-shape wins before frecency among equal typo shapes
+- then descending caller `score`
+- then `internal_breaks`, ascending, where `internal_breaks` now counts every candidate-side unmatched gap region around matched runs, so uninterrupted matches beat fragmented ones once position and score tie
+- then raw `insertions`, ascending, as a separate noise key
+
+For single-token contiguous substring matches with no core typo, `path::typo` takes a direct fast path instead of running full Damerau-Levenshtein. Those matches come through with:
+
+- core typo cost `0`
+- `internal_breaks = 0`
+- raw `insertions` equal to the unmatched candidate-side slack
+
+So among pure insertion-only matches, ranking falls through quickly to `position`, then to descending `score`, then to `internal_breaks`, and later to `insertions` if those still tie.
 
 Shared versus adapter-local:
 
 - shared:
-  - `distance`
-  - `operations`
-  - `ratio_milli`
+  - the shared weighted `OperationProfile`
   - the tuple ordering in `compare_path_typo_sort_keys`
 - adapter-local:
+  - splitting core typo cost from raw `insertions`
+  - `internal_breaks` as total candidate-side break regions around the matched runs
   - `position`
-  - `structure`
   - `path_depth`
   - normal-path helper logic
 
-## `command.rs`
+## `command_history.rs`
 
 Purpose:
 
-- typo-tolerant command-string matching
-- executable-first command ranking
-- command-history style matching
+- typo-tolerant shell-history command matching
+- command-token typo matching
+- recency-aware command-history ranking
 
-This adapter is intended for fish-history-like or command-palette-like search.
+This adapter is intended for fish-history-like search.
 
 It owns:
 
-- `CommandQuery`
-- `CommandCandidate`
-- `CommandMatch`
-- `parse_command_candidate`
+- `CommandHistoryQuery`
+- `CommandHistoryCandidate`
+- `CommandHistoryMatch`
+- `parse_command_history_candidate`
 
 It uses shared core from:
 
 - `core` for edit distance
-- `ranking` for typo sort-key comparison
-- `text` for whitespace tokenization and missing-space variants
-- `token_match` for aligned and partitioned token matching
+- `ranking` for command-history typo sort-key comparison
+- `text` for lowercase normalization, whitespace tokenization, and signal checks
 
-What is command-specific here:
+What is command-history-specific here:
 
-- executable token is stronger than later arguments
-- earlier argv positions beat later argv positions
-- command position is interpreted as token order rather than path depth
+- command history is split into search words, so punctuation and underscores create token boundaries
+- query tokens are compared against whole command-history search words
+- multi-token queries can match non-contiguous command-history words in order
+- missing-space and extra-space interpretations are not part of this adapter
+- caller-provided `recency` breaks equal textual ties
 
-This is the adapter to use for shell command history or command-string search.
+This is the adapter to use for shell command history search.
 
-### Exact command sort order
+### Exact command-history sort order
 
-`command` uses the shared `TypoSortKey` comparator from `ranking.rs`.
-The exact command sort key order is:
+`command_history` uses the shared `TypoSortKey` comparator from `ranking.rs`.
+The exact command-history sort key order is:
 
-1. `distance`
-2. `operations`
-3. `ratio_milli`
-4. `position`
-5. `structure`
-6. descending `score`
-7. `secondary`
-8. `key`
+1. descending `exact_count`
+2. `span_len`
+3. `distance`
+4. `operations`
+5. `ratio_milli`
+6. descending `recency`
+7. `alphabetical`
 
 Where:
 
-- `position` is command-specific token position, with earlier and stronger command-token matches ranking better
-- `structure` is the command adapter’s token-span looseness metric
-- `secondary` is currently the command token count
+- `exact_count` is the number of query tokens matched exactly
+- `span_len` is the width of the matched command-token span, so phrase-like adjacent matches beat scattered matches
+- `distance` is the summed bounded Damerau-Levenshtein typo distance
+- `operations` is the shared intended-to-typed typo-likelihood profile
+  It prefers, at equal edit distance:
+  nearby-key substitutions, then transpositions, then omitted characters, then inserted characters, with far substitutions and arbitrary insertions penalized most.
+- `ratio_milli` is the normalized typo ratio in thousandths
+- `recency` is caller-provided and sorts descending
+- `alphabetical` is the final deterministic command-string tie-break
 
 Shared versus adapter-local:
 
@@ -364,9 +396,12 @@ Shared versus adapter-local:
   - `ratio_milli`
   - the tuple ordering in `compare_typo_sort_keys`
 - adapter-local:
-  - `position`
-  - `structure`
-  - `secondary`
+  - `exact_count`
+  - `span_len`
+  - command-token candidate construction
+  - whole-token typo policy
+  - `recency`
+  - `alphabetical`
 
 ## `message.rs`
 
@@ -397,14 +432,28 @@ What is message-specific here:
 - broader token coverage outranks repeated occurrences of only one query term
 - repeated query-term occurrences refine ties after phrase coverage
 
+Message matching first prepares lowercased search tokens for the query and each candidate.
+Candidates that do not contain any usable query signal are rejected before sorting.
+
 Final message result ordering is:
 
-1. phrase presence
-2. matched query-term count
-3. phrase occurrence count
-4. total matched-term occurrences
-5. descending `score`
-6. `key`
+1. descending `matched_terms`
+2. phrase presence, with phrase matches first
+3. descending `adjacent_run_len`
+4. `covering_span_len`, ascending, with missing spans last
+5. `covering_span_position`, ascending, with missing spans last
+6. descending `total_occurrences`
+7. descending `score`
+8. `key`
+
+Where:
+
+- `matched_terms` is how many distinct query terms appear in the candidate
+- phrase presence means the full query phrase appears contiguously at least once
+- `adjacent_run_len` is the longest adjacent query-token run found in the candidate
+- `covering_span_len` is the smallest token span that covers all matched query terms
+- `covering_span_position` is the first position of that covering span
+- `total_occurrences` is the total count of matched query-term occurrences
 
 This is the adapter to use for:
 
@@ -435,7 +484,7 @@ It uses shared core from:
 - `ranking` for structural, fuzzy, abbreviation, and typo rank comparison
 - `text` for general search tokenization and normalized key cleanup
 
-It currently keeps more logic locally than `path` and `command`, because metadata search has richer field-aware policy.
+It currently keeps more logic locally than `path` and `command_history`, because metadata search has richer field-aware policy.
 
 What is metadata-specific here:
 
@@ -451,82 +500,67 @@ This is the adapter to use for:
 - WM class / instance values
 - other structured multi-field records
 
-### Exact metadata sort order
+### Metadata sort order
 
-`metadata` uses the shared `SearchRank` ordering plus the shared
-`compare_search_results` comparator from `ranking.rs`.
+`metadata` now uses a query-aware relevance stack before caller score and final
+deterministic tie-breaks.
 
 Final metadata result ordering is:
 
-1. `SearchRank`
-2. descending `score`
-3. `key`
+1. exact whole-phrase occurrence count
+2. exact longer phrase-run vector, lexicographic
+3. exact distinct query-token coverage
+4. fuzzy/typo whole-phrase match
+5. fuzzy/typo phrase-run vector, lexicographic
+6. total distinct query-token coverage, exact plus fuzzy
+7. typo severity
+8. whether all query tokens are matched
+9. field quality
+10. same-order scattered matching
+11. closeness / gap distance
+12. repeated exact phrase bonus, saturated
+13. repeated token bonus, saturated
+14. density / low clutter
+15. descending caller `score`
+16. `SearchRank`
+17. `key`
 
-`SearchRank` itself has a fixed shared kind precedence:
+Where:
 
-1. `Structural`
-2. `Abbreviation`
-3. `Fuzzy`
-4. `Typo`
+- exact phrase stages use contiguous query-token windows matched by token-prefix exactness
+- fuzzy phrase stages use the same contiguous window logic, but allow typo matches per token
+- typo severity uses the shared intended-to-typed edit engine from `core.rs` and compares:
+  - summed core typo cost
+  - then summed `internal_breaks` (total candidate-side break regions around matched runs)
+  - then summed `insertions`
+- field quality is `SearchField.priority`, ascending
+- same-order scattered matching prefers candidates where all query tokens can be recovered in query order within one field
+- closeness / gap distance prefers smaller gaps between those ordered matches
+- density prefers candidates where matched concepts occupy a larger fraction of a smaller field
 
-Within each kind, the exact sort keys are:
-
-`StructuralRank`:
-
-1. `field_priority`
-2. `position_class`
-3. `token_index`
-4. `token_span_delta`
-5. `start_idx`
-6. `field_len`
-
-`AbbreviationRank`:
-
-1. `field_priority`
-2. `variant_scope`
-3. `position_class`
-4. `token_index`
-5. `gap_span`
-6. `gap_count`
-7. `start_idx`
-8. `field_len`
-
-`DistanceRank` for both `Fuzzy` and `Typo`:
-
-1. `distance`
-2. `ratio_milli`
-3. `field_priority`
-4. `variant_scope`
-5. `position_class`
-6. `token_index`
-7. `token_span_delta`
-8. `start_idx`
-9. `field_len`
+`SearchRank` is still computed and used for provenance, highlighting, and as a
+late tie-break, but it is no longer the primary metadata result order.
 
 Shared versus adapter-local:
 
 - shared:
-  - `SearchRank`
-  - `StructuralRank`
-  - `AbbreviationRank`
-  - `DistanceRank`
-  - the kind precedence and final comparator in `compare_search_results`
+  - the bounded typo engine in `core.rs`
+  - `SearchRank` provenance for highlighting and explanations
 - adapter-local:
-  - how fields are built
-  - what `field_priority` means
-  - what `variant_scope` means
-  - how structural, abbreviation, fuzzy, and typo candidates are generated
-  - some of the metadata matching logic is still local and richer than the other adapters
+  - phrase-run accounting across multiple fields
+  - exact and fuzzy coverage aggregation
+  - field-priority policy
+  - caller-controlled `score`
 
 ## Which Adapter To Use
 
 - Use `path` for filesystem paths.
-- Use `command` for shell commands or command history lines.
+- Use `command_history` for shell command history lines.
 - Use `message` for tokenized free-text records where phrase continuity matters.
 - Use `metadata` for apps, windows, or generic multi-field searchable records.
 
 If the data is not naturally a path, do not force it through `path`.
-If the data is not naturally a command line, do not force it through `command`.
+If the data is not naturally shell command history, do not force it through `command_history`.
 
 ## Current Shared/Core Story
 
@@ -536,7 +570,7 @@ The current design is:
 2. `ranking` provides one ranking/comparison framework.
 3. `text` provides one shared text/query-prep layer.
 4. `token_match` provides one shared token-matching layer.
-5. `path`, `command`, `message`, and `metadata` adapt those shared layers to their own domains.
+5. `path`, `command_history`, `message`, and `metadata` adapt those shared layers to their own domains.
 
 So the crate does not have separate ad hoc matcher implementations anymore.
 It has:
@@ -582,14 +616,14 @@ Each adapter expects:
 
 - a user query
 - a domain-shaped candidate
-- an externally computed score if ranking should consider recency/frequency
+- an externally computed priority such as `score` or `recency` if ranking should consider recency/frequency
 
 ### Outputs
 
 Each adapter returns an adapter-specific match type or rank, for example:
 
 - `PathMatch`
-- `CommandMatch`
+- `CommandHistoryMatch`
 - `SearchRank`
 
 Those outputs are intentionally not fully unified because the caller usually needs domain-specific details.
@@ -642,4 +676,4 @@ When adding new functionality:
 - put generic token-level alignment/matching in `token_match`
 - keep only domain semantics in adapters
 
-If a helper would make sense for both `path` and `command`, it probably does not belong in either of them.
+If a helper would make sense for both `path` and `command_history`, it probably does not belong in either of them.

@@ -4,6 +4,7 @@ use crate::core::OperationProfile;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StructuralRank {
+    pub field_index: usize,
     pub field_priority: u8,
     pub position_class: u8,
     pub token_index: usize,
@@ -45,6 +46,7 @@ pub struct DistanceRank {
     pub distance: usize,
     pub ratio_milli: usize,
     pub keyboard_distance: usize,
+    pub field_index: usize,
     pub field_priority: u8,
     pub variant_scope: u8,
     pub position_class: u8,
@@ -92,6 +94,7 @@ impl PartialOrd for DistanceRank {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AbbreviationRank {
+    pub field_index: usize,
     pub field_priority: u8,
     pub variant_scope: u8,
     pub position_class: u8,
@@ -144,6 +147,7 @@ pub enum SearchRank {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MatchProvenance {
+    pub field_index: usize,
     pub field_priority: u8,
     pub variant_scope: Option<u8>,
     pub token_index: usize,
@@ -179,6 +183,7 @@ impl SearchRank {
     pub fn provenance(&self) -> MatchProvenance {
         match self {
             SearchRank::Structural(rank) => MatchProvenance {
+                field_index: rank.field_index,
                 field_priority: rank.field_priority,
                 variant_scope: None,
                 token_index: rank.token_index,
@@ -187,6 +192,7 @@ impl SearchRank {
                 field_len: rank.field_len,
             },
             SearchRank::Abbreviation(rank) => MatchProvenance {
+                field_index: rank.field_index,
                 field_priority: rank.field_priority,
                 variant_scope: Some(rank.variant_scope),
                 token_index: rank.token_index,
@@ -195,6 +201,7 @@ impl SearchRank {
                 field_len: rank.field_len,
             },
             SearchRank::Fuzzy(rank) | SearchRank::Typo(rank) => MatchProvenance {
+                field_index: rank.field_index,
                 field_priority: rank.field_priority,
                 variant_scope: Some(rank.variant_scope),
                 token_index: rank.token_index,
@@ -222,34 +229,33 @@ pub fn compare_search_results(
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TypoSortKey<'a> {
+    pub exact_count: usize,
+    pub span_len: usize,
     pub distance: usize,
     pub operations: OperationProfile,
     pub ratio_milli: usize,
-    pub position: usize,
-    pub structure: usize,
-    pub score: f64,
-    pub secondary: usize,
-    pub key: &'a str,
+    pub recency: f64,
+    pub alphabetical: &'a str,
 }
 
 pub fn compare_typo_sort_keys(left: &TypoSortKey<'_>, right: &TypoSortKey<'_>) -> Ordering {
-    left.distance
-        .cmp(&right.distance)
+    right
+        .exact_count
+        .cmp(&left.exact_count)
+        .then_with(|| left.span_len.cmp(&right.span_len))
+        .then_with(|| left.distance.cmp(&right.distance))
         .then_with(|| left.operations.cmp(&right.operations))
         .then_with(|| left.ratio_milli.cmp(&right.ratio_milli))
-        .then_with(|| left.position.cmp(&right.position))
-        .then_with(|| left.structure.cmp(&right.structure))
-        .then_with(|| right.score.total_cmp(&left.score))
-        .then_with(|| left.secondary.cmp(&right.secondary))
-        .then_with(|| left.key.cmp(right.key))
+        .then_with(|| right.recency.total_cmp(&left.recency))
+        .then_with(|| left.alphabetical.cmp(right.alphabetical))
 }
 
 pub fn typo_keys_are_ambiguous(left: &TypoSortKey<'_>, right: &TypoSortKey<'_>) -> bool {
-    left.distance == right.distance
-        && left.position == right.position
-        && left.structure == right.structure
+    left.exact_count == right.exact_count
+        && left.span_len == right.span_len
+        && left.distance == right.distance
         && left.ratio_milli.abs_diff(right.ratio_milli) <= 20
-        && left.score.total_cmp(&right.score).is_eq()
+        && left.recency.total_cmp(&right.recency).is_eq()
 }
 
 pub fn ratio_milli(distance: usize, compared_len: usize) -> usize {
@@ -260,9 +266,8 @@ pub fn ratio_milli(distance: usize, compared_len: usize) -> usize {
 pub struct PathTypoSortKey<'a> {
     pub distance: usize,
     pub operations: OperationProfile,
-    pub ratio_milli: usize,
+    pub internal_breaks: usize,
     pub position: usize,
-    pub structure: usize,
     pub score: f64,
     pub path_depth: usize,
     pub key: &'a str,
@@ -272,13 +277,13 @@ pub fn compare_path_typo_sort_keys(
     left: &PathTypoSortKey<'_>,
     right: &PathTypoSortKey<'_>,
 ) -> Ordering {
-    left.distance
-        .cmp(&right.distance)
-        .then_with(|| left.operations.cmp(&right.operations))
-        .then_with(|| left.ratio_milli.cmp(&right.ratio_milli))
+    left.operations
+        .core_typo_cost()
+        .cmp(&right.operations.core_typo_cost())
         .then_with(|| left.position.cmp(&right.position))
         .then_with(|| right.score.total_cmp(&left.score))
-        .then_with(|| left.structure.cmp(&right.structure))
+        .then_with(|| left.internal_breaks.cmp(&right.internal_breaks))
+        .then_with(|| left.operations.insertions.cmp(&right.operations.insertions))
         .then_with(|| left.path_depth.cmp(&right.path_depth))
         .then_with(|| left.key.cmp(right.key))
 }
@@ -287,9 +292,9 @@ pub fn path_typo_keys_are_ambiguous(
     left: &PathTypoSortKey<'_>,
     right: &PathTypoSortKey<'_>,
 ) -> bool {
-    left.distance == right.distance
+    left.operations.core_typo_cost() == right.operations.core_typo_cost()
         && left.position == right.position
-        && left.structure == right.structure
-        && left.ratio_milli.abs_diff(right.ratio_milli) <= 20
         && left.score.total_cmp(&right.score).is_eq()
+        && left.internal_breaks == right.internal_breaks
+        && left.operations.insertions == right.operations.insertions
 }

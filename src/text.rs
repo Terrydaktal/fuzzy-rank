@@ -7,23 +7,6 @@ pub fn to_lowercase(s: impl AsRef<str>) -> String {
     }
 }
 
-pub fn separator_variants(query: &str) -> Vec<String> {
-    let boundaries: Vec<_> = query.char_indices().map(|(idx, _)| idx).skip(1).collect();
-    if boundaries.is_empty() {
-        return Vec::new();
-    }
-
-    let mut variants = Vec::new();
-    for cut in boundaries {
-        let mut variant = String::with_capacity(query.len() + 1);
-        variant.push_str(&query[..cut]);
-        variant.push(' ');
-        variant.push_str(&query[cut..]);
-        variants.push(variant);
-    }
-    variants
-}
-
 pub fn token_has_signal(token: &str, candidate: &str) -> bool {
     let chars = token.chars().collect::<Vec<_>>();
     match chars.as_slice() {

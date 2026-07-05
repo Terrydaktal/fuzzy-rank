@@ -1,4 +1,4 @@
-pub mod command;
+pub mod command_history;
 pub mod core;
 pub mod message;
 pub mod path;
