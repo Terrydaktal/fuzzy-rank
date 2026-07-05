@@ -85,7 +85,7 @@ impl OperationProfile {
     }
 
     pub fn core_typo_cost(&self) -> usize {
-        self.substitution_penalty
+        self.keyboard_distance + self.insertions * 6
     }
 }
 

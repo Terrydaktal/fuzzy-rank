@@ -43,7 +43,7 @@ pub fn choose_path_token_match(
         .map(|(distance, penalty, position_rank, _len, operations)| {
             (distance, penalty, position_rank, 0usize, operations)
         });
-    let fragmented = if candidate.chars().count().saturating_sub(query.chars().count()) > limit {
+    let fragmented = {
         let local_limit = limit.min(max_typos(query.chars().count()));
         fragmented_token_match(query, candidate, local_limit).map(|matched| {
             let penalty = candidate.chars().count().saturating_sub(query.chars().count());
@@ -55,8 +55,6 @@ pub fn choose_path_token_match(
                 matched.operations,
             )
         })
-    } else {
-        None
     };
 
     match (contiguous, fragmented) {
@@ -338,7 +336,7 @@ pub fn fragmented_token_match(
 
                 if i < n {
                     let mut next = cost;
-                    next.operations = next.operations.with_insertion(
+                    next.operations = next.operations.with_deletion(
                         candidate_chars[i],
                         i.checked_sub(1).map(|idx| candidate_chars[idx]),
                         candidate_chars.get(i + 1).copied(),

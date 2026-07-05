@@ -169,11 +169,11 @@ struct TypoSeverity {
 
 impl Ord for TypoSeverity {
     fn cmp(&self, other: &Self) -> Ordering {
-        (self.core_cost, self.internal_breaks, self.insertions, self.distance).cmp(&(
+        (self.distance, self.core_cost, self.internal_breaks, self.insertions).cmp(&(
+            other.distance,
             other.core_cost,
             other.internal_breaks,
             other.insertions,
-            other.distance,
         ))
     }
 }
@@ -509,19 +509,38 @@ fn fuzzy_or_exact_token_match(candidate_token: &str, query_token: &str) -> Optio
     if candidate_token.starts_with(query_token) {
         return Some(TypoSeverity::default());
     }
-    if !token_has_signal(query_token, candidate_token) {
+    let query_len = query_token.chars().count();
+    if query_len < 3 || !token_has_signal(query_token, candidate_token) {
         return None;
     }
 
-    let limit = max_typos(query_token.chars().count()).max(1);
-    let contiguous = bounded_damerau_levenshtein(candidate_token, query_token, limit).map(
-        |(distance, operations)| TypoSeverity {
-            core_cost: operations.core_typo_cost(),
-            internal_breaks: 0,
-            insertions: operations.insertions,
-            distance,
-        },
-    );
+    let limit = max_typos(query_len).max(1);
+    let contiguous = if let Some((_, _, start_idx, end_idx)) =
+        fuzzy_match_details(query_token, candidate_token)
+    {
+        let candidate_chars: Vec<char> = candidate_token.chars().collect();
+        let end = end_idx.min(candidate_chars.len());
+        let start_min = start_idx.saturating_sub(limit).min(end);
+        let start_max = (start_idx + limit).min(end);
+        let mut best_severity: Option<TypoSeverity> = None;
+        for s in start_min..=start_max {
+            let sliced: String = candidate_chars[s..end].iter().collect();
+            if let Some((distance, operations)) = bounded_damerau_levenshtein(&sliced, query_token, limit) {
+                let severity = TypoSeverity {
+                    core_cost: operations.core_typo_cost(),
+                    internal_breaks: 0,
+                    insertions: operations.insertions,
+                    distance,
+                };
+                if best_severity.as_ref().is_none_or(|best| severity < *best) {
+                    best_severity = Some(severity);
+                }
+            }
+        }
+        best_severity
+    } else {
+        None
+    };
 
     let fragmented = if candidate_token.chars().count().saturating_sub(query_token.chars().count()) > limit {
         fragmented_token_match(query_token, candidate_token, limit).and_then(|matched| {
@@ -679,13 +698,13 @@ impl PartialOrd for MetadataEditCost {
     }
 }
 
-fn fuzzy_match_details(query: &str, target: &str) -> Option<(usize, usize, usize)> {
+fn fuzzy_match_details(query: &str, target: &str) -> Option<(usize, usize, usize, usize)> {
     let query_lower = to_lowercase(query);
     let target_lower = to_lowercase(target);
 
     let q_len = query_lower.chars().count();
     if q_len == 0 {
-        return Some((0, 0, 0));
+        return Some((0, 0, 0, 0));
     }
 
     let t_len = target_lower.chars().count();
@@ -774,6 +793,7 @@ fn fuzzy_match_details(query: &str, target: &str) -> Option<(usize, usize, usize
         min_cost.distance,
         min_cost.keyboard_distance,
         best_end_idx.saturating_sub(q_len),
+        best_end_idx,
     ))
 }
 
@@ -939,12 +959,29 @@ fn best_abbreviation_rank(query: &str, fields: &[SearchField<'_>]) -> Option<Abb
     let mut best_rank = None;
 
     for (field_index, field) in fields.iter().enumerate() {
+        if field.priority > 2 {
+            continue;
+        }
         let target = field.value.trim();
         if target.is_empty() {
             continue;
         }
 
         let target_lower = to_lowercase(target);
+        
+        // Fast path: check if target contains all characters of query in order
+        let mut target_chars_iter = target_lower.chars();
+        let mut found_all = true;
+        for q_char in query_compact.chars() {
+            if !target_chars_iter.any(|t_char| t_char == q_char) {
+                found_all = false;
+                break;
+            }
+        }
+        if !found_all {
+            continue;
+        }
+
         let tokens = split_search_tokens(&target_lower);
         let mut candidates: Vec<(u8, String)> = Vec::new();
 
@@ -994,7 +1031,7 @@ fn best_abbreviation_rank(query: &str, fields: &[SearchField<'_>]) -> Option<Abb
 
 fn best_fuzzy_rank(query: &str, fields: &[SearchField<'_>]) -> Option<DistanceRank> {
     let query_lower = to_lowercase(query.trim());
-    if query_lower.is_empty() {
+    if query_lower.is_empty() || query_lower.chars().count() < 3 {
         return None;
     }
 
@@ -1010,6 +1047,9 @@ fn best_fuzzy_rank(query: &str, fields: &[SearchField<'_>]) -> Option<DistanceRa
         }
 
         let target_lower = to_lowercase(target);
+        if !token_has_signal(&query_lower, &target_lower) {
+            continue;
+        }
         let tokens = split_search_tokens(&target_lower);
         let mut candidates: Vec<(u8, String, String)> = Vec::new();
 
@@ -1025,7 +1065,10 @@ fn best_fuzzy_rank(query: &str, fields: &[SearchField<'_>]) -> Option<DistanceRa
         }
 
         for (variant_scope, candidate_query, candidate_target) in candidates {
-            let Some((distance, keyboard_distance, start_idx)) =
+            if !token_has_signal(&candidate_query, &candidate_target) {
+                continue;
+            }
+            let Some((distance, keyboard_distance, start_idx, _)) =
                 fuzzy_match_details(&candidate_query, &candidate_target)
             else {
                 continue;
@@ -1064,7 +1107,7 @@ fn best_fuzzy_rank(query: &str, fields: &[SearchField<'_>]) -> Option<DistanceRa
 
 fn best_typo_rank(query: &str, fields: &[SearchField<'_>]) -> Option<DistanceRank> {
     let query_lower = to_lowercase(query.trim());
-    if query_lower.is_empty() {
+    if query_lower.is_empty() || query_lower.chars().count() < 3 {
         return None;
     }
 
@@ -1080,6 +1123,9 @@ fn best_typo_rank(query: &str, fields: &[SearchField<'_>]) -> Option<DistanceRan
         }
 
         let target_lower = to_lowercase(target);
+        if !token_has_signal(&query_lower, &target_lower) {
+            continue;
+        }
         let tokens = split_search_tokens(&target_lower);
         let mut candidates: Vec<(u8, String, String)> =
             vec![(0, query_lower.clone(), target_lower.clone())];
@@ -1096,7 +1142,7 @@ fn best_typo_rank(query: &str, fields: &[SearchField<'_>]) -> Option<DistanceRan
         }
 
         for (variant_scope, candidate_query, candidate_target) in candidates {
-            let Some((distance, keyboard_distance, start_idx)) =
+            let Some((distance, keyboard_distance, start_idx, _)) =
                 fuzzy_match_details(&candidate_query, &candidate_target)
             else {
                 continue;
@@ -1421,22 +1467,30 @@ mod tests {
     }
 
     #[test]
-    fn typo_search_handles_multibyte_separator_before_match() {
-        let fields = [SearchField {
+    fn two_character_queries_use_exact_matching_only() {
+        let fuzzy_only_fields = [SearchField {
             priority: 0,
             value: "videos — pcmanfm | pcmanfm | /usr/bin/pcmanfm | ~",
         }];
-        let candidate = MetadataCandidate {
+        let exact_fields = [SearchField {
+            priority: 0,
+            value: "mpv media player",
+        }];
+        let fuzzy_only = MetadataCandidate {
             key: "window:pcmanfm",
-            fields: &fields,
+            fields: &fuzzy_only_fields,
             score: 1.0,
         };
-        let rank = MetadataQuery::new("mp")
-            .unwrap()
-            .with_typo_fallback(true)
-            .search_rank(candidate);
+        let exact = MetadataCandidate {
+            key: "window:mpv",
+            fields: &exact_fields,
+            score: 1.0,
+        };
+        let typo_query = MetadataQuery::new("mp").unwrap().with_typo_fallback(true);
+        let exact_query = MetadataQuery::new("mp").unwrap();
 
-        assert!(rank.is_some());
+        assert!(typo_query.search_rank(fuzzy_only).is_none());
+        assert!(exact_query.search_rank(exact).is_some());
     }
 
     #[test]
@@ -1495,6 +1549,41 @@ mod tests {
         ];
         query.sort_matches(&mut matches);
         assert_eq!(matches[0].0.key, "window:unsplash");
+    }
+
+    #[test]
+    fn metadata_typo_rejects_unrelated_long_title_token_match() {
+        let list_fields = [
+            SearchField {
+                priority: 0,
+                value: "List the purpose of all of the top subdirectories of the main root directory on Linux according to the file system hierarchy standard IP. - Google Search - Google Chrome",
+            },
+            SearchField {
+                priority: 1,
+                value: "google-chrome",
+            },
+            SearchField {
+                priority: 6,
+                value: "chrome",
+            },
+        ];
+        let unsplash_fields = [SearchField {
+            priority: 0,
+            value: "mike-uderevsky-JuJYPgv4Rag-unsplash exported",
+        }];
+        let query = MetadataQuery::new("splyush").unwrap().with_typo_fallback(true);
+        let list = MetadataCandidate {
+            key: "window:list-google",
+            fields: &list_fields,
+            score: 1.0,
+        };
+        let unsplash = MetadataCandidate {
+            key: "window:unsplash",
+            fields: &unsplash_fields,
+            score: 1.0,
+        };
+        assert!(query.search_rank(list).is_none());
+        assert!(query.search_rank(unsplash).is_some());
     }
 
     #[test]
@@ -1558,4 +1647,182 @@ mod tests {
         assert_eq!(term.field.unwrap().value, "whisper service python3");
         assert_eq!(term.rank.as_ref().unwrap().provenance().field_index, 0);
     }
+
+    #[test]
+    fn metadata_typo_reproduce_user_bug() {
+        let list_fields = [
+            SearchField {
+                priority: 0,
+                value: "List the purpose of all of the top subdirectories of the main root directory on Linux according to the file system hierarchy standard IP. - Google Search - Google Chrome",
+            },
+            SearchField {
+                priority: 1,
+                value: "google-chrome",
+            },
+            SearchField {
+                priority: 4,
+                value: "chromium-chatbot --remote-debugging-port=9233 --start-minimized --no-first-run --no-default-browser-check --disable-background-timer-throttling --disable-renderer-backgrounding --disable-backgrounding-occluded-windows --disable-features=CalculateNativeWinOcclusion",
+            },
+            SearchField {
+                priority: 5,
+                value: "/opt/google/chrome/chrome --ozone-platform=wayland --disable-features=Vulkan --enable-gpu-rasterization --enable-zero-copy --ignore-gpu-blocklist --user-data-dir=/home/lewis/.config/chromium-chatbot --remote-debugging-port=9233 --start-minimized --no-first-run --no-default-browser-check --disable-background-timer-throttling --disable-renderer-backgrounding --disable-backgrounding-occluded-windows --disable-features=CalculateNativeWinOcclusion",
+            },
+            SearchField {
+                priority: 6,
+                value: "chrome",
+            },
+            SearchField {
+                priority: 7,
+                value: "~/Dev/chatbot",
+            },
+        ];
+        let unsplash_fields = [
+            SearchField {
+                priority: 0,
+                value: "*[mike-uderevsky-JuJYPgv4Rag-unsplash] (exported)-1.0 (RGB colour 8-bit non-linear integer, sRGB IEC61966-2.1, 1 layer)",
+            },
+        ];
+        let query = MetadataQuery::new("splyush").unwrap().with_typo_fallback(true);
+        let list = MetadataCandidate {
+            key: "window:list-google",
+            fields: &list_fields,
+            score: 1.0,
+        };
+        let unsplash = MetadataCandidate {
+            key: "window:unsplash",
+            fields: &unsplash_fields,
+            score: 1.0,
+        };
+        
+        let list_rank = query.search_rank(list);
+        let unsplash_rank = query.search_rank(unsplash);
+        println!("list_rank: {:?}", list_rank);
+        println!("unsplash_rank: {:?}", unsplash_rank);
+
+        assert!(list_rank.is_none());
+        assert!(unsplash_rank.is_some());
+    }
+
+    #[test]
+    fn metadata_typo_reproduce_unsplash_bug() {
+        let list_fields = [
+            SearchField {
+                priority: 0,
+                value: "List the purpose of all of the top subdirectories of the main root directory on Linux according to the file system hierarchy standard IP. - Google Search - Google Chrome",
+            },
+            SearchField {
+                priority: 1,
+                value: "google-chrome",
+            },
+            SearchField {
+                priority: 4,
+                value: "chromium-chatbot --remote-debugging-port=9233 --start-minimized --no-first-run --no-default-browser-check --disable-background-timer-throttling --disable-renderer-backgrounding --disable-backgrounding-occluded-windows --disable-features=CalculateNativeWinOcclusion",
+            },
+            SearchField {
+                priority: 5,
+                value: "/opt/google/chrome/chrome --ozone-platform=wayland --disable-features=Vulkan --enable-gpu-rasterization --enable-zero-copy --ignore-gpu-blocklist --user-data-dir=/home/lewis/.config/chromium-chatbot --remote-debugging-port=9233 --start-minimized --no-first-run --no-default-browser-check --disable-background-timer-throttling --disable-renderer-backgrounding --disable-backgrounding-occluded-windows --disable-features=CalculateNativeWinOcclusion",
+            },
+            SearchField {
+                priority: 6,
+                value: "chrome",
+            },
+            SearchField {
+                priority: 7,
+                value: "~/Dev/chatbot",
+            },
+        ];
+        let unsplash_fields = [
+            SearchField {
+                priority: 0,
+                value: "*[mike-uderevsky-JuJYPgv4Rag-unsplash] (exported)-1.0 (RGB colour 8-bit non-linear integer, sRGB IEC61966-2.1, 1 layer)",
+            },
+        ];
+        let query = MetadataQuery::new("unsplash").unwrap();
+        let list = MetadataCandidate {
+            key: "window:list-google",
+            fields: &list_fields,
+            score: 1.0,
+        };
+        let unsplash = MetadataCandidate {
+            key: "window:unsplash",
+            fields: &unsplash_fields,
+            score: 1.0,
+        };
+        
+        let list_rank = query.search_rank(list);
+        let unsplash_rank = query.search_rank(unsplash);
+        println!("list_rank: {:?}", list_rank);
+        println!("unsplash_rank: {:?}", unsplash_rank);
+
+        let mut matches = vec![
+            (list, list_rank.unwrap()),
+            (unsplash, unsplash_rank.unwrap()),
+        ];
+        query.sort_matches(&mut matches);
+        
+        println!("Sorted results:");
+        for (candidate, rank) in &matches {
+            println!("  key: {}, rank: {:?}", candidate.key, rank);
+        }
+
+        assert_eq!(matches[0].0.key, "window:unsplash");
+    }
+
+    #[test]
+    fn metadata_typo_diagnostic() {
+        let list_fields = [
+            SearchField {
+                priority: 0,
+                value: "List the purpose of all of the top subdirectories of the main root directory on Linux according to the file system hierarchy standard IP. - Google Search - Google Chrome",
+            },
+            SearchField {
+                priority: 1,
+                value: "google-chrome",
+            },
+            SearchField {
+                priority: 4,
+                value: "chromium-chatbot --remote-debugging-port=9233 --start-minimized --no-first-run --no-default-browser-check --disable-background-timer-throttling --disable-renderer-backgrounding --disable-backgrounding-occluded-windows --disable-features=CalculateNativeWinOcclusion",
+            },
+            SearchField {
+                priority: 5,
+                value: "/opt/google/chrome/chrome --ozone-platform=wayland --disable-features=Vulkan --enable-gpu-rasterization --enable-zero-copy --ignore-gpu-blocklist --user-data-dir=/home/lewis/.config/chromium-chatbot --remote-debugging-port=9233 --start-minimized --no-first-run --no-default-browser-check --disable-background-timer-throttling --disable-renderer-backgrounding --disable-backgrounding-occluded-windows --disable-features=CalculateNativeWinOcclusion",
+            },
+            SearchField {
+                priority: 6,
+                value: "chrome",
+            },
+            SearchField {
+                priority: 7,
+                value: "~/Dev/chatbot",
+            },
+        ];
+        let unsplash_fields = [
+            SearchField {
+                priority: 0,
+                value: "*[mike-uderevsky-JuJYPgv4Rag-unsplash] (exported)-1.0 (RGB colour 8-bit non-linear integer, sRGB IEC61966-2.1, 1 layer)",
+            },
+        ];
+        let query_str = "splyush";
+        let query = MetadataQuery::new(query_str).unwrap().with_typo_fallback(true);
+        let list = MetadataCandidate {
+            key: "window:list-google",
+            fields: &list_fields,
+            score: 0.0,
+        };
+        let unsplash = MetadataCandidate {
+            key: "window:unsplash",
+            fields: &unsplash_fields,
+            score: 0.0,
+        };
+
+        let list_relevance = metadata_relevance_rank(&query.query_tokens, true, list.fields);
+        let unsplash_relevance = metadata_relevance_rank(&query.query_tokens, true, unsplash.fields);
+
+        println!("Query: {}", query_str);
+        println!("list relevance: {:#?}", list_relevance);
+        println!("unsplash relevance: {:#?}", unsplash_relevance);
+    }
 }
+
+
+

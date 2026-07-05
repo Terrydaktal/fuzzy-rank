@@ -382,6 +382,7 @@ fn candidate_for_text<'a>(
         }
     }
 
+
     if ctx.limit == 0 || ctx.query_len.abs_diff(candidate_len) > ctx.limit {
         return None;
     }
@@ -493,7 +494,21 @@ fn candidate_for_partitioned_single_query<'a>(
     }
     let candidate_len = candidate.chars().count();
     if ctx.query_len.abs_diff(candidate_len) <= ctx.limit {
-        return None;
+        let matched = fragmented_token_match(ctx.query, candidate, ctx.limit)?;
+        let ratio = matched.distance as f64 / ctx.query_len.max(candidate_len) as f64;
+        if ratio > 0.5 || matched.internal_breaks < 2 {
+            return None;
+        }
+        return Some(PathMatch {
+            path: ctx.path,
+            distance: matched.distance,
+            ratio,
+            path_position: path_position * 3 + matched.position_rank,
+            internal_breaks: matched.internal_breaks,
+            operations: matched.operations,
+            score: ctx.score,
+            path_depth: ctx.path_depth,
+        });
     }
     let matched = fragmented_token_match(ctx.query, candidate, ctx.limit)?;
     let ratio = matched.distance as f64 / ctx.query_len.max(candidate_len) as f64;
@@ -624,7 +639,7 @@ mod tests {
         let candidate = best_match("/home/lewis/applicationlauncher", 10.0, "applaunch").unwrap();
         assert_eq!(candidate.operations.core_typo_cost(), 0);
         assert_eq!(candidate.internal_breaks, 2);
-        assert_eq!(candidate.operations.insertions, 10);
+        assert_eq!(candidate.operations.insertions, 0);
     }
 
     #[test]
@@ -666,7 +681,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(candidate.path_position, 3);
-        assert_eq!(candidate.distance, 2);
+        assert_eq!(candidate.distance, 1);
         assert_eq!(candidate.internal_breaks, 1);
     }
 
@@ -692,7 +707,7 @@ mod tests {
         assert_eq!(matches[0].path, "/home/lewis/abdef");
         assert_eq!(matches[0].distance, matches[1].distance);
         assert_eq!(matches[0].operations.insertions, 1);
-        assert_eq!(matches[0].operations.core_typo_cost(), 0);
+        assert_eq!(matches[0].operations.core_typo_cost(), 6);
         assert!(matches[1].operations.core_typo_cost() > matches[0].operations.core_typo_cost());
     }
 
@@ -806,6 +821,27 @@ mod tests {
         .unwrap();
         assert_eq!(candidate.operations.core_typo_cost(), 0);
         assert_eq!(candidate.internal_breaks, 2);
-        assert_eq!(candidate.operations.insertions, 10);
+        assert_eq!(candidate.operations.insertions, 0);
+    }
+
+    #[test]
+    fn test_zoxide_lcunaher() {
+        let applications = best_match("/home/lewis/.local/share/applications", 1.9, "application lcunaher");
+        let launcher = best_match("/home/lewis/Dev/applicationlauncher", 190.4, "application lcunaher");
+        println!("applications match: {:#?}", applications);
+        println!("launcher match: {:#?}", launcher);
+        
+        let mut matches = vec![
+            applications.unwrap(),
+            launcher.unwrap(),
+        ];
+        sort_matches(&mut matches);
+        
+        println!("Sorted:");
+        for m in &matches {
+            println!("  path: {}, distance: {}, core_typo_cost: {}, score: {}", m.path, m.distance, m.operations.core_typo_cost(), m.score);
+        }
+        
+        assert_eq!(matches[0].path, "/home/lewis/Dev/applicationlauncher");
     }
 }
