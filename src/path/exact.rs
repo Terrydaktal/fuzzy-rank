@@ -17,6 +17,7 @@ pub struct ExactPathMatch<'a> {
     pub path: &'a str,
     pub score: Score,
     pub insertions: usize,
+    pub segment: usize,
     pub position: usize,
     pub path_depth: usize,
 }
@@ -30,6 +31,7 @@ pub fn exact_match<'a>(
         path,
         score,
         insertions: match_penalty(path, keywords)?,
+        segment: match_path_segment(path, keywords)?,
         position: match_path_position(path, keywords)?,
         path_depth: path_depth(path),
     })
@@ -39,11 +41,11 @@ pub fn compare_exact_path_matches(
     left: ExactPathMatch<'_>,
     right: ExactPathMatch<'_>,
 ) -> std::cmp::Ordering {
-    right
-        .score
-        .total_cmp(&left.score)
-        .then_with(|| left.insertions.cmp(&right.insertions))
+    left.segment
+        .cmp(&right.segment)
         .then_with(|| left.position.cmp(&right.position))
+        .then_with(|| right.score.total_cmp(&left.score))
+        .then_with(|| left.insertions.cmp(&right.insertions))
         .then_with(|| left.path_depth.cmp(&right.path_depth))
         .then_with(|| left.path.cmp(right.path))
 }
@@ -74,6 +76,32 @@ pub fn match_penalty(path: &str, keywords: &[String]) -> Option<usize> {
     Some(penalty)
 }
 
+pub fn match_path_segment(path: &str, keywords: &[String]) -> Option<usize> {
+    let (keywords_last, keywords) = match keywords.split_last() {
+        Some(split) => split,
+        None => return Some(0),
+    };
+
+    let full_path = to_lowercase(path);
+    let mut search = full_path.as_str();
+    let mut segment = 0;
+
+    let idx = search.rfind(keywords_last)?;
+    if search[idx + keywords_last.len()..].contains(path::is_separator) {
+        return None;
+    }
+    segment += path_segment_class(&full_path, idx);
+    search = &search[..idx];
+
+    for keyword in keywords.iter().rev() {
+        let idx = search.rfind(keyword)?;
+        segment += path_segment_class(&full_path, idx);
+        search = &search[..idx];
+    }
+
+    Some(segment / (keywords.len() + 1))
+}
+
 pub fn match_path_position(path: &str, keywords: &[String]) -> Option<usize> {
     let (keywords_last, keywords) = match keywords.split_last() {
         Some(split) => split,
@@ -88,12 +116,12 @@ pub fn match_path_position(path: &str, keywords: &[String]) -> Option<usize> {
     if search[idx + keywords_last.len()..].contains(path::is_separator) {
         return None;
     }
-    position += path_position_class(&full_path, idx, keywords_last.len());
+    position += position_rank(&full_path, idx, keywords_last.len());
     search = &search[..idx];
 
     for keyword in keywords.iter().rev() {
         let idx = search.rfind(keyword)?;
-        position += path_position_class(&full_path, idx, keyword.len());
+        position += position_rank(&full_path, idx, keyword.len());
         search = &search[..idx];
     }
 
@@ -165,13 +193,11 @@ fn match_position_penalty(path: &str, idx: usize, keyword_len: usize) -> usize {
     idx - token_start + (token_end - end)
 }
 
-fn path_position_class(path: &str, idx: usize, keyword_len: usize) -> usize {
-    let component_distance = path[idx..]
+fn path_segment_class(path: &str, idx: usize) -> usize {
+    path[idx..]
         .chars()
         .filter(|ch| path::is_separator(*ch))
-        .count();
-
-    component_distance * 3 + position_rank(path, idx, keyword_len)
+        .count()
 }
 
 fn position_rank(path: &str, idx: usize, keyword_len: usize) -> usize {
@@ -201,15 +227,15 @@ mod tests {
     }
 
     #[test]
-    fn match_path_position_prefers_basename_over_parent_components() {
+    fn match_path_segment_prefers_basename_over_parent_components() {
         let keywords = ["ap", "laun"];
         let keywords = keywords.into_iter().map(str::to_string).collect::<Vec<_>>();
         assert_eq!(
-            match_path_position("/home/lewis/Dev/applicationlauncher", &keywords),
-            Some(2)
+            match_path_segment("/home/lewis/Dev/applicationlauncher", &keywords),
+            Some(0)
         );
         assert_eq!(
-            match_path_position(
+            match_path_segment(
                 "/home/lewis/Dev/applicationlauncher/target/release",
                 &keywords
             ),
@@ -218,13 +244,29 @@ mod tests {
     }
 
     #[test]
-    fn compare_exact_path_matches_prefers_score_then_insertions_then_position_then_path_depth() {
+    fn compare_exact_path_matches_prefers_segment_then_position_then_score_then_insertions_then_path_depth() {
         let keywords = ["tasks", "onfig"];
         let keywords = keywords.into_iter().map(str::to_string).collect::<Vec<_>>();
         let lower_insertions = exact_match("/home/lewis/tasks/config", &keywords, 10.0).unwrap();
         let higher_insertions =
             exact_match("/home/lewis/tasks/redragonmouseconfig", &keywords, 10.0).unwrap();
         let higher_score = exact_match("/home/lewis/tasks/config", &keywords, 20.0).unwrap();
+        let worse_position = ExactPathMatch {
+            path: "/home/lewis/tasks/config",
+            score: 50.0,
+            insertions: 0,
+            segment: lower_insertions.segment,
+            position: lower_insertions.position + 1,
+            path_depth: lower_insertions.path_depth,
+        };
+        let worse_segment = ExactPathMatch {
+            path: "/home/lewis/tasks/config",
+            score: 100.0,
+            insertions: 0,
+            segment: lower_insertions.segment + 1,
+            position: 0,
+            path_depth: lower_insertions.path_depth,
+        };
 
         assert_eq!(
             compare_exact_path_matches(higher_score, lower_insertions),
@@ -232,6 +274,14 @@ mod tests {
         );
         assert_eq!(
             compare_exact_path_matches(lower_insertions, higher_insertions),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            compare_exact_path_matches(lower_insertions, worse_position),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            compare_exact_path_matches(lower_insertions, worse_segment),
             std::cmp::Ordering::Less
         );
     }

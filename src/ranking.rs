@@ -266,7 +266,7 @@ pub fn ratio_milli(distance: usize, compared_len: usize) -> usize {
 pub struct PathTypoSortKey<'a> {
     pub distance: usize,
     pub operations: OperationProfile,
-    pub internal_breaks: usize,
+    pub segment: usize,
     pub position: usize,
     pub score: f64,
     pub path_depth: usize,
@@ -280,9 +280,9 @@ pub fn compare_path_typo_sort_keys(
     left.operations
         .core_typo_cost()
         .cmp(&right.operations.core_typo_cost())
+        .then_with(|| left.segment.cmp(&right.segment))
         .then_with(|| left.position.cmp(&right.position))
         .then_with(|| right.score.total_cmp(&left.score))
-        .then_with(|| left.internal_breaks.cmp(&right.internal_breaks))
         .then_with(|| left.operations.insertions.cmp(&right.operations.insertions))
         .then_with(|| left.path_depth.cmp(&right.path_depth))
         .then_with(|| left.key.cmp(right.key))
@@ -293,8 +293,8 @@ pub fn path_typo_keys_are_ambiguous(
     right: &PathTypoSortKey<'_>,
 ) -> bool {
     left.operations.core_typo_cost() == right.operations.core_typo_cost()
+        && left.segment == right.segment
         && left.position == right.position
         && left.score.total_cmp(&right.score).is_eq()
-        && left.internal_breaks == right.internal_breaks
         && left.operations.insertions == right.operations.insertions
 }

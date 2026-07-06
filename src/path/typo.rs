@@ -14,8 +14,8 @@ pub struct PathMatch<'a> {
     pub path: &'a str,
     pub distance: usize,
     pub ratio: f64,
-    pub path_position: usize,
-    pub internal_breaks: usize,
+    pub segment: usize,
+    pub position: usize,
     pub operations: OperationProfile,
     pub score: Score,
     pub path_depth: usize,
@@ -26,8 +26,8 @@ impl<'a> PathMatch<'a> {
         PathTypoSortKey {
             distance: self.distance,
             operations: self.operations,
-            internal_breaks: self.internal_breaks,
-            position: self.path_position,
+            segment: self.segment,
+            position: self.position,
             score: self.score,
             path_depth: self.path_depth,
             key: self.path,
@@ -369,8 +369,8 @@ fn candidate_for_text<'a>(
                     path: ctx.path,
                     distance: insertions,
                     ratio,
-                    path_position: path_position * 3 + position_rank,
-                    internal_breaks: 0,
+                    segment: path_position,
+                    position: position_rank,
                     operations: OperationProfile {
                         insertions,
                         ..OperationProfile::default()
@@ -405,8 +405,8 @@ fn candidate_for_text<'a>(
         path: ctx.path,
         distance,
         ratio,
-        path_position: path_position * 3 + position_rank,
-        internal_breaks: 0,
+        segment: path_position,
+        position: position_rank,
         operations,
         score: ctx.score,
         path_depth: ctx.path_depth,
@@ -425,14 +425,14 @@ fn candidate_for_token_sequence<'a>(
     }
 
     let mut distance = 0;
-    let mut path_metric = 0;
+    let mut position = 0;
     let mut operations = OperationProfile::default();
     for (query_token, candidate_token) in query_tokens.into_iter().zip(candidate_tokens) {
         let remaining = ctx.limit.checked_sub(distance)?;
         let (cost, penalty, position_rank, _, token_operations) =
             best_token_match(query_token, candidate_token, remaining)?;
         distance += cost;
-        path_metric += path_position * 3 + position_rank;
+        position += position_rank;
         let _ = penalty;
         operations = operations.merge(token_operations);
     }
@@ -446,8 +446,8 @@ fn candidate_for_token_sequence<'a>(
         path: ctx.path,
         distance,
         ratio,
-        path_position: path_metric,
-        internal_breaks: 0,
+        segment: path_position,
+        position,
         operations,
         score: ctx.score,
         path_depth: ctx.path_depth,
@@ -465,7 +465,7 @@ fn candidate_for_compound_component<'a>(
         return None;
     }
 
-    let (distance, _structure, position_metric, operations) =
+    let (distance, _structure, position, operations) =
         partitioned_token_distance(&query_tokens, candidate, ctx.limit)?;
     let ratio = distance as f64 / ctx.query_len.max(candidate.chars().count()) as f64;
     if ratio > 0.5 {
@@ -476,8 +476,8 @@ fn candidate_for_compound_component<'a>(
         path: ctx.path,
         distance,
         ratio,
-        path_position: path_position * 3 * query_tokens.len() + position_metric,
-        internal_breaks: query_tokens.len().saturating_sub(1),
+        segment: path_position,
+        position,
         operations,
         score: ctx.score,
         path_depth: ctx.path_depth,
@@ -503,8 +503,8 @@ fn candidate_for_partitioned_single_query<'a>(
             path: ctx.path,
             distance: matched.distance,
             ratio,
-            path_position: path_position * 3 + matched.position_rank,
-            internal_breaks: matched.internal_breaks,
+            segment: path_position,
+            position: matched.position_rank,
             operations: matched.operations,
             score: ctx.score,
             path_depth: ctx.path_depth,
@@ -520,8 +520,8 @@ fn candidate_for_partitioned_single_query<'a>(
         path: ctx.path,
         distance: matched.distance,
         ratio,
-        path_position: path_position * 3 + matched.position_rank,
-        internal_breaks: matched.internal_breaks,
+        segment: path_position,
+        position: matched.position_rank,
         operations: matched.operations,
         score: ctx.score,
         path_depth: ctx.path_depth,
@@ -547,7 +547,7 @@ fn candidate_for_component_sequence<'a>(
                 .into_iter()
                 .map(move |token| PositionedToken {
                     token,
-                    position: path_position * 3,
+                    segment: path_position,
                 })
         })
         .collect();
@@ -555,7 +555,7 @@ fn candidate_for_component_sequence<'a>(
         return None;
     }
 
-    let (distance, path_position, internal_breaks, _structure, operations) =
+    let (distance, segment, position, _breaks, _structure, operations) =
         aligned_token_distance(&query_tokens, &candidate_tokens, ctx.limit)?;
     let ratio = distance as f64 / ctx.query_len as f64;
     if ratio > 0.5 {
@@ -566,8 +566,8 @@ fn candidate_for_component_sequence<'a>(
         path: ctx.path,
         distance,
         ratio,
-        path_position,
-        internal_breaks,
+        segment,
+        position,
         operations,
         score: ctx.score,
         path_depth: ctx.path_depth,
@@ -616,8 +616,8 @@ mod tests {
     #[test]
     fn single_token_component_matches_use_token_relative_position() {
         let candidate = best_match("/home/lewis/tasks/config", 10.0, "onfig").unwrap();
-        assert_eq!(candidate.path_position, 1);
-        assert_eq!(candidate.internal_breaks, 0);
+        assert_eq!(candidate.segment, 0);
+        assert_eq!(candidate.position, 1);
     }
 
     #[test]
@@ -629,25 +629,24 @@ mod tests {
     #[test]
     fn spaced_query_tokens_can_match_single_compound_token() {
         let candidate = best_match("/home/lewis/applicationlauncher", 10.0, "app laucnh").unwrap();
-        assert_eq!(candidate.path_position, 0);
+        assert_eq!(candidate.segment, 0);
+        assert_eq!(candidate.position, 0);
         assert_eq!(candidate.distance, 1);
-        assert_eq!(candidate.internal_breaks, 1);
     }
 
     #[test]
     fn missing_space_query_matches_single_compound_token_via_internal_breaks_and_insertions() {
         let candidate = best_match("/home/lewis/applicationlauncher", 10.0, "applaunch").unwrap();
         assert_eq!(candidate.operations.core_typo_cost(), 0);
-        assert_eq!(candidate.internal_breaks, 2);
         assert_eq!(candidate.operations.insertions, 0);
     }
 
     #[test]
     fn spaced_query_tokens_can_match_component_sequence() {
         let candidate = best_match("/home/lewis/tasks/config", 10.0, "tasks cinfig").unwrap();
-        assert_eq!(candidate.path_position, 3);
+        assert_eq!(candidate.segment, 0);
+        assert_eq!(candidate.position, 0);
         assert_eq!(candidate.distance, 1);
-        assert_eq!(candidate.internal_breaks, 0);
     }
 
     #[test]
@@ -680,9 +679,9 @@ mod tests {
             "tasks cinfig",
         )
         .unwrap();
-        assert_eq!(candidate.path_position, 3);
+        assert_eq!(candidate.segment, 0);
+        assert_eq!(candidate.position, 0);
         assert_eq!(candidate.distance, 1);
-        assert_eq!(candidate.internal_breaks, 1);
     }
 
     #[test]
@@ -694,7 +693,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(candidate.distance, 0);
-        assert_eq!(candidate.path_position, 12);
+        assert_eq!(candidate.segment, 2);
+        assert_eq!(candidate.position, 0);
     }
 
     #[test]
@@ -820,7 +820,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(candidate.operations.core_typo_cost(), 0);
-        assert_eq!(candidate.internal_breaks, 2);
         assert_eq!(candidate.operations.insertions, 0);
     }
 

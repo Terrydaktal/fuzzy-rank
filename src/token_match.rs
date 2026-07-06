@@ -3,7 +3,7 @@ use crate::core::{OperationProfile, bounded_damerau_levenshtein, max_typos};
 #[derive(Clone, Copy)]
 pub struct PositionedToken<'a> {
     pub token: &'a str,
-    pub position: usize,
+    pub segment: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -86,7 +86,7 @@ pub fn aligned_token_distance(
     query_tokens: &[&str],
     candidate_tokens: &[PositionedToken<'_>],
     limit: usize,
-) -> Option<(usize, usize, usize, usize, OperationProfile)> {
+) -> Option<(usize, usize, usize, usize, usize, OperationProfile)> {
     if candidate_tokens.len() < query_tokens.len() {
         return None;
     }
@@ -94,6 +94,7 @@ pub fn aligned_token_distance(
     let mut best = None;
     for start in 0..=candidate_tokens.len() - query_tokens.len() {
         let mut distance = 0;
+        let mut segment = 0;
         let mut position = 0;
         let mut internal_breaks = 0;
         let mut structure = 0;
@@ -115,7 +116,8 @@ pub fn aligned_token_distance(
                 break;
             };
             distance += cost;
-            position += candidate.position + position_rank;
+            segment += candidate.segment;
+            position += position_rank;
             internal_breaks += token_internal_breaks;
             structure += penalty;
             operations = operations.merge(token_operations);
@@ -129,13 +131,14 @@ pub fn aligned_token_distance(
             continue;
         }
 
-        let total = (distance, position, internal_breaks, structure, operations);
+        let segment = segment / query_tokens.len().max(1);
+        let total = (distance, segment, position, internal_breaks, structure, operations);
         best = Some(match best {
             None => total,
             Some(current) if total < current => total,
             Some(current) => current,
         });
-        if best == Some((0, 0, 0, 0, OperationProfile::default())) {
+        if best == Some((0, 0, 0, 0, 0, OperationProfile::default())) {
             break;
         }
     }
