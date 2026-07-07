@@ -119,39 +119,15 @@ fn qwerty_position(ch: char) -> Option<(usize, usize)> {
 }
 
 fn substitution_likelihood_penalty(keyboard_distance: usize) -> usize {
-    if keyboard_distance == 0 {
-        return 10;
-    }
-    if keyboard_distance <= 4 {
-        45 + keyboard_distance
-    } else {
-        130 + keyboard_distance
-    }
+    keyboard_distance
 }
 
-fn insertion_likelihood_penalty(inserted: char, prev: Option<char>, next: Option<char>) -> usize {
-    let inserted = inserted.to_ascii_lowercase();
-    let prev = prev.map(|ch| ch.to_ascii_lowercase());
-    let next = next.map(|ch| ch.to_ascii_lowercase());
-    if prev == Some(inserted) || next == Some(inserted) {
-        return 80;
-    }
-    if prev.is_some_and(|ch| keyboard_substitution_cost(ch, inserted) <= 4)
-        || next.is_some_and(|ch| keyboard_substitution_cost(ch, inserted) <= 4)
-    {
-        return 105;
-    }
-    145
+fn insertion_likelihood_penalty(_inserted: char, _prev: Option<char>, _next: Option<char>) -> usize {
+    6
 }
 
-fn deletion_likelihood_penalty(deleted: char, prev: Option<char>, next: Option<char>) -> usize {
-    let deleted = deleted.to_ascii_lowercase();
-    let prev = prev.map(|ch| ch.to_ascii_lowercase());
-    let next = next.map(|ch| ch.to_ascii_lowercase());
-    if prev == Some(deleted) || next == Some(deleted) {
-        return 35;
-    }
-    40
+fn deletion_likelihood_penalty(_deleted: char, _prev: Option<char>, _next: Option<char>) -> usize {
+    6
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -346,18 +322,21 @@ mod tests {
     }
 
     #[test]
-    fn missing_character_is_cheaper_than_extra_character() {
+    fn missing_character_has_same_cost_as_extra_character() {
         let missing = bounded_damerau_levenshtein("film", "flm", 1).unwrap();
         let extra = bounded_damerau_levenshtein("film", "filmx", 1).unwrap();
         assert_eq!(missing.0, extra.0);
-        assert!(missing.1 < extra.1);
+        assert_eq!(
+            missing.1.substitution_penalty + missing.1.insertion_penalty,
+            extra.1.substitution_penalty + extra.1.insertion_penalty
+        );
     }
 
     #[test]
-    fn far_substitution_is_cheaper_than_arbitrary_insertion() {
+    fn arbitrary_insertion_is_cheaper_than_far_substitution() {
         let extra = bounded_damerau_levenshtein("film", "filmx", 1).unwrap();
         let far = bounded_damerau_levenshtein("film", "pilm", 1).unwrap();
         assert_eq!(extra.0, far.0);
-        assert!(far.1 < extra.1);
+        assert!(extra.1 < far.1);
     }
 }

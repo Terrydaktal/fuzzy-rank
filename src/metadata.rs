@@ -4,6 +4,7 @@ use crate::ranking::{
     AbbreviationRank, DistanceRank, SearchRank, StructuralRank, compare_search_results, ratio_milli,
 };
 use crate::text::{normalize_compact_alnum, split_search_tokens, to_lowercase, token_has_signal};
+use std::cell::OnceCell;
 use std::cmp::{Ordering, Reverse};
 
 pub type Score = f64;
@@ -93,6 +94,7 @@ impl MetadataQuery {
         best_rank
     }
 
+
     pub fn compare_candidates(
         &self,
         left_candidate: MetadataCandidate<'_>,
@@ -100,12 +102,10 @@ impl MetadataQuery {
         right_candidate: MetadataCandidate<'_>,
         right_rank: &SearchRank,
     ) -> Ordering {
-        metadata_relevance_rank(&self.query_tokens, self.allow_typo, left_candidate.fields)
-            .cmp(&metadata_relevance_rank(
-                &self.query_tokens,
-                self.allow_typo,
-                right_candidate.fields,
-            ))
+        let left_relevance = LazyRelevance::new(&self.query_tokens, self.allow_typo, left_candidate.fields);
+        let right_relevance = LazyRelevance::new(&self.query_tokens, self.allow_typo, right_candidate.fields);
+
+        left_relevance.compare(&right_relevance)
             .then_with(|| {
                 right_candidate
                     .score
@@ -116,9 +116,160 @@ impl MetadataQuery {
     }
 
     pub fn sort_matches(&self, matches: &mut [(MetadataCandidate<'_>, SearchRank)]) {
-        matches.sort_unstable_by(|(left_candidate, left_rank), (right_candidate, right_rank)| {
-            self.compare_candidates(*left_candidate, left_rank, *right_candidate, right_rank)
+        let mut lazy_matches: Vec<_> = matches
+            .iter()
+            .map(|(cand, rank)| {
+                (
+                    *cand,
+                    rank.clone(),
+                    LazyRelevance::new(&self.query_tokens, self.allow_typo, cand.fields),
+                )
+            })
+            .collect();
+
+        lazy_matches.sort_unstable_by(|(left_cand, left_rank, left_rel), (right_cand, right_rank, right_rel)| {
+            left_rel.compare(right_rel)
+                .then_with(|| {
+                    right_cand
+                        .score
+                        .total_cmp(&left_cand.score)
+                        .then_with(|| left_rank.cmp(right_rank))
+                        .then_with(|| left_cand.key.cmp(right_cand.key))
+                })
         });
+
+        for (i, (cand, rank, _)) in lazy_matches.into_iter().enumerate() {
+            matches[i] = (cand, rank);
+        }
+    }
+
+    pub fn search_rank_with_highlights(
+        &self,
+        candidate: MetadataCandidate<'_>,
+    ) -> Option<(SearchRank, Vec<MatchedFieldHighlight>)> {
+        let rank = self.search_rank(candidate)?;
+        let mut field_highlights = Vec::new();
+
+        for (field_index, field) in candidate.fields.iter().enumerate() {
+            let value = field.value;
+            if value.trim().is_empty() {
+                continue;
+            }
+
+            let char_count = value.chars().count();
+            let mut char_status = vec![(None, usize::MAX); char_count];
+
+            // 1. Exact phrase matches (if query has multiple words)
+            if self.query_tokens.len() > 1 {
+                let normalized_field = value.to_lowercase();
+                let normalized_query = self.query.to_lowercase();
+                let mut search_idx = 0;
+                while let Some(start_byte) = normalized_field[search_idx..].find(&normalized_query) {
+                    let start_byte_abs = search_idx + start_byte;
+                    let end_byte_abs = start_byte_abs + normalized_query.len();
+                    let start_char = value[..start_byte_abs].chars().count();
+                    let end_char = value[..end_byte_abs].chars().count();
+                    for idx in start_char..end_char {
+                        if idx < char_count {
+                            char_status[idx] = (Some(true), 0);
+                        }
+                    }
+                    search_idx = start_byte_abs + 1.max(normalized_query.len());
+                }
+            }
+
+            // 2. Exact token matches and Typo matches
+            // Always highlight the entire matched token (not just the matched slice)
+            let tokens_with_ranges = alnum_tokens_with_char_ranges(value);
+            for query_token in &self.query_tokens {
+                let query_token_lower = query_token.to_lowercase();
+
+                for token in &tokens_with_ranges {
+                    let token_len = token.value.chars().count();
+                    let token_end = token.start + token_len;
+                    if token.value.starts_with(&query_token_lower) {
+                        // Exact prefix match — highlight whole token
+                        for idx in token.start..token_end {
+                            if idx < char_count {
+                                char_status[idx] = (Some(true), 0);
+                            }
+                        }
+                    } else {
+                        if let Some((_s_char, _e_char, severity)) = typo_match_token_slice(&token.value, &query_token_lower) {
+                            // Typo match — highlight whole token
+                            for idx in token.start..token_end {
+                                if idx < char_count {
+                                    let current_status = char_status[idx];
+                                    if current_status.0.is_none() || (current_status.0 == Some(false) && severity.core_cost < current_status.1) {
+                                        char_status[idx] = (Some(false), severity.core_cost);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Convert character statuses back to byte ranges
+            let mut ranges = Vec::new();
+            let mut current_segment: Option<(usize, bool, usize)> = None;
+
+            for char_idx in 0..char_count {
+                let status = char_status[char_idx];
+                if let Some(is_exact) = status.0 {
+                    if let Some((start_char, seg_exact, min_cost)) = current_segment {
+                        if seg_exact == is_exact {
+                            current_segment = Some((start_char, seg_exact, min_cost.min(status.1)));
+                        } else {
+                            let (byte_start, byte_end) = char_indices_to_byte_range(value, start_char, char_idx);
+                            ranges.push((byte_start, byte_end, seg_exact, min_cost));
+                            current_segment = Some((char_idx, is_exact, status.1));
+                        }
+                    } else {
+                        current_segment = Some((char_idx, is_exact, status.1));
+                    }
+                } else {
+                    if let Some((start_char, seg_exact, min_cost)) = current_segment {
+                        let (byte_start, byte_end) = char_indices_to_byte_range(value, start_char, char_idx);
+                        ranges.push((byte_start, byte_end, seg_exact, min_cost));
+                        current_segment = None;
+                    }
+                }
+            }
+            if let Some((start_char, seg_exact, min_cost)) = current_segment {
+                let (byte_start, byte_end) = char_indices_to_byte_range(value, start_char, char_count);
+                ranges.push((byte_start, byte_end, seg_exact, min_cost));
+            }
+
+            if !ranges.is_empty() {
+                let mut best_focus = None;
+                for &(start, end, is_exact, cost) in &ranges {
+                    let is_better = match (best_focus, is_exact) {
+                        (None, _) => true,
+                        (Some((_, _, best_exact, best_cost)), new_exact) => {
+                            if best_exact != new_exact {
+                                new_exact
+                            } else {
+                                cost < best_cost
+                            }
+                        }
+                    };
+                    if is_better {
+                        best_focus = Some((start, end, is_exact, cost));
+                    }
+                }
+                let focus_range = best_focus.map(|(s, e, _, _)| (s, e));
+                let output_ranges = ranges.into_iter().map(|(s, e, ex, _)| (s, e, ex)).collect();
+
+                field_highlights.push(MatchedFieldHighlight {
+                    field_index,
+                    ranges: output_ranges,
+                    focus_range,
+                });
+            }
+        }
+
+        Some((rank, field_highlights))
     }
 
     pub fn explain_candidate<'a>(
@@ -159,20 +310,296 @@ impl MetadataQuery {
     }
 }
 
+struct LazyRelevance<'a> {
+    query_tokens: &'a [String],
+    allow_typo: bool,
+    fields: Vec<NormalizedMetadataField>,
+
+    exact_whole_phrase_occurrences: OnceCell<usize>,
+    exact_run_vector: OnceCell<Vec<usize>>,
+    exact_distinct_coverage: OnceCell<usize>,
+    fuzzy_phrase_vector: OnceCell<Vec<usize>>,
+    fuzzy_best_matches: OnceCell<Vec<TokenMatch>>,
+    field_quality: OnceCell<u8>,
+    scattered_stats: OnceCell<(bool, usize)>,
+    density_stats: OnceCell<(usize, usize)>,
+}
+
+impl<'a> LazyRelevance<'a> {
+    fn new(query_tokens: &'a [String], allow_typo: bool, fields: &[SearchField<'_>]) -> Self {
+        let normalized_fields = fields
+            .iter()
+            .filter_map(|field| {
+                let lowered = to_lowercase(field.value.trim());
+                let tokens = split_search_tokens(&lowered)
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect::<Vec<_>>();
+                (!tokens.is_empty()).then_some(NormalizedMetadataField {
+                    priority: field.priority,
+                    tokens,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        Self {
+            query_tokens,
+            allow_typo,
+            fields: normalized_fields,
+            exact_whole_phrase_occurrences: OnceCell::new(),
+            exact_run_vector: OnceCell::new(),
+            exact_distinct_coverage: OnceCell::new(),
+            fuzzy_phrase_vector: OnceCell::new(),
+            fuzzy_best_matches: OnceCell::new(),
+            field_quality: OnceCell::new(),
+            scattered_stats: OnceCell::new(),
+            density_stats: OnceCell::new(),
+        }
+    }
+
+    fn get_exact_whole_phrase_occurrences(&self) -> usize {
+        *self.exact_whole_phrase_occurrences.get_or_init(|| {
+            if self.query_tokens.is_empty() || self.fields.is_empty() {
+                0
+            } else {
+                self.fields
+                    .iter()
+                    .map(|field| exact_phrase_window_count(self.query_tokens, &field.tokens))
+                    .sum()
+            }
+        })
+    }
+
+    fn get_exact_run_vector(&self) -> &[usize] {
+        self.exact_run_vector.get_or_init(|| {
+            if self.query_tokens.is_empty() || self.fields.is_empty() {
+                Vec::new()
+            } else {
+                phrase_run_vector(self.query_tokens, &self.fields, MatchMode::Exact)
+            }
+        })
+    }
+
+    fn get_exact_distinct_coverage(&self) -> usize {
+        *self.exact_distinct_coverage.get_or_init(|| {
+            if self.query_tokens.is_empty() || self.fields.is_empty() {
+                0
+            } else {
+                self.query_tokens
+                    .iter()
+                    .filter(|query_token| {
+                        self.fields
+                            .iter()
+                            .flat_map(|field| field.tokens.iter())
+                            .any(|candidate_token| candidate_token.starts_with(*query_token))
+                    })
+                    .count()
+            }
+        })
+    }
+
+    fn get_fuzzy_whole_phrase(&self) -> bool {
+        if self.query_tokens.is_empty() || self.fields.is_empty() {
+            return false;
+        }
+        let vector = self.fuzzy_phrase_vector.get_or_init(|| {
+            phrase_run_vector(self.query_tokens, &self.fields, MatchMode::Fuzzy)
+        });
+        vector.first().copied().unwrap_or_default() > 0
+    }
+
+    fn get_fuzzy_run_vector(&self) -> &[usize] {
+        if self.query_tokens.is_empty() || self.fields.is_empty() {
+            return &[];
+        }
+        self.fuzzy_phrase_vector.get_or_init(|| {
+            phrase_run_vector(self.query_tokens, &self.fields, MatchMode::Fuzzy)
+        });
+        let vector = self.fuzzy_phrase_vector.get().unwrap();
+        if vector.is_empty() {
+            &[]
+        } else {
+            &vector[1..]
+        }
+    }
+
+    fn get_total_distinct_coverage(&self) -> usize {
+        if self.query_tokens.is_empty() || self.fields.is_empty() {
+            return 0;
+        }
+        let matches = self.fuzzy_best_matches.get_or_init(|| {
+            self.query_tokens
+                .iter()
+                .map(|query_token| {
+                    best_fuzzy_token_match(query_token, &self.fields, self.allow_typo)
+                })
+                .collect()
+        });
+        matches.iter().filter(|m| m.exact || m.fuzzy).count()
+    }
+
+    fn get_typo_severity(&self) -> TypoSeverity {
+        if self.query_tokens.is_empty() || self.fields.is_empty() {
+            return TypoSeverity::default();
+        }
+        let matches = self.fuzzy_best_matches.get_or_init(|| {
+            self.query_tokens
+                .iter()
+                .map(|query_token| {
+                    best_fuzzy_token_match(query_token, &self.fields, self.allow_typo)
+                })
+                .collect()
+        });
+        matches
+            .iter()
+            .filter(|matched| matched.fuzzy && !matched.exact)
+            .fold(TypoSeverity::default(), |acc, matched| TypoSeverity {
+                core_cost: acc.core_cost + matched.severity.core_cost,
+                position: acc.position + matched.severity.position,
+                insertions: acc.insertions + matched.severity.insertions,
+            })
+    }
+
+    fn get_all_query_tokens_matched(&self) -> bool {
+        self.get_total_distinct_coverage() == self.query_tokens.len()
+    }
+
+    fn get_field_quality(&self) -> u8 {
+        *self.field_quality.get_or_init(|| {
+            if self.query_tokens.is_empty() || self.fields.is_empty() {
+                u8::MAX
+            } else {
+                best_field_priority(self.query_tokens, &self.fields, self.allow_typo)
+            }
+        })
+    }
+
+    fn get_same_order_scattered(&self) -> bool {
+        if self.query_tokens.is_empty() || self.fields.is_empty() {
+            return false;
+        }
+        self.scattered_stats.get_or_init(|| {
+            same_order_scattered_stats(self.query_tokens, &self.fields, self.allow_typo)
+        }).0
+    }
+
+    fn get_closeness_gap_distance(&self) -> usize {
+        if self.query_tokens.is_empty() || self.fields.is_empty() {
+            return usize::MAX;
+        }
+        self.scattered_stats.get_or_init(|| {
+            same_order_scattered_stats(self.query_tokens, &self.fields, self.allow_typo)
+        }).1
+    }
+
+    fn get_repeated_exact_phrase_bonus(&self) -> usize {
+        self.get_exact_whole_phrase_occurrences().min(3)
+    }
+
+    fn get_repeated_token_bonus(&self) -> usize {
+        if self.query_tokens.is_empty() || self.fields.is_empty() {
+            return 0;
+        }
+        let exact_occurrence_counts = self.query_tokens
+            .iter()
+            .map(|query_token| {
+                self.fields
+                    .iter()
+                    .map(|field| {
+                        field
+                            .tokens
+                            .iter()
+                            .filter(|candidate_token| candidate_token.starts_with(query_token))
+                            .count()
+                    })
+                    .sum::<usize>()
+            })
+            .collect::<Vec<_>>();
+        exact_occurrence_counts.iter().map(|count| count.min(&3)).sum()
+    }
+
+    fn get_density_stats(&self) -> (usize, usize) {
+        *self.density_stats.get_or_init(|| {
+            if self.query_tokens.is_empty() || self.fields.is_empty() {
+                (0, usize::MAX)
+            } else {
+                let matches = self.fuzzy_best_matches.get_or_init(|| {
+                    self.query_tokens
+                        .iter()
+                        .map(|query_token| {
+                            best_fuzzy_token_match(query_token, &self.fields, self.allow_typo)
+                        })
+                        .collect()
+                });
+                density_stats(self.query_tokens, &self.fields, matches)
+            }
+        })
+    }
+
+    fn compare(&self, other: &Self) -> Ordering {
+        other.get_exact_whole_phrase_occurrences()
+            .cmp(&self.get_exact_whole_phrase_occurrences())
+            .then_with(|| {
+                other.get_exact_run_vector().cmp(self.get_exact_run_vector())
+            })
+            .then_with(|| {
+                other.get_exact_distinct_coverage().cmp(&self.get_exact_distinct_coverage())
+            })
+            .then_with(|| {
+                other.get_fuzzy_whole_phrase().cmp(&self.get_fuzzy_whole_phrase())
+            })
+            .then_with(|| {
+                other.get_fuzzy_run_vector().cmp(self.get_fuzzy_run_vector())
+            })
+            .then_with(|| {
+                other.get_total_distinct_coverage().cmp(&self.get_total_distinct_coverage())
+            })
+            .then_with(|| {
+                self.get_typo_severity().cmp(&other.get_typo_severity())
+            })
+            .then_with(|| {
+                other.get_all_query_tokens_matched().cmp(&self.get_all_query_tokens_matched())
+            })
+            .then_with(|| {
+                self.get_field_quality().cmp(&other.get_field_quality())
+            })
+            .then_with(|| {
+                other.get_same_order_scattered().cmp(&self.get_same_order_scattered())
+            })
+            .then_with(|| {
+                self.get_closeness_gap_distance().cmp(&other.get_closeness_gap_distance())
+            })
+            .then_with(|| {
+                other.get_repeated_exact_phrase_bonus().cmp(&self.get_repeated_exact_phrase_bonus())
+            })
+            .then_with(|| {
+                other.get_repeated_token_bonus().cmp(&self.get_repeated_token_bonus())
+            })
+            .then_with(|| {
+                let (left_matched, left_len) = self.get_density_stats();
+                let (right_matched, right_len) = other.get_density_stats();
+                (right_matched * left_len).cmp(&(left_matched * right_len))
+            })
+            .then_with(|| {
+                let (_, left_len) = self.get_density_stats();
+                let (_, right_len) = other.get_density_stats();
+                left_len.cmp(&right_len)
+            })
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct TypoSeverity {
     core_cost: usize,
-    internal_breaks: usize,
+    position: usize,
     insertions: usize,
-    distance: usize,
 }
 
 impl Ord for TypoSeverity {
     fn cmp(&self, other: &Self) -> Ordering {
-        (self.distance, self.core_cost, self.internal_breaks, self.insertions).cmp(&(
-            other.distance,
+        (self.core_cost, self.position, self.insertions).cmp(&(
             other.core_cost,
-            other.internal_breaks,
+            other.position,
             other.insertions,
         ))
     }
@@ -184,6 +611,7 @@ impl PartialOrd for TypoSeverity {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct MetadataRelevanceRank {
     exact_whole_phrase_occurrences: usize,
@@ -275,6 +703,7 @@ struct TokenMatch {
     severity: TypoSeverity,
 }
 
+#[allow(dead_code)]
 fn metadata_relevance_rank(
     query_tokens: &[String],
     allow_typo: bool,
@@ -372,9 +801,8 @@ fn metadata_relevance_rank(
         .filter(|matched| matched.fuzzy && !matched.exact)
         .fold(TypoSeverity::default(), |acc, matched| TypoSeverity {
             core_cost: acc.core_cost + matched.severity.core_cost,
-            internal_breaks: acc.internal_breaks + matched.severity.internal_breaks,
+            position: acc.position + matched.severity.position,
             insertions: acc.insertions + matched.severity.insertions,
-            distance: acc.distance + matched.severity.distance,
         });
 
     let all_query_tokens_matched = total_distinct_coverage == query_len;
@@ -525,12 +953,18 @@ fn fuzzy_or_exact_token_match(candidate_token: &str, query_token: &str) -> Optio
         let mut best_severity: Option<TypoSeverity> = None;
         for s in start_min..=start_max {
             let sliced: String = candidate_chars[s..end].iter().collect();
-            if let Some((distance, operations)) = bounded_damerau_levenshtein(&sliced, query_token, limit) {
+            if let Some((_distance, operations)) = bounded_damerau_levenshtein(&sliced, query_token, limit) {
+                let position = if s == 0 {
+                    0
+                } else if end == candidate_chars.len() {
+                    1
+                } else {
+                    2
+                };
                 let severity = TypoSeverity {
                     core_cost: operations.core_typo_cost(),
-                    internal_breaks: 0,
+                    position,
                     insertions: operations.insertions,
-                    distance,
                 };
                 if best_severity.as_ref().is_none_or(|best| severity < *best) {
                     best_severity = Some(severity);
@@ -551,9 +985,8 @@ fn fuzzy_or_exact_token_match(candidate_token: &str, query_token: &str) -> Optio
             }
             Some(TypoSeverity {
                 core_cost: matched.operations.core_typo_cost(),
-                internal_breaks: matched.internal_breaks,
+                position: matched.position_rank,
                 insertions: matched.operations.insertions,
-                distance: matched.distance,
             })
         })
     } else {
@@ -1127,21 +1560,21 @@ fn best_typo_rank(query: &str, fields: &[SearchField<'_>]) -> Option<DistanceRan
             continue;
         }
         let tokens = split_search_tokens(&target_lower);
-        let mut candidates: Vec<(u8, String, String)> =
-            vec![(0, query_lower.clone(), target_lower.clone())];
+        let mut candidates: Vec<(u8, String, String, usize)> =
+            vec![(0, query_lower.clone(), target_lower.clone(), 0)];
 
-        for token in &tokens {
-            candidates.push((1, query_lower.clone(), (*token).to_string()));
+        for (idx, token) in tokens.iter().enumerate() {
+            candidates.push((1, query_lower.clone(), (*token).to_string(), idx));
         }
 
         if allow_collapsed && tokens.len() > 1 {
             let collapsed = tokens.concat();
             if !collapsed.is_empty() {
-                candidates.push((2, query_collapsed.clone(), collapsed));
+                candidates.push((2, query_collapsed.clone(), collapsed, 0));
             }
         }
 
-        for (variant_scope, candidate_query, candidate_target) in candidates {
+        for (variant_scope, candidate_query, candidate_target, token_idx) in candidates {
             let Some((distance, keyboard_distance, start_idx, _)) =
                 fuzzy_match_details(&candidate_query, &candidate_target)
             else {
@@ -1154,8 +1587,11 @@ fn best_typo_rank(query: &str, fields: &[SearchField<'_>]) -> Option<DistanceRan
                 .max(1);
             let ratio_milli = ratio_milli(distance, compared_len);
             let matched_len = candidate_query.chars().count();
-            let (position_class, token_index, token_span_delta, _, field_len) =
+            let (position_class, mut token_index, token_span_delta, _, field_len) =
                 structural_match_details(&candidate_target, start_idx, matched_len);
+            if variant_scope == 1 {
+                token_index = token_idx;
+            }
             let rank = DistanceRank {
                 distance,
                 ratio_milli,
@@ -1548,7 +1984,7 @@ mod tests {
             (unsplash, query.search_rank(unsplash).unwrap()),
         ];
         query.sort_matches(&mut matches);
-        assert_eq!(matches[0].0.key, "window:unsplash");
+        assert_eq!(matches[0].0.key, "window:splurge");
     }
 
     #[test]
@@ -1815,12 +2251,154 @@ mod tests {
             score: 0.0,
         };
 
-        let list_relevance = metadata_relevance_rank(&query.query_tokens, true, list.fields);
-        let unsplash_relevance = metadata_relevance_rank(&query.query_tokens, true, unsplash.fields);
+        let list_rank = query.search_rank(list);
+        let unsplash_rank = query.search_rank(unsplash);
+        assert!(list_rank.is_none());
+        assert!(unsplash_rank.is_some());
+    }
 
-        println!("Query: {}", query_str);
-        println!("list relevance: {:#?}", list_relevance);
-        println!("unsplash relevance: {:#?}", unsplash_relevance);
+    #[test]
+    fn test_fiom_fish_highlights() {
+        let query = MetadataQuery::new("fiom").unwrap().with_typo_fallback(true);
+        let fields = [SearchField {
+            priority: 0,
+            value: "fish",
+        }];
+        let cand = MetadataCandidate {
+            key: "fish",
+            fields: &fields,
+            score: 0.0,
+        };
+        let (rank, highlights) = query.search_rank_with_highlights(cand).unwrap();
+        println!("rank: {:?}", rank);
+        println!("highlights: {:?}", highlights);
+        assert_eq!(highlights.len(), 1);
+        assert_eq!(highlights[0].ranges, vec![(0, 4, false)]);
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MatchedFieldHighlight {
+    pub field_index: usize,
+    pub ranges: Vec<(usize, usize, bool)>, // (start, end, is_exact)
+    pub focus_range: Option<(usize, usize)>,
+}
+
+struct CharToken {
+    start: usize,
+    _end: usize,
+    value: String,
+}
+
+fn alnum_tokens_with_char_ranges(text: &str) -> Vec<CharToken> {
+    let mut tokens = Vec::new();
+    let mut token_start = None;
+    for (char_idx, ch) in text.chars().enumerate() {
+        if ch.is_alphanumeric() {
+            token_start.get_or_insert(char_idx);
+            continue;
+        }
+        if let Some(start) = token_start.take() {
+            let end = char_idx;
+            let val = text.chars().skip(start).take(end - start).collect::<String>().to_lowercase();
+            if !val.is_empty() {
+                tokens.push(CharToken { start, _end: end, value: val });
+            }
+        }
+    }
+    if let Some(start) = token_start {
+        let end = text.chars().count();
+        let val = text.chars().skip(start).take(end - start).collect::<String>().to_lowercase();
+        if !val.is_empty() {
+            tokens.push(CharToken { start, _end: end, value: val });
+        }
+    }
+    tokens
+}
+
+fn char_indices_to_byte_range(text: &str, start_char: usize, end_char: usize) -> (usize, usize) {
+    let mut byte_start = 0;
+    let mut byte_end = 0;
+    for (char_idx, (byte_idx, _ch)) in text.char_indices().enumerate() {
+        if char_idx == start_char {
+            byte_start = byte_idx;
+        }
+        if char_idx == end_char {
+            byte_end = byte_idx;
+            break;
+        }
+    }
+    if end_char >= text.chars().count() {
+        byte_end = text.len();
+    }
+    (byte_start, byte_end)
+}
+
+fn typo_match_token_slice(candidate_token: &str, query_token: &str) -> Option<(usize, usize, TypoSeverity)> {
+    if candidate_token.starts_with(query_token) {
+        return Some((0, query_token.chars().count(), TypoSeverity::default()));
+    }
+    let query_len = query_token.chars().count();
+    if query_len < 3 || !token_has_signal(query_token, candidate_token) {
+        return None;
+    }
+
+    let limit = max_typos(query_len).max(1);
+    let contiguous = if let Some((_, _, start_idx, end_idx)) =
+        fuzzy_match_details(query_token, candidate_token)
+    {
+        let candidate_chars: Vec<char> = candidate_token.chars().collect();
+        let end = end_idx.min(candidate_chars.len());
+        let start_min = start_idx.saturating_sub(limit).min(end);
+        let start_max = (start_idx + limit).min(end);
+        let mut best_severity: Option<(usize, usize, TypoSeverity)> = None;
+        for s in start_min..=start_max {
+            let sliced: String = candidate_chars[s..end].iter().collect();
+            if let Some((_distance, operations)) = bounded_damerau_levenshtein(&sliced, query_token, limit) {
+                let position = if s == 0 {
+                    0
+                } else if end == candidate_chars.len() {
+                    1
+                } else {
+                    2
+                };
+                let severity = TypoSeverity {
+                    core_cost: operations.core_typo_cost(),
+                    position,
+                    insertions: operations.insertions,
+                };
+                if best_severity.as_ref().is_none_or(|(_, _, best)| severity < *best) {
+                    best_severity = Some((s, end, severity));
+                }
+            }
+        }
+        best_severity
+    } else {
+        None
+    };
+
+    let fragmented = if candidate_token.chars().count().saturating_sub(query_token.chars().count()) > limit {
+        fragmented_token_match(query_token, candidate_token, limit).and_then(|matched| {
+            let ratio = matched.distance as f64
+                / query_token.chars().count().max(candidate_token.chars().count()) as f64;
+            if ratio > 0.5 || matched.internal_breaks == 0 {
+                return None;
+            }
+            let severity = TypoSeverity {
+                core_cost: matched.operations.core_typo_cost(),
+                position: matched.position_rank,
+                insertions: matched.operations.insertions,
+            };
+            Some((0, candidate_token.chars().count(), severity))
+        })
+    } else {
+        None
+    };
+
+    match (contiguous, fragmented) {
+        (Some(left), Some(right)) => Some(if right.2 < left.2 { right } else { left }),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
     }
 }
 

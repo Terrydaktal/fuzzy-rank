@@ -12,13 +12,26 @@ pub fn token_has_signal(token: &str, candidate: &str) -> bool {
     match chars.as_slice() {
         [] => false,
         [single] => candidate.contains(*single),
+        _ if chars.len() <= 4 => {
+            let required = 2;
+            let mut matched_chars = 0;
+            for ch in &chars {
+                if candidate.contains(*ch) {
+                    matched_chars += 1;
+                    if matched_chars >= required {
+                        return true;
+                    }
+                }
+            }
+            false
+        }
         _ => {
-            let required = if chars.len() <= 3 { 1 } else { 2 };
             let mut overlap = 0;
+            let candidate_chars = candidate.chars().collect::<Vec<_>>();
             for pair in chars.windows(2) {
-                if candidate.contains([pair[0], pair[1]]) {
+                if candidate_chars.windows(2).any(|w| w == pair) {
                     overlap += 1;
-                    if overlap >= required {
+                    if overlap >= 2 {
                         return true;
                     }
                 }

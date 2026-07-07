@@ -664,7 +664,7 @@ mod tests {
                     deletions: 0,
                     transpositions: 0,
                     keyboard_distance: 2,
-                    substitution_penalty: 47,
+                    substitution_penalty: 2,
                     insertion_penalty: 0,
                 },
             ))
@@ -714,7 +714,7 @@ mod tests {
     #[test]
     fn long_queries_use_half_length_typo_limit() {
         let candidate = best_match("/home/lewis/xfce4-terminal", 10.0, "xgce4-tremriianl").unwrap();
-        assert_eq!(candidate.distance, 5);
+        assert_eq!(candidate.distance, 6);
     }
 
     #[test]
