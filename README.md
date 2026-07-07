@@ -281,6 +281,15 @@ contiguous unmatched character count around the matched keyword
 span(s) inside the chosen token/component. That makes `application` rank closer to `applications`
 than to `applicationlauncher` after position and score have already been compared.
 
+Only the leading exact-path stages are materialized eagerly:
+
+- `segment`
+- `position`
+- caller `score`
+
+`insertions` and `path_depth` are deferred until an exact-path comparison reaches those tie-break
+levels.
+
 ### `path::typo`
 
 `path::typo` owns:
@@ -322,6 +331,9 @@ For single-token contiguous substring matches with no core typo, `path::typo` ta
 - raw `insertions` equal to the unmatched candidate-side slack
 
 So among pure insertion-only matches, ranking falls through quickly to `segment`, then within-segment `position`, then to descending `score`, and later to `insertions` if those still tie.
+
+For path typo ranking, `path_depth` is also deferred until a comparison actually reaches that final
+structural tie-break.
 
 Shared versus adapter-local:
 
@@ -368,7 +380,7 @@ What is command-history-specific here:
 
 This is the adapter to use for shell command history search.
 
-### Exact command-history sort order
+### Command-history sort order
 
 `command_history` uses the shared `TypoSortKey` comparator from `ranking.rs`.
 The exact command-history sort key order is:
@@ -416,8 +428,8 @@ Purpose:
 - phrase-aware ordering for exact multi-token sequences
 - lightweight precomputation for repeated query evaluation
 
-This adapter is intended for message search where coverage and phrase continuity
-matter more than typo-distance ranking.
+This adapter is intended for message search where metadata-style exact phrase and
+coverage ranking are needed on a single text field, without typo handling.
 
 It owns:
 
@@ -433,32 +445,35 @@ It uses shared core from:
 
 What is message-specific here:
 
-- phrase matches outrank split-token matches
-- broader token coverage outranks repeated occurrences of only one query term
-- repeated query-term occurrences refine ties after phrase coverage
+- applying the metadata exact-only relevance stack to one text field
+- omitting typo/fuzzy stages entirely
+- omitting field-quality stages because message search is single-field
 
 Message matching first prepares lowercased search tokens for the query and each candidate.
 Candidates that do not contain any usable query signal are rejected before sorting.
 
 Final message result ordering is:
 
-1. descending `matched_terms`
-2. phrase presence, with phrase matches first
-3. descending `adjacent_run_len`
-4. `covering_span_len`, ascending, with missing spans last
-5. `covering_span_position`, ascending, with missing spans last
-6. descending `total_occurrences`
-7. descending `score`
-8. `key`
+1. exact whole-phrase occurrence count
+2. exact longer phrase-run vector, lexicographic
+3. exact distinct query-token coverage
+4. whether all query tokens are matched
+5. same-order scattered matching
+6. closeness / gap distance
+7. repeated exact phrase bonus, saturated
+8. repeated token bonus, saturated
+9. density / low clutter
+10. descending `score`
+11. `key`
 
 Where:
 
-- `matched_terms` is how many distinct query terms appear in the candidate
-- phrase presence means the full query phrase appears contiguously at least once
-- `adjacent_run_len` is the longest adjacent query-token run found in the candidate
-- `covering_span_len` is the smallest token span that covers all matched query terms
-- `covering_span_position` is the first position of that covering span
-- `total_occurrences` is the total count of matched query-term occurrences
+- exact phrase stages use contiguous query-token windows matched by token-prefix exactness
+- exact distinct coverage counts how many different query tokens are matched exactly
+- same-order scattered matching prefers candidates where all query tokens can be recovered in query order
+- closeness / gap distance prefers smaller gaps between those ordered matches
+- repeated exact phrase bonus and repeated token bonus saturate at `3`
+- density prefers candidates where matched concepts occupy a larger fraction of a shorter message
 
 This is the adapter to use for:
 
@@ -538,8 +553,10 @@ Where:
 - one- and two-character metadata queries only use exact/prefix-style matching; fuzzy and typo token matching start at three characters to keep early interactive search cheap
 - typo severity uses the shared intended-to-typed edit engine from `core.rs` and compares:
   - summed core typo cost
-  - then summed `internal_breaks` (total candidate-side break regions around matched runs)
+  - then summed per-token `position`
   - then summed `insertions`
+  Here metadata `position` is still the token-local typo position used by the metadata matcher:
+  `0` for start, `1` for end, and `2` for middle.
 - field quality is `SearchField.priority`, ascending
 - same-order scattered matching prefers candidates where all query tokens can be recovered in query order within one field
 - closeness / gap distance prefers smaller gaps between those ordered matches
@@ -547,6 +564,11 @@ Where:
 
 `SearchRank` is still computed and used for provenance, highlighting, and as a
 late tie-break, but it is no longer the primary metadata result order.
+The final tail of the comparator is:
+
+1. descending caller `score`
+2. `SearchRank`
+3. `key`
 
 Shared versus adapter-local:
 

@@ -18,7 +18,6 @@ pub struct PathMatch<'a> {
     pub position: usize,
     pub operations: OperationProfile,
     pub score: Score,
-    pub path_depth: usize,
 }
 
 impl<'a> PathMatch<'a> {
@@ -29,7 +28,6 @@ impl<'a> PathMatch<'a> {
             segment: self.segment,
             position: self.position,
             score: self.score,
-            path_depth: self.path_depth,
             key: self.path,
         }
     }
@@ -134,8 +132,6 @@ fn best_match_inner<'a>(
     if components.is_empty() {
         return None;
     }
-    let path_depth = components.len();
-
     if split_path_tokens(query).len() == 1 {
         return best_match_single_token(
             path,
@@ -145,7 +141,6 @@ fn best_match_inner<'a>(
             limit,
             &lower_path,
             &components,
-            path_depth,
         );
     }
 
@@ -157,7 +152,6 @@ fn best_match_inner<'a>(
         query,
         query_len,
         limit,
-        path_depth,
     };
 
     let mut best = candidate_for_text(&ctx, basename, 0);
@@ -218,7 +212,6 @@ fn best_basename_match_inner<'a>(
         return None;
     }
 
-    let path_depth = components.len();
     let basename = *components.last().unwrap();
     let ctx = MatchContext {
         path,
@@ -226,7 +219,6 @@ fn best_basename_match_inner<'a>(
         query,
         query_len,
         limit,
-        path_depth,
     };
     let mut best = candidate_for_text(&ctx, basename, 0);
     update_best(
@@ -252,7 +244,6 @@ fn best_match_single_token<'a>(
     limit: usize,
     lower_path: &str,
     components: &[&str],
-    path_depth: usize,
 ) -> Option<PathMatch<'a>> {
     let basename = *components.last().unwrap();
     let basename_idx = components.len() - 1;
@@ -262,7 +253,6 @@ fn best_match_single_token<'a>(
         query,
         query_len,
         limit,
-        path_depth,
     };
 
     let mut best = candidate_for_text(&ctx, basename, 0);
@@ -336,7 +326,6 @@ struct MatchContext<'a, 'q> {
     query: &'q str,
     query_len: usize,
     limit: usize,
-    path_depth: usize,
 }
 
 fn candidate_for_text<'a>(
@@ -376,7 +365,6 @@ fn candidate_for_text<'a>(
                         ..OperationProfile::default()
                     },
                     score: ctx.score,
-                    path_depth: ctx.path_depth,
                 });
             }
         }
@@ -409,7 +397,6 @@ fn candidate_for_text<'a>(
         position: position_rank,
         operations,
         score: ctx.score,
-        path_depth: ctx.path_depth,
     })
 }
 
@@ -450,7 +437,6 @@ fn candidate_for_token_sequence<'a>(
         position,
         operations,
         score: ctx.score,
-        path_depth: ctx.path_depth,
     })
 }
 
@@ -480,7 +466,6 @@ fn candidate_for_compound_component<'a>(
         position,
         operations,
         score: ctx.score,
-        path_depth: ctx.path_depth,
     })
 }
 
@@ -507,7 +492,6 @@ fn candidate_for_partitioned_single_query<'a>(
             position: matched.position_rank,
             operations: matched.operations,
             score: ctx.score,
-            path_depth: ctx.path_depth,
         });
     }
     let matched = fragmented_token_match(ctx.query, candidate, ctx.limit)?;
@@ -524,7 +508,6 @@ fn candidate_for_partitioned_single_query<'a>(
         position: matched.position_rank,
         operations: matched.operations,
         score: ctx.score,
-        path_depth: ctx.path_depth,
     })
 }
 
@@ -570,7 +553,6 @@ fn candidate_for_component_sequence<'a>(
         position,
         operations,
         score: ctx.score,
-        path_depth: ctx.path_depth,
     })
 }
 

@@ -16,10 +16,8 @@ pub enum MatchQuality {
 pub struct ExactPathMatch<'a> {
     pub path: &'a str,
     pub score: Score,
-    pub insertions: usize,
     pub segment: usize,
     pub position: usize,
-    pub path_depth: usize,
 }
 
 pub fn exact_match<'a>(
@@ -30,23 +28,22 @@ pub fn exact_match<'a>(
     Some(ExactPathMatch {
         path,
         score,
-        insertions: match_penalty(path, keywords)?,
         segment: match_path_segment(path, keywords)?,
         position: match_path_position(path, keywords)?,
-        path_depth: path_depth(path),
     })
 }
 
 pub fn compare_exact_path_matches(
-    left: ExactPathMatch<'_>,
-    right: ExactPathMatch<'_>,
+    left: &ExactPathMatch<'_>,
+    right: &ExactPathMatch<'_>,
+    keywords: &[String],
 ) -> std::cmp::Ordering {
     left.segment
         .cmp(&right.segment)
         .then_with(|| left.position.cmp(&right.position))
         .then_with(|| right.score.total_cmp(&left.score))
-        .then_with(|| left.insertions.cmp(&right.insertions))
-        .then_with(|| left.path_depth.cmp(&right.path_depth))
+        .then_with(|| match_penalty(left.path, keywords).cmp(&match_penalty(right.path, keywords)))
+        .then_with(|| path_depth(left.path).cmp(&path_depth(right.path)))
         .then_with(|| left.path.cmp(right.path))
 }
 
@@ -254,34 +251,30 @@ mod tests {
         let worse_position = ExactPathMatch {
             path: "/home/lewis/tasks/config",
             score: 50.0,
-            insertions: 0,
             segment: lower_insertions.segment,
             position: lower_insertions.position + 1,
-            path_depth: lower_insertions.path_depth,
         };
         let worse_segment = ExactPathMatch {
             path: "/home/lewis/tasks/config",
             score: 100.0,
-            insertions: 0,
             segment: lower_insertions.segment + 1,
             position: 0,
-            path_depth: lower_insertions.path_depth,
         };
 
         assert_eq!(
-            compare_exact_path_matches(higher_score, lower_insertions),
+            compare_exact_path_matches(&higher_score, &lower_insertions, &keywords),
             std::cmp::Ordering::Less
         );
         assert_eq!(
-            compare_exact_path_matches(lower_insertions, higher_insertions),
+            compare_exact_path_matches(&lower_insertions, &higher_insertions, &keywords),
             std::cmp::Ordering::Less
         );
         assert_eq!(
-            compare_exact_path_matches(lower_insertions, worse_position),
+            compare_exact_path_matches(&lower_insertions, &worse_position, &keywords),
             std::cmp::Ordering::Less
         );
         assert_eq!(
-            compare_exact_path_matches(lower_insertions, worse_segment),
+            compare_exact_path_matches(&lower_insertions, &worse_segment, &keywords),
             std::cmp::Ordering::Less
         );
     }

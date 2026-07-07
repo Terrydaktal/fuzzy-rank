@@ -269,8 +269,11 @@ pub struct PathTypoSortKey<'a> {
     pub segment: usize,
     pub position: usize,
     pub score: f64,
-    pub path_depth: usize,
     pub key: &'a str,
+}
+
+fn path_depth(path: &str) -> usize {
+    path.chars().filter(|ch| matches!(ch, '/' | '\\')).count()
 }
 
 pub fn compare_path_typo_sort_keys(
@@ -284,7 +287,7 @@ pub fn compare_path_typo_sort_keys(
         .then_with(|| left.position.cmp(&right.position))
         .then_with(|| right.score.total_cmp(&left.score))
         .then_with(|| left.operations.insertions.cmp(&right.operations.insertions))
-        .then_with(|| left.path_depth.cmp(&right.path_depth))
+        .then_with(|| path_depth(left.key).cmp(&path_depth(right.key)))
         .then_with(|| left.key.cmp(right.key))
 }
 
