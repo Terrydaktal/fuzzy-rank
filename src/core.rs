@@ -1,5 +1,162 @@
 use std::cmp::Ordering;
 
+pub fn compare_score_desc(left: f64, right: f64) -> Ordering {
+    right.total_cmp(&left)
+}
+
+pub fn compare_key_asc(left: &str, right: &str) -> Ordering {
+    left.cmp(right)
+}
+
+pub fn ratio_milli(distance: usize, compared_len: usize) -> usize {
+    distance * 1000 / compared_len.max(1)
+}
+
+pub fn exact_phrase_count<'a, Q, C, I>(query_tokens: &[Q], fields: I) -> usize
+where
+    Q: AsRef<str>,
+    C: AsRef<str> + 'a,
+    I: IntoIterator<Item = &'a [C]>,
+{
+    if query_tokens.is_empty() {
+        return 0;
+    }
+    fields
+        .into_iter()
+        .map(|tokens| {
+            tokens
+                .windows(query_tokens.len())
+                .filter(|window| exact_prefix_window(query_tokens, window))
+                .count()
+        })
+        .sum()
+}
+
+pub fn exact_phrase_run_vector<'a, Q, C, I>(query_tokens: &[Q], fields: I) -> Vec<usize>
+where
+    Q: AsRef<str>,
+    C: AsRef<str> + 'a,
+    I: IntoIterator<Item = &'a [C]>,
+{
+    if query_tokens.is_empty() {
+        return Vec::new();
+    }
+    let fields = fields.into_iter().collect::<Vec<_>>();
+    (2..=query_tokens.len())
+        .rev()
+        .map(|window_len| {
+            let mut count = 0;
+            for query_start in 0..=query_tokens.len() - window_len {
+                let query_window = &query_tokens[query_start..query_start + window_len];
+                count += fields
+                    .iter()
+                    .map(|tokens| {
+                        tokens
+                            .windows(window_len)
+                            .filter(|window| exact_prefix_window(query_window, window))
+                            .count()
+                    })
+                    .sum::<usize>();
+            }
+            count
+        })
+        .collect()
+}
+
+pub fn exact_distinct_coverage<'a, Q, C, I>(query_tokens: &[Q], fields: I) -> usize
+where
+    Q: AsRef<str>,
+    C: AsRef<str> + 'a,
+    I: IntoIterator<Item = &'a [C]>,
+{
+    let fields = fields.into_iter().collect::<Vec<_>>();
+    query_tokens
+        .iter()
+        .filter(|query| {
+            fields.iter().any(|tokens| {
+                tokens
+                    .iter()
+                    .any(|candidate| candidate.as_ref().starts_with(query.as_ref()))
+            })
+        })
+        .count()
+}
+
+pub fn exact_token_occurrence_counts<'a, Q, C, I>(query_tokens: &[Q], fields: I) -> Vec<usize>
+where
+    Q: AsRef<str>,
+    C: AsRef<str> + 'a,
+    I: IntoIterator<Item = &'a [C]>,
+{
+    let fields = fields.into_iter().collect::<Vec<_>>();
+    query_tokens
+        .iter()
+        .map(|query| {
+            fields
+                .iter()
+                .map(|tokens| {
+                    tokens
+                        .iter()
+                        .filter(|candidate| candidate.as_ref().starts_with(query.as_ref()))
+                        .count()
+                })
+                .sum()
+        })
+        .collect()
+}
+
+pub fn ordered_token_span<'a, Q, C, I, F>(
+    query_tokens: &[Q],
+    fields: I,
+    mut token_matches: F,
+) -> (bool, usize)
+where
+    Q: AsRef<str>,
+    C: AsRef<str> + 'a,
+    I: IntoIterator<Item = &'a [C]>,
+    F: FnMut(&str, &str) -> bool,
+{
+    if query_tokens.is_empty() {
+        return (false, usize::MAX);
+    }
+
+    let mut found = false;
+    let mut best_gap = usize::MAX;
+    for field in fields {
+        let mut search_from = 0;
+        let mut first = None;
+        let mut last = 0;
+        let mut matched = 0;
+        for query in query_tokens {
+            let Some((idx, _)) = field
+                .iter()
+                .enumerate()
+                .skip(search_from)
+                .find(|(_, candidate)| token_matches(query.as_ref(), candidate.as_ref()))
+            else {
+                break;
+            };
+            first.get_or_insert(idx);
+            last = idx;
+            matched += 1;
+            search_from = idx + 1;
+        }
+        if matched == query_tokens.len() {
+            found = true;
+            let span = last - first.unwrap_or(last);
+            best_gap = best_gap.min(span.saturating_sub(query_tokens.len() - 1));
+        }
+    }
+    (found, best_gap)
+}
+
+fn exact_prefix_window<Q: AsRef<str>, C: AsRef<str>>(query: &[Q], candidate: &[C]) -> bool {
+    candidate
+        .iter()
+        .zip(query)
+        .all(|(candidate, query)| candidate.as_ref().starts_with(query.as_ref()))
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct OperationProfile {
     pub substitutions: usize,
@@ -288,6 +445,32 @@ pub fn bounded_damerau_levenshtein(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exact_relevance_primitives_work_across_fields() {
+        let query = vec!["one".to_string(), "two".to_string(), "three".to_string()];
+        let first = vec!["one".to_string(), "twofold".to_string()];
+        let second = vec!["three".to_string(), "one".to_string(), "two".to_string()];
+        let fields = [first.as_slice(), second.as_slice()];
+
+        assert_eq!(exact_phrase_count(&query, fields), 0);
+        assert_eq!(exact_phrase_run_vector(&query, fields), vec![0, 2]);
+        assert_eq!(exact_distinct_coverage(&query, fields), 3);
+        assert_eq!(exact_token_occurrence_counts(&query, fields), vec![2, 2, 1]);
+    }
+
+    #[test]
+    fn ordered_span_uses_caller_match_policy_across_fields() {
+        let query = ["one", "two", "three"];
+        let scattered = ["one", "x", "two", "y", "three"];
+        let closer = ["one", "two", "three"];
+        assert_eq!(
+            ordered_token_span(&query, [&scattered[..], &closer[..]], |query, candidate| {
+                candidate.starts_with(query)
+            }),
+            (true, 0)
+        );
+    }
 
     #[test]
     fn transpositions_are_cheaper_than_substitutions_as_a_tiebreak() {

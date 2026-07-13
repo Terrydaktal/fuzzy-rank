@@ -1,5 +1,6 @@
 use std::path;
 
+use crate::core::{compare_key_asc, compare_score_desc};
 use crate::text::to_lowercase;
 
 pub type Score = f64;
@@ -41,10 +42,10 @@ pub fn compare_exact_path_matches(
     left.segment
         .cmp(&right.segment)
         .then_with(|| left.position.cmp(&right.position))
-        .then_with(|| right.score.total_cmp(&left.score))
+        .then_with(|| compare_score_desc(left.score, right.score))
         .then_with(|| match_penalty(left.path, keywords).cmp(&match_penalty(right.path, keywords)))
         .then_with(|| path_depth(left.path).cmp(&path_depth(right.path)))
-        .then_with(|| left.path.cmp(right.path))
+        .then_with(|| compare_key_asc(left.path, right.path))
 }
 
 pub fn match_penalty(path: &str, keywords: &[String]) -> Option<usize> {

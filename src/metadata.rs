@@ -1,7 +1,11 @@
-use crate::core::{bounded_damerau_levenshtein, keyboard_substitution_cost, max_typos};
+use crate::core::{
+    bounded_damerau_levenshtein, compare_key_asc, compare_score_desc, exact_distinct_coverage,
+    exact_phrase_count, exact_phrase_run_vector, exact_token_occurrence_counts,
+    keyboard_substitution_cost, max_typos, ordered_token_span, ratio_milli,
+};
 use crate::token_match::fragmented_token_match;
 use crate::ranking::{
-    AbbreviationRank, DistanceRank, SearchRank, StructuralRank, compare_search_results, ratio_milli,
+    AbbreviationRank, DistanceRank, SearchRank, StructuralRank, compare_search_results,
 };
 use crate::text::{normalize_compact_alnum, split_search_tokens, to_lowercase, token_has_signal};
 use std::cell::OnceCell;
@@ -107,11 +111,9 @@ impl MetadataQuery {
 
         left_relevance.compare(&right_relevance)
             .then_with(|| {
-                right_candidate
-                    .score
-                    .total_cmp(&left_candidate.score)
+                compare_score_desc(left_candidate.score, right_candidate.score)
                     .then_with(|| left_rank.cmp(right_rank))
-                    .then_with(|| left_candidate.key.cmp(right_candidate.key))
+                    .then_with(|| compare_key_asc(left_candidate.key, right_candidate.key))
             })
     }
 
@@ -130,11 +132,9 @@ impl MetadataQuery {
         lazy_matches.sort_unstable_by(|(left_cand, left_rank, left_rel), (right_cand, right_rank, right_rel)| {
             left_rel.compare(right_rel)
                 .then_with(|| {
-                    right_cand
-                        .score
-                        .total_cmp(&left_cand.score)
+                    compare_score_desc(left_cand.score, right_cand.score)
                         .then_with(|| left_rank.cmp(right_rank))
-                        .then_with(|| left_cand.key.cmp(right_cand.key))
+                        .then_with(|| compare_key_asc(left_cand.key, right_cand.key))
                 })
         });
 
@@ -362,10 +362,10 @@ impl<'a> LazyRelevance<'a> {
             if self.query_tokens.is_empty() || self.fields.is_empty() {
                 0
             } else {
-                self.fields
-                    .iter()
-                    .map(|field| exact_phrase_window_count(self.query_tokens, &field.tokens))
-                    .sum()
+                exact_phrase_count(
+                    self.query_tokens,
+                    self.fields.iter().map(|field| field.tokens.as_slice()),
+                )
             }
         })
     }
@@ -375,7 +375,10 @@ impl<'a> LazyRelevance<'a> {
             if self.query_tokens.is_empty() || self.fields.is_empty() {
                 Vec::new()
             } else {
-                phrase_run_vector(self.query_tokens, &self.fields, MatchMode::Exact)
+                exact_phrase_run_vector(
+                    self.query_tokens,
+                    self.fields.iter().map(|field| field.tokens.as_slice()),
+                )
             }
         })
     }
@@ -385,15 +388,10 @@ impl<'a> LazyRelevance<'a> {
             if self.query_tokens.is_empty() || self.fields.is_empty() {
                 0
             } else {
-                self.query_tokens
-                    .iter()
-                    .filter(|query_token| {
-                        self.fields
-                            .iter()
-                            .flat_map(|field| field.tokens.iter())
-                            .any(|candidate_token| candidate_token.starts_with(*query_token))
-                    })
-                    .count()
+                exact_distinct_coverage(
+                    self.query_tokens,
+                    self.fields.iter().map(|field| field.tokens.as_slice()),
+                )
             }
         })
     }
@@ -403,7 +401,7 @@ impl<'a> LazyRelevance<'a> {
             return false;
         }
         let vector = self.fuzzy_phrase_vector.get_or_init(|| {
-            phrase_run_vector(self.query_tokens, &self.fields, MatchMode::Fuzzy)
+            fuzzy_phrase_run_vector(self.query_tokens, &self.fields)
         });
         vector.first().copied().unwrap_or_default() > 0
     }
@@ -413,7 +411,7 @@ impl<'a> LazyRelevance<'a> {
             return &[];
         }
         self.fuzzy_phrase_vector.get_or_init(|| {
-            phrase_run_vector(self.query_tokens, &self.fields, MatchMode::Fuzzy)
+            fuzzy_phrase_run_vector(self.query_tokens, &self.fields)
         });
         let vector = self.fuzzy_phrase_vector.get().unwrap();
         if vector.is_empty() {
@@ -745,44 +743,26 @@ fn metadata_relevance_rank(
     }
 
     let query_len = query_tokens.len();
-    let exact_occurrence_counts = query_tokens
-        .iter()
-        .map(|query_token| {
-            normalized_fields
-                .iter()
-                .map(|field| {
-                    field
-                        .tokens
-                        .iter()
-                        .filter(|candidate_token| candidate_token.starts_with(query_token))
-                        .count()
-                })
-                .sum::<usize>()
-        })
-        .collect::<Vec<_>>();
-
-    let exact_token_matches = query_tokens
-        .iter()
-        .map(|query_token| {
-            normalized_fields
-                .iter()
-                .flat_map(|field| field.tokens.iter())
-                .any(|candidate_token| candidate_token.starts_with(query_token))
-        })
-        .collect::<Vec<_>>();
+    let exact_occurrence_counts = exact_token_occurrence_counts(
+        query_tokens,
+        normalized_fields.iter().map(|field| field.tokens.as_slice()),
+    );
 
     let fuzzy_best_matches = query_tokens
         .iter()
         .map(|query_token| best_fuzzy_token_match(query_token, &normalized_fields, allow_typo))
         .collect::<Vec<_>>();
 
-    let exact_whole_phrase_occurrences: usize = normalized_fields
-        .iter()
-        .map(|field| exact_phrase_window_count(query_tokens, &field.tokens))
-        .sum();
+    let exact_whole_phrase_occurrences = exact_phrase_count(
+        query_tokens,
+        normalized_fields.iter().map(|field| field.tokens.as_slice()),
+    );
 
-    let exact_run_vector = phrase_run_vector(query_tokens, &normalized_fields, MatchMode::Exact);
-    let fuzzy_phrase_vector = phrase_run_vector(query_tokens, &normalized_fields, MatchMode::Fuzzy);
+    let exact_run_vector = exact_phrase_run_vector(
+        query_tokens,
+        normalized_fields.iter().map(|field| field.tokens.as_slice()),
+    );
+    let fuzzy_phrase_vector = fuzzy_phrase_run_vector(query_tokens, &normalized_fields);
     let fuzzy_whole_phrase = fuzzy_phrase_vector
         .first()
         .copied()
@@ -790,7 +770,10 @@ fn metadata_relevance_rank(
         > 0;
     let fuzzy_run_vector = fuzzy_phrase_vector.into_iter().skip(1).collect::<Vec<_>>();
 
-    let exact_distinct_coverage = exact_token_matches.iter().filter(|matched| **matched).count();
+    let exact_distinct_coverage = exact_distinct_coverage(
+        query_tokens,
+        normalized_fields.iter().map(|field| field.tokens.as_slice()),
+    );
     let total_distinct_coverage = fuzzy_best_matches
         .iter()
         .filter(|matched| matched.exact || matched.fuzzy)
@@ -839,31 +822,9 @@ fn metadata_relevance_rank(
     }
 }
 
-#[derive(Clone, Copy)]
-enum MatchMode {
-    Exact,
-    Fuzzy,
-}
-
-fn exact_phrase_window_count(query_tokens: &[String], field_tokens: &[String]) -> usize {
-    if query_tokens.is_empty() || field_tokens.len() < query_tokens.len() {
-        return 0;
-    }
-    field_tokens
-        .windows(query_tokens.len())
-        .filter(|window| {
-            window
-                .iter()
-                .zip(query_tokens)
-                .all(|(candidate, query)| candidate.starts_with(query))
-        })
-        .count()
-}
-
-fn phrase_run_vector(
+fn fuzzy_phrase_run_vector(
     query_tokens: &[String],
     fields: &[NormalizedMetadataField],
-    mode: MatchMode,
 ) -> Vec<usize> {
     if query_tokens.is_empty() {
         return Vec::new();
@@ -881,15 +842,13 @@ fn phrase_run_vector(
                     count += field
                         .tokens
                         .windows(window_len)
-                        .filter(|candidate_window| match mode {
-                            MatchMode::Exact => candidate_window
+                        .filter(|candidate_window| {
+                            candidate_window
                                 .iter()
                                 .zip(query_window.iter())
-                                .all(|(candidate, query)| candidate.starts_with(query)),
-                            MatchMode::Fuzzy => candidate_window
-                                .iter()
-                                .zip(query_window.iter())
-                                .all(|(candidate, query)| fuzzy_or_exact_token_match(candidate, query).is_some()),
+                                .all(|(candidate, query)| {
+                                    fuzzy_or_exact_token_match(candidate, query).is_some()
+                                })
                         })
                         .count();
                 }
@@ -1025,36 +984,14 @@ fn same_order_scattered_stats(
     fields: &[NormalizedMetadataField],
     allow_typo: bool,
 ) -> (bool, usize) {
-    let mut found = false;
-    let mut best_gap = usize::MAX;
-    for field in fields {
-        let mut positions = Vec::new();
-        let mut search_from = 0usize;
-        for query_token in query_tokens {
-            let Some((idx, _)) = field
-                .tokens
-                .iter()
-                .enumerate()
-                .skip(search_from)
-                .find(|(_, candidate_token)| {
-                    candidate_token.starts_with(query_token)
-                        || (allow_typo && fuzzy_or_exact_token_match(candidate_token, query_token).is_some())
-                })
-            else {
-                positions.clear();
-                break;
-            };
-            positions.push(idx);
-            search_from = idx + 1;
-        }
-        if positions.len() == query_tokens.len() {
-            found = true;
-            let span = positions.last().copied().unwrap_or(0) - positions.first().copied().unwrap_or(0);
-            let gap = span.saturating_sub(query_tokens.len().saturating_sub(1));
-            best_gap = best_gap.min(gap);
-        }
-    }
-    (found, best_gap)
+    ordered_token_span(
+        query_tokens,
+        fields.iter().map(|field| field.tokens.as_slice()),
+        |query, candidate| {
+            candidate.starts_with(query)
+                || (allow_typo && fuzzy_or_exact_token_match(candidate, query).is_some())
+        },
+    )
 }
 
 fn density_stats(
@@ -2401,6 +2338,3 @@ fn typo_match_token_slice(candidate_token: &str, query_token: &str) -> Option<(u
         (None, None) => None,
     }
 }
-
-
-

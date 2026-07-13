@@ -1,6 +1,10 @@
 use std::cmp::{Ordering, Reverse};
 use std::collections::HashMap;
 
+use crate::core::{
+    compare_key_asc, compare_score_desc, exact_distinct_coverage, exact_phrase_count,
+    exact_phrase_run_vector, exact_token_occurrence_counts, ordered_token_span,
+};
 use crate::text::{split_search_tokens, to_lowercase};
 
 pub type Score = f64;
@@ -35,7 +39,6 @@ pub struct MessageMatch<'a> {
     pub exact_whole_phrase_occurrences: usize,
     pub exact_run_vector: Vec<usize>,
     pub exact_distinct_coverage: usize,
-    pub all_query_tokens_matched: bool,
     pub same_order_scattered: bool,
     pub closeness_gap_distance: usize,
     pub repeated_exact_phrase_bonus: usize,
@@ -116,22 +119,21 @@ impl MessageQuery {
             return None;
         }
 
-        let counts = self
-            .tokens
-            .iter()
-            .map(|query_token| count_token_prefix_occurrences(query_token, candidate_tokens))
-            .collect::<Vec<_>>();
+        let fields = std::iter::once(candidate_tokens);
+        let counts = exact_token_occurrence_counts(&self.tokens, fields.clone());
 
-        let exact_distinct_coverage = counts.iter().filter(|count| **count > 0).count();
+        let exact_distinct_coverage = exact_distinct_coverage(&self.tokens, fields.clone());
         if exact_distinct_coverage == 0 {
             return None;
         }
 
-        let exact_whole_phrase_occurrences = exact_phrase_window_count(&self.tokens, candidate_tokens);
-        let exact_run_vector = exact_run_vector(&self.tokens, candidate_tokens);
-        let all_query_tokens_matched = exact_distinct_coverage == self.tokens.len();
-        let (same_order_scattered, closeness_gap_distance) =
-            same_order_scattered_stats(&self.tokens, candidate_tokens);
+        let exact_whole_phrase_occurrences = exact_phrase_count(&self.tokens, fields.clone());
+        let exact_run_vector = exact_phrase_run_vector(&self.tokens, fields);
+        let (same_order_scattered, closeness_gap_distance) = ordered_token_span(
+            &self.tokens,
+            std::iter::once(candidate_tokens),
+            |query, candidate| candidate.starts_with(query),
+        );
         let repeated_exact_phrase_bonus = exact_whole_phrase_occurrences.min(3);
         let repeated_token_bonus = counts.iter().map(|count| (*count).min(3)).sum::<usize>();
         let density_matched_tokens = exact_distinct_coverage;
@@ -144,7 +146,6 @@ impl MessageQuery {
             exact_whole_phrase_occurrences,
             exact_run_vector,
             exact_distinct_coverage,
-            all_query_tokens_matched,
             same_order_scattered,
             closeness_gap_distance,
             repeated_exact_phrase_bonus,
@@ -164,7 +165,6 @@ fn compare_matches(left: &MessageMatch<'_>, right: &MessageMatch<'_>) -> Orderin
         .cmp(&Reverse(right.exact_whole_phrase_occurrences))
         .then_with(|| Reverse(&left.exact_run_vector).cmp(&Reverse(&right.exact_run_vector)))
         .then_with(|| Reverse(left.exact_distinct_coverage).cmp(&Reverse(right.exact_distinct_coverage)))
-        .then_with(|| Reverse(left.all_query_tokens_matched).cmp(&Reverse(right.all_query_tokens_matched)))
         .then_with(|| Reverse(left.same_order_scattered).cmp(&Reverse(right.same_order_scattered)))
         .then_with(|| left.closeness_gap_distance.cmp(&right.closeness_gap_distance))
         .then_with(|| Reverse(left.repeated_exact_phrase_bonus).cmp(&Reverse(right.repeated_exact_phrase_bonus)))
@@ -174,8 +174,8 @@ fn compare_matches(left: &MessageMatch<'_>, right: &MessageMatch<'_>) -> Orderin
                 .cmp(&(left.density_matched_tokens * right.density_field_len))
         })
         .then_with(|| left.density_field_len.cmp(&right.density_field_len))
-        .then_with(|| right.score.total_cmp(&left.score))
-        .then_with(|| left.key.cmp(right.key))
+        .then_with(|| compare_score_desc(left.score, right.score))
+        .then_with(|| compare_key_asc(left.key, right.key))
 }
 
 pub fn contains_query_signal(
@@ -189,73 +189,6 @@ pub fn contains_query_signal(
                 .iter()
                 .any(|candidate_token| candidate_token.starts_with(token))
     }) || candidate.lowered.contains(query.tokens[0].as_str())
-}
-
-fn count_token_prefix_occurrences(query_token: &str, candidate_tokens: &[String]) -> usize {
-    candidate_tokens
-        .iter()
-        .filter(|candidate_token| candidate_token.starts_with(query_token))
-        .count()
-}
-
-fn exact_phrase_window_count(query_tokens: &[String], candidate_tokens: &[String]) -> usize {
-    if query_tokens.is_empty() || candidate_tokens.len() < query_tokens.len() {
-        return 0;
-    }
-    candidate_tokens
-        .windows(query_tokens.len())
-        .filter(|window| {
-            window
-                .iter()
-                .zip(query_tokens)
-                .all(|(candidate, query)| candidate.starts_with(query))
-        })
-        .count()
-}
-
-fn exact_run_vector(query_tokens: &[String], candidate_tokens: &[String]) -> Vec<usize> {
-    if query_tokens.is_empty() {
-        return Vec::new();
-    }
-    (2..=query_tokens.len())
-        .rev()
-        .map(|window_len| {
-            let mut count = 0;
-            for query_start in 0..=query_tokens.len() - window_len {
-                let query_window = &query_tokens[query_start..query_start + window_len];
-                count += candidate_tokens
-                    .windows(window_len)
-                    .filter(|candidate_window| {
-                        candidate_window
-                            .iter()
-                            .zip(query_window.iter())
-                            .all(|(candidate, query)| candidate.starts_with(query))
-                    })
-                    .count();
-            }
-            count
-        })
-        .collect()
-}
-
-fn same_order_scattered_stats(query_tokens: &[String], candidate_tokens: &[String]) -> (bool, usize) {
-    let mut positions = Vec::new();
-    let mut search_from = 0usize;
-    for query_token in query_tokens {
-        let Some((idx, _)) = candidate_tokens
-            .iter()
-            .enumerate()
-            .skip(search_from)
-            .find(|(_, candidate_token)| candidate_token.starts_with(query_token))
-        else {
-            return (false, usize::MAX);
-        };
-        positions.push(idx);
-        search_from = idx + 1;
-    }
-    let span = positions.last().copied().unwrap_or(0) - positions.first().copied().unwrap_or(0);
-    let gap = span.saturating_sub(query_tokens.len().saturating_sub(1));
-    (true, gap)
 }
 
 #[cfg(test)]

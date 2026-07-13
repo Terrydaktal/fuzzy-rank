@@ -1,6 +1,6 @@
 use std::cmp::Ordering;
 
-use crate::core::OperationProfile;
+use crate::core::{OperationProfile, compare_key_asc, compare_score_desc};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StructuralRank {
@@ -246,8 +246,8 @@ pub fn compare_typo_sort_keys(left: &TypoSortKey<'_>, right: &TypoSortKey<'_>) -
         .then_with(|| left.distance.cmp(&right.distance))
         .then_with(|| left.operations.cmp(&right.operations))
         .then_with(|| left.ratio_milli.cmp(&right.ratio_milli))
-        .then_with(|| right.recency.total_cmp(&left.recency))
-        .then_with(|| left.alphabetical.cmp(right.alphabetical))
+        .then_with(|| compare_score_desc(left.recency, right.recency))
+        .then_with(|| compare_key_asc(left.alphabetical, right.alphabetical))
 }
 
 pub fn typo_keys_are_ambiguous(left: &TypoSortKey<'_>, right: &TypoSortKey<'_>) -> bool {
@@ -258,12 +258,9 @@ pub fn typo_keys_are_ambiguous(left: &TypoSortKey<'_>, right: &TypoSortKey<'_>) 
         && left.recency.total_cmp(&right.recency).is_eq()
 }
 
-pub fn ratio_milli(distance: usize, compared_len: usize) -> usize {
-    distance * 1000 / compared_len.max(1)
-}
-
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PathTypoSortKey<'a> {
+    pub exact: bool,
     pub distance: usize,
     pub operations: OperationProfile,
     pub segment: usize,
@@ -280,22 +277,33 @@ pub fn compare_path_typo_sort_keys(
     left: &PathTypoSortKey<'_>,
     right: &PathTypoSortKey<'_>,
 ) -> Ordering {
-    left.operations
-        .core_typo_cost()
-        .cmp(&right.operations.core_typo_cost())
-        .then_with(|| left.segment.cmp(&right.segment))
+    right
+        .exact
+        .cmp(&left.exact)
+        .then_with(|| effective_path_core_cost(left).cmp(&effective_path_core_cost(right)))
+        .then_with(|| compare_path_tail(left, right))
+}
+
+fn effective_path_core_cost(key: &PathTypoSortKey<'_>) -> usize {
+    if key.exact { 0 } else { key.operations.core_typo_cost() }
+}
+
+fn compare_path_tail(left: &PathTypoSortKey<'_>, right: &PathTypoSortKey<'_>) -> Ordering {
+    left.segment
+        .cmp(&right.segment)
         .then_with(|| left.position.cmp(&right.position))
-        .then_with(|| right.score.total_cmp(&left.score))
+        .then_with(|| compare_score_desc(left.score, right.score))
         .then_with(|| left.operations.insertions.cmp(&right.operations.insertions))
         .then_with(|| path_depth(left.key).cmp(&path_depth(right.key)))
-        .then_with(|| left.key.cmp(right.key))
+        .then_with(|| compare_key_asc(left.key, right.key))
 }
 
 pub fn path_typo_keys_are_ambiguous(
     left: &PathTypoSortKey<'_>,
     right: &PathTypoSortKey<'_>,
 ) -> bool {
-    left.operations.core_typo_cost() == right.operations.core_typo_cost()
+    left.exact == right.exact
+        && effective_path_core_cost(left) == effective_path_core_cost(right)
         && left.segment == right.segment
         && left.position == right.position
         && left.score.total_cmp(&right.score).is_eq()

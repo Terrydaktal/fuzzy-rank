@@ -1,5 +1,5 @@
-use crate::core::{OperationProfile, bounded_damerau_levenshtein, max_typos};
-use crate::ranking::{TypoSortKey, compare_typo_sort_keys, ratio_milli, typo_keys_are_ambiguous};
+use crate::core::{OperationProfile, bounded_damerau_levenshtein, max_typos, ratio_milli};
+use crate::ranking::{TypoSortKey, compare_typo_sort_keys, typo_keys_are_ambiguous};
 use crate::text::{has_query_signal, split_search_tokens, split_whitespace_tokens, to_lowercase};
 
 pub type Recency = f64;
