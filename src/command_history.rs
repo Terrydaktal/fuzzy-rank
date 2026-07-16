@@ -1,5 +1,10 @@
-use crate::core::{OperationProfile, bounded_damerau_levenshtein, max_typos, ratio_milli};
-use crate::ranking::{TypoSortKey, compare_typo_sort_keys, typo_keys_are_ambiguous};
+use std::cmp::{Ordering, Reverse};
+
+use crate::core::{
+    InsertionVector, OperationProfile, TypoCostVector, bounded_damerau_levenshtein,
+    compare_key_asc, compare_score_desc, exact_distinct_coverage, exact_phrase_count,
+    exact_subphrase_counts_vector, max_typos, ordered_token_span,
+};
 use crate::text::{has_query_signal, split_search_tokens, split_whitespace_tokens, to_lowercase};
 
 pub type Recency = f64;
@@ -11,41 +16,94 @@ pub struct CommandHistoryCandidate<'a> {
     pub recency: Recency,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct CommandHistoryMatch<'a> {
     pub candidate: CommandHistoryCandidate<'a>,
+    pub exact_phrase_count: usize,
+    pub exact_coverage: usize,
+    pub exact_subphrase_counts_vector: Vec<usize>,
+    pub total_coverage: usize,
+    pub fuzzy_subphrase_counts_vector: Vec<usize>,
+    pub order_distance: usize,
+    pub total_gap: usize,
     pub exact_count: usize,
     pub span_len: usize,
     pub distance: usize,
     pub ratio: f64,
     pub operations: OperationProfile,
+    pub typo_costs: TypoCostVector,
+    pub insertions: InsertionVector,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommandHistoryRank {
+    pub exact_phrase_count: usize,
+    pub exact_coverage: usize,
+    pub exact_subphrase_counts_vector: Vec<usize>,
+    pub total_coverage: usize,
+    pub fuzzy_subphrase_counts_vector: Vec<usize>,
+    pub typo_costs: TypoCostVector,
+    pub insertions: InsertionVector,
+    pub typo_operations: OperationProfile,
+    pub order_distance: usize,
+    pub total_gap: usize,
 }
 
 impl<'a> CommandHistoryMatch<'a> {
-    fn sort_key(&self) -> TypoSortKey<'_> {
-        TypoSortKey {
-            exact_count: self.exact_count,
-            span_len: self.span_len,
-            distance: self.distance,
-            operations: self.operations,
-            ratio_milli: ratio_milli(self.distance, self.compared_len()),
-            recency: self.candidate.recency,
-            alphabetical: self.candidate.command,
+    pub fn rank(&self) -> CommandHistoryRank {
+        CommandHistoryRank {
+            exact_phrase_count: self.exact_phrase_count,
+            exact_coverage: self.exact_coverage,
+            exact_subphrase_counts_vector: self.exact_subphrase_counts_vector.clone(),
+            total_coverage: self.total_coverage,
+            fuzzy_subphrase_counts_vector: self.fuzzy_subphrase_counts_vector.clone(),
+            typo_costs: self.typo_costs.clone(),
+            insertions: self.insertions.clone(),
+            typo_operations: self.operations,
+            order_distance: self.order_distance,
+            total_gap: self.total_gap,
         }
     }
 
-    fn compared_len(&self) -> usize {
-        let query_estimate = if self.ratio == 0.0 {
-            1
-        } else {
-            ((self.distance as f64 / self.ratio).round() as usize).max(1)
-        };
-        query_estimate.max(1)
-    }
-
     pub fn compare(&self, other: &Self) -> std::cmp::Ordering {
-        compare_typo_sort_keys(&self.sort_key(), &other.sort_key())
+        compare_ranks(
+            &self.rank(),
+            self.candidate.recency,
+            self.candidate.command,
+            &other.rank(),
+            other.candidate.recency,
+            other.candidate.command,
+        )
     }
+}
+
+pub fn compare_ranks(
+    left: &CommandHistoryRank,
+    left_recency: Recency,
+    left_command: &str,
+    right: &CommandHistoryRank,
+    right_recency: Recency,
+    right_command: &str,
+) -> Ordering {
+    Reverse(left.exact_phrase_count)
+        .cmp(&Reverse(right.exact_phrase_count))
+        .then_with(|| Reverse(left.exact_coverage).cmp(&Reverse(right.exact_coverage)))
+        .then_with(|| {
+            Reverse(&left.exact_subphrase_counts_vector)
+                .cmp(&Reverse(&right.exact_subphrase_counts_vector))
+        })
+        .then_with(|| Reverse(left.total_coverage).cmp(&Reverse(right.total_coverage)))
+        .then_with(|| {
+            Reverse(&left.fuzzy_subphrase_counts_vector)
+                .cmp(&Reverse(&right.fuzzy_subphrase_counts_vector))
+        })
+        .then_with(|| left.typo_costs.cmp(&right.typo_costs))
+        .then_with(|| left.insertions.cmp(&right.insertions))
+        .then_with(|| left.typo_operations.cmp(&right.typo_operations))
+        .then_with(|| left.order_distance.cmp(&right.order_distance))
+        .then_with(|| left.total_gap.cmp(&right.total_gap))
+        .then_with(|| compare_score_desc(left_recency, right_recency))
+        .then_with(|| compare_key_asc(left_command, right_command))
 }
 
 pub struct CommandHistoryQuery {
@@ -127,7 +185,16 @@ pub fn sort_matches(matches: &mut [CommandHistoryMatch<'_>]) {
 }
 
 pub fn is_ambiguous(first: &CommandHistoryMatch<'_>, second: &CommandHistoryMatch<'_>) -> bool {
-    typo_keys_are_ambiguous(&first.sort_key(), &second.sort_key())
+    first.exact_phrase_count == second.exact_phrase_count
+        && first.exact_coverage == second.exact_coverage
+        && first.exact_subphrase_counts_vector == second.exact_subphrase_counts_vector
+        && first.total_coverage == second.total_coverage
+        && first.fuzzy_subphrase_counts_vector == second.fuzzy_subphrase_counts_vector
+        && first.typo_costs == second.typo_costs
+        && first.insertions == second.insertions
+        && first.operations == second.operations
+        && first.order_distance == second.order_distance
+        && first.total_gap == second.total_gap
 }
 
 struct LoweredCandidate<'a> {
@@ -151,202 +218,163 @@ fn best_match_inner<'a>(
         return None;
     }
 
-    let mut best = None;
+    let query_tokens = query_tokens
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let fields = std::iter::once(candidate.tokens.as_slice());
+    let exact_phrase_count = exact_phrase_count(&query_tokens, fields.clone());
+    let exact_coverage = exact_distinct_coverage(&query_tokens, fields.clone());
+    let exact_subphrase_counts_vector = exact_subphrase_counts_vector(&query_tokens, fields);
 
-    if query_tokens.len() == 1 {
-        for token in &candidate.tokens {
-            update_best(
-                &mut best,
-                candidate_for_token(candidate.original, token, query, query_len, limit),
-            );
-        }
-    } else if query_tokens.len() <= candidate.tokens.len() {
-        update_best(
-            &mut best,
-            candidate_for_ordered_token_subsequence(
-                candidate.original,
-                &candidate.tokens,
-                &query_tokens,
-                query_len,
-                limit,
-            ),
-        );
-    }
-
-    best
-}
-
-fn candidate_for_token<'a>(
-    candidate: CommandHistoryCandidate<'a>,
-    token: &str,
-    query: &str,
-    query_len: usize,
-    limit: usize,
-) -> Option<CommandHistoryMatch<'a>> {
-    if token.is_empty() || limit == 0 {
+    let token_matches = query_tokens
+        .iter()
+        .map(|query_token| best_command_token_match(query_token, &candidate.tokens, limit))
+        .collect::<Vec<_>>();
+    let total_coverage = token_matches
+        .iter()
+        .filter(|matched| matched.is_some())
+        .count();
+    if total_coverage < query_tokens.len() {
         return None;
     }
 
-    let token_len = token.chars().count();
-    let token_limit = command_token_limit(query_len, limit);
-    if query_len.abs_diff(token_len) > token_limit {
-        return None;
-    }
-
-    let (distance, operations) = bounded_damerau_levenshtein(token, query, token_limit)?;
-    let ratio = distance as f64 / query_len.max(token_len) as f64;
-    if ratio > 0.5 {
-        return None;
-    }
+    let fuzzy_subphrase_counts_vector =
+        command_fuzzy_subphrase_counts_vector(&query_tokens, &candidate.tokens, limit);
+    let (order_distance, total_gap) = ordered_token_span(
+        &query_tokens,
+        std::iter::once(candidate.tokens.as_slice()),
+        |query, token| command_token_match(query, token, limit).is_some(),
+    );
+    let (distance, operations, compared_len) = token_matches.iter().flatten().fold(
+        (0, OperationProfile::default(), 0),
+        |(distance, operations, compared_len), matched| {
+            (
+                distance + matched.distance,
+                operations.merge(matched.operations),
+                compared_len + matched.compared_len,
+            )
+        },
+    );
+    let typo_costs = TypoCostVector::new(
+        token_matches
+            .iter()
+            .map(|matched| {
+                matched
+                    .as_ref()
+                    .map_or(0, |matched| matched.operations.core_typo_cost())
+            })
+            .collect(),
+    );
+    let insertions = InsertionVector::new(
+        token_matches
+            .iter()
+            .map(|matched| {
+                matched
+                    .as_ref()
+                    .map_or(0, |matched| matched.operations.insertions)
+            })
+            .collect(),
+    );
 
     Some(CommandHistoryMatch {
-        candidate,
-        exact_count: usize::from(distance == 0),
-        span_len: 1,
+        candidate: candidate.original,
+        exact_phrase_count,
+        exact_coverage,
+        exact_subphrase_counts_vector,
+        total_coverage,
+        fuzzy_subphrase_counts_vector,
+        order_distance,
+        total_gap,
+        exact_count: exact_coverage,
+        span_len: total_gap.saturating_add(total_coverage),
         distance,
-        ratio,
+        ratio: distance as f64 / compared_len.max(query_len).max(1) as f64,
         operations,
+        typo_costs,
+        insertions,
     })
-}
-
-fn candidate_for_ordered_token_subsequence<'a>(
-    candidate: CommandHistoryCandidate<'a>,
-    tokens: &[String],
-    query_tokens: &[&str],
-    query_len: usize,
-    limit: usize,
-) -> Option<CommandHistoryMatch<'a>> {
-    let best = best_ordered_token_subsequence(tokens, query_tokens, 0, 0, limit)?;
-    let (exact_count, span_len, _, distance, operations, compared_len) = best?;
-    let ratio = distance as f64 / query_len.max(compared_len) as f64;
-    if ratio > 0.5 {
-        return None;
-    }
-
-    Some(CommandHistoryMatch {
-        candidate,
-        exact_count,
-        span_len,
-        distance,
-        ratio,
-        operations,
-    })
-}
-
-fn best_ordered_token_subsequence(
-    tokens: &[String],
-    query_tokens: &[&str],
-    query_idx: usize,
-    token_start: usize,
-    remaining: usize,
-) -> Option<Option<(usize, usize, usize, usize, OperationProfile, usize)>> {
-    if query_idx == query_tokens.len() {
-        return Some(Some((0, 0, 0, 0, OperationProfile::default(), 0)));
-    }
-
-    let remaining_query = query_tokens.len() - query_idx;
-    if tokens.len().saturating_sub(token_start) < remaining_query {
-        return Some(None);
-    }
-
-    let query_token = query_tokens[query_idx];
-    let query_token_len = query_token.chars().count();
-    let last_start = tokens.len() - remaining_query;
-    let mut best = None;
-
-    for token_idx in token_start..=last_start {
-        let token = &tokens[token_idx];
-        let token_len = token.chars().count();
-        let token_limit = command_token_limit(query_token_len, remaining);
-        if query_token_len.abs_diff(token_len) > token_limit {
-            continue;
-        }
-
-        let Some((token_distance, token_operations)) =
-            bounded_damerau_levenshtein(token, query_token, token_limit)
-        else {
-            continue;
-        };
-        if token_distance > remaining {
-            continue;
-        }
-
-        let Some(tail) = best_ordered_token_subsequence(
-            tokens,
-            query_tokens,
-            query_idx + 1,
-            token_idx + 1,
-            remaining - token_distance,
-        ) else {
-            continue;
-        };
-        let Some((
-            tail_exact_count,
-            _tail_span_len,
-            tail_last_idx,
-            tail_distance,
-            tail_operations,
-            tail_compared_len,
-        )) = tail
-        else {
-            continue;
-        };
-
-        let total = (
-            usize::from(token_distance == 0) + tail_exact_count,
-            if query_idx + 1 == query_tokens.len() {
-                1
-            } else {
-                tail_last_idx - token_idx + 1
-            },
-            if query_idx + 1 == query_tokens.len() {
-                token_idx
-            } else {
-                tail_last_idx
-            },
-            token_distance + tail_distance,
-            token_operations.merge(tail_operations),
-            query_token_len.max(token_len) + tail_compared_len,
-        );
-        best = Some(match best {
-            None => total,
-            Some(current) if command_history_match_tuple_compare(total, current).is_lt() => total,
-            Some(current) => current,
-        });
-    }
-
-    Some(best)
-}
-
-fn command_history_match_tuple_compare(
-    left: (usize, usize, usize, usize, OperationProfile, usize),
-    right: (usize, usize, usize, usize, OperationProfile, usize),
-) -> std::cmp::Ordering {
-    right
-        .0
-        .cmp(&left.0)
-        .then_with(|| left.1.cmp(&right.1))
-        .then_with(|| left.3.cmp(&right.3))
-        .then_with(|| left.4.cmp(&right.4))
-        .then_with(|| left.5.cmp(&right.5))
 }
 
 fn command_token_limit(query_len: usize, global_limit: usize) -> usize {
     global_limit.min((query_len / 3).max(1))
 }
 
-fn update_best<'a>(
-    best: &mut Option<CommandHistoryMatch<'a>>,
-    candidate: Option<CommandHistoryMatch<'a>>,
-) {
-    match (best.as_ref(), candidate) {
-        (_, None) => {}
-        (None, Some(candidate)) => *best = Some(candidate),
-        (Some(current), Some(candidate)) if candidate.compare(current).is_lt() => {
-            *best = Some(candidate)
-        }
-        _ => {}
+#[derive(Clone, Copy)]
+struct CommandTokenMatch {
+    distance: usize,
+    operations: OperationProfile,
+    compared_len: usize,
+}
+
+fn command_token_match(query: &str, token: &str, global_limit: usize) -> Option<CommandTokenMatch> {
+    if token.starts_with(query) {
+        return Some(CommandTokenMatch {
+            distance: 0,
+            operations: OperationProfile::default(),
+            compared_len: query.chars().count().max(token.chars().count()),
+        });
     }
+    let query_len = query.chars().count();
+    let token_len = token.chars().count();
+    let limit = command_token_limit(query_len, global_limit);
+    if query_len.abs_diff(token_len) > limit {
+        return None;
+    }
+    let (distance, operations) = bounded_damerau_levenshtein(token, query, limit)?;
+    (distance as f64 / query_len.max(token_len).max(1) as f64 <= 0.5).then_some(CommandTokenMatch {
+        distance,
+        operations,
+        compared_len: query_len.max(token_len),
+    })
+}
+
+fn best_command_token_match(
+    query: &str,
+    tokens: &[String],
+    limit: usize,
+) -> Option<CommandTokenMatch> {
+    tokens
+        .iter()
+        .filter_map(|token| command_token_match(query, token, limit))
+        .min_by(|left, right| {
+            (left.distance, left.operations, left.compared_len).cmp(&(
+                right.distance,
+                right.operations,
+                right.compared_len,
+            ))
+        })
+}
+
+fn command_fuzzy_subphrase_counts_vector(
+    query_tokens: &[String],
+    tokens: &[String],
+    limit: usize,
+) -> Vec<usize> {
+    if query_tokens.len() < 3 {
+        return Vec::new();
+    }
+    (2..query_tokens.len())
+        .rev()
+        .map(|window_len| {
+            (0..=query_tokens.len() - window_len)
+                .map(|query_start| {
+                    let query_window = &query_tokens[query_start..query_start + window_len];
+                    tokens
+                        .windows(window_len)
+                        .filter(|candidate_window| {
+                            candidate_window
+                                .iter()
+                                .zip(query_window)
+                                .all(|(token, query)| {
+                                    command_token_match(query, token, limit).is_some()
+                                })
+                        })
+                        .count()
+                })
+                .sum()
+        })
+        .collect()
 }
 
 #[cfg(test)]

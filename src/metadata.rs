@@ -1,13 +1,13 @@
 use crate::core::{
-    bounded_damerau_levenshtein, compare_key_asc, compare_score_desc, exact_distinct_coverage,
-    exact_phrase_count, exact_phrase_run_vector, exact_token_occurrence_counts,
-    keyboard_substitution_cost, max_typos, ordered_token_span, ratio_milli,
+    CoverageRank, DensityRank, InsertionVector, TypoCostVector, bounded_damerau_levenshtein,
+    compare_key_asc, compare_score_desc, exact_phrase_count_by, exact_subphrase_counts_vector_by,
+    keyboard_substitution_cost, max_typos, ordered_token_span, position_vector, ratio_milli,
 };
-use crate::token_match::fragmented_token_match;
 use crate::ranking::{
     AbbreviationRank, DistanceRank, SearchRank, StructuralRank, compare_search_results,
 };
 use crate::text::{normalize_compact_alnum, split_search_tokens, to_lowercase, token_has_signal};
+use crate::token_match::fragmented_token_match;
 use std::cell::OnceCell;
 use std::cmp::{Ordering, Reverse};
 
@@ -86,7 +86,10 @@ impl MetadataQuery {
             } else {
                 best_structural_rank(query, candidate.fields)
                     .map(SearchRank::Structural)
-                    .or_else(|| best_abbreviation_rank(query, candidate.fields).map(SearchRank::Abbreviation))
+                    .or_else(|| {
+                        best_abbreviation_rank(query, candidate.fields)
+                            .map(SearchRank::Abbreviation)
+                    })
                     .or_else(|| best_fuzzy_rank(query, candidate.fields).map(SearchRank::Fuzzy))
             };
             if let Some(rank) = rank
@@ -98,7 +101,6 @@ impl MetadataQuery {
         best_rank
     }
 
-
     pub fn compare_candidates(
         &self,
         left_candidate: MetadataCandidate<'_>,
@@ -106,15 +108,16 @@ impl MetadataQuery {
         right_candidate: MetadataCandidate<'_>,
         right_rank: &SearchRank,
     ) -> Ordering {
-        let left_relevance = LazyRelevance::new(&self.query_tokens, self.allow_typo, left_candidate.fields);
-        let right_relevance = LazyRelevance::new(&self.query_tokens, self.allow_typo, right_candidate.fields);
+        let left_relevance =
+            LazyRelevance::new(&self.query_tokens, self.allow_typo, left_candidate.fields);
+        let right_relevance =
+            LazyRelevance::new(&self.query_tokens, self.allow_typo, right_candidate.fields);
 
-        left_relevance.compare(&right_relevance)
-            .then_with(|| {
-                compare_score_desc(left_candidate.score, right_candidate.score)
-                    .then_with(|| left_rank.cmp(right_rank))
-                    .then_with(|| compare_key_asc(left_candidate.key, right_candidate.key))
-            })
+        left_relevance.compare(&right_relevance).then_with(|| {
+            compare_score_desc(left_candidate.score, right_candidate.score)
+                .then_with(|| left_rank.cmp(right_rank))
+                .then_with(|| compare_key_asc(left_candidate.key, right_candidate.key))
+        })
     }
 
     pub fn sort_matches(&self, matches: &mut [(MetadataCandidate<'_>, SearchRank)]) {
@@ -129,14 +132,15 @@ impl MetadataQuery {
             })
             .collect();
 
-        lazy_matches.sort_unstable_by(|(left_cand, left_rank, left_rel), (right_cand, right_rank, right_rel)| {
-            left_rel.compare(right_rel)
-                .then_with(|| {
+        lazy_matches.sort_unstable_by(
+            |(left_cand, left_rank, left_rel), (right_cand, right_rank, right_rel)| {
+                left_rel.compare(right_rel).then_with(|| {
                     compare_score_desc(left_cand.score, right_cand.score)
                         .then_with(|| left_rank.cmp(right_rank))
                         .then_with(|| compare_key_asc(left_cand.key, right_cand.key))
                 })
-        });
+            },
+        );
 
         for (i, (cand, rank, _)) in lazy_matches.into_iter().enumerate() {
             matches[i] = (cand, rank);
@@ -164,7 +168,8 @@ impl MetadataQuery {
                 let normalized_field = value.to_lowercase();
                 let normalized_query = self.query.to_lowercase();
                 let mut search_idx = 0;
-                while let Some(start_byte) = normalized_field[search_idx..].find(&normalized_query) {
+                while let Some(start_byte) = normalized_field[search_idx..].find(&normalized_query)
+                {
                     let start_byte_abs = search_idx + start_byte;
                     let end_byte_abs = start_byte_abs + normalized_query.len();
                     let start_char = value[..start_byte_abs].chars().count();
@@ -187,20 +192,25 @@ impl MetadataQuery {
                 for token in &tokens_with_ranges {
                     let token_len = token.value.chars().count();
                     let token_end = token.start + token_len;
-                    if token.value.starts_with(&query_token_lower) {
-                        // Exact prefix match — highlight whole token
+                    if literal_token_match(&query_token_lower, &token.value) {
+                        // Exact literal match: highlight the containing token.
                         for idx in token.start..token_end {
                             if idx < char_count {
                                 char_status[idx] = (Some(true), 0);
                             }
                         }
                     } else {
-                        if let Some((_s_char, _e_char, severity)) = typo_match_token_slice(&token.value, &query_token_lower) {
+                        if let Some((_s_char, _e_char, severity)) =
+                            typo_match_token_slice(&token.value, &query_token_lower)
+                        {
                             // Typo match — highlight whole token
                             for idx in token.start..token_end {
                                 if idx < char_count {
                                     let current_status = char_status[idx];
-                                    if current_status.0.is_none() || (current_status.0 == Some(false) && severity.core_cost < current_status.1) {
+                                    if current_status.0.is_none()
+                                        || (current_status.0 == Some(false)
+                                            && severity.core_cost < current_status.1)
+                                    {
                                         char_status[idx] = (Some(false), severity.core_cost);
                                     }
                                 }
@@ -221,7 +231,8 @@ impl MetadataQuery {
                         if seg_exact == is_exact {
                             current_segment = Some((start_char, seg_exact, min_cost.min(status.1)));
                         } else {
-                            let (byte_start, byte_end) = char_indices_to_byte_range(value, start_char, char_idx);
+                            let (byte_start, byte_end) =
+                                char_indices_to_byte_range(value, start_char, char_idx);
                             ranges.push((byte_start, byte_end, seg_exact, min_cost));
                             current_segment = Some((char_idx, is_exact, status.1));
                         }
@@ -230,14 +241,16 @@ impl MetadataQuery {
                     }
                 } else {
                     if let Some((start_char, seg_exact, min_cost)) = current_segment {
-                        let (byte_start, byte_end) = char_indices_to_byte_range(value, start_char, char_idx);
+                        let (byte_start, byte_end) =
+                            char_indices_to_byte_range(value, start_char, char_idx);
                         ranges.push((byte_start, byte_end, seg_exact, min_cost));
                         current_segment = None;
                     }
                 }
             }
             if let Some((start_char, seg_exact, min_cost)) = current_segment {
-                let (byte_start, byte_end) = char_indices_to_byte_range(value, start_char, char_count);
+                let (byte_start, byte_end) =
+                    char_indices_to_byte_range(value, start_char, char_count);
                 ranges.push((byte_start, byte_end, seg_exact, min_cost));
             }
 
@@ -316,13 +329,18 @@ struct LazyRelevance<'a> {
     fields: Vec<NormalizedMetadataField>,
 
     exact_whole_phrase_occurrences: OnceCell<usize>,
-    exact_run_vector: OnceCell<Vec<usize>>,
-    exact_distinct_coverage: OnceCell<usize>,
-    fuzzy_phrase_vector: OnceCell<Vec<usize>>,
+    exact_subphrase_counts_vector: OnceCell<Vec<usize>>,
+    exact_coverage_rank: OnceCell<CoverageRank>,
+    fuzzy_coverage_rank: OnceCell<CoverageRank>,
+    fuzzy_whole_phrase: OnceCell<bool>,
+    fuzzy_subphrase_counts_vector: OnceCell<Vec<usize>>,
     fuzzy_best_matches: OnceCell<Vec<TokenMatch>>,
-    field_quality: OnceCell<u8>,
-    scattered_stats: OnceCell<(bool, usize)>,
-    density_stats: OnceCell<(usize, usize)>,
+    exact_field_quality: OnceCell<u8>,
+    fuzzy_field_quality: OnceCell<u8>,
+    exact_phrase_occurrence_rank: OnceCell<FieldOccurrenceRank>,
+    exact_token_occurrence_rank: OnceCell<FieldOccurrenceRank>,
+    scattered_stats: OnceCell<(usize, usize)>,
+    density_rank: OnceCell<DensityRank>,
 }
 
 impl<'a> LazyRelevance<'a> {
@@ -347,13 +365,18 @@ impl<'a> LazyRelevance<'a> {
             allow_typo,
             fields: normalized_fields,
             exact_whole_phrase_occurrences: OnceCell::new(),
-            exact_run_vector: OnceCell::new(),
-            exact_distinct_coverage: OnceCell::new(),
-            fuzzy_phrase_vector: OnceCell::new(),
+            exact_subphrase_counts_vector: OnceCell::new(),
+            exact_coverage_rank: OnceCell::new(),
+            fuzzy_coverage_rank: OnceCell::new(),
+            fuzzy_whole_phrase: OnceCell::new(),
+            fuzzy_subphrase_counts_vector: OnceCell::new(),
             fuzzy_best_matches: OnceCell::new(),
-            field_quality: OnceCell::new(),
+            exact_field_quality: OnceCell::new(),
+            fuzzy_field_quality: OnceCell::new(),
+            exact_phrase_occurrence_rank: OnceCell::new(),
+            exact_token_occurrence_rank: OnceCell::new(),
             scattered_stats: OnceCell::new(),
-            density_stats: OnceCell::new(),
+            density_rank: OnceCell::new(),
         }
     }
 
@@ -362,78 +385,74 @@ impl<'a> LazyRelevance<'a> {
             if self.query_tokens.is_empty() || self.fields.is_empty() {
                 0
             } else {
-                exact_phrase_count(
+                exact_phrase_count_by(
                     self.query_tokens,
                     self.fields.iter().map(|field| field.tokens.as_slice()),
+                    literal_token_match,
                 )
             }
         })
     }
 
-    fn get_exact_run_vector(&self) -> &[usize] {
-        self.exact_run_vector.get_or_init(|| {
+    fn get_exact_subphrase_counts_vector(&self) -> &[usize] {
+        self.exact_subphrase_counts_vector.get_or_init(|| {
             if self.query_tokens.is_empty() || self.fields.is_empty() {
                 Vec::new()
             } else {
-                exact_phrase_run_vector(
+                exact_subphrase_counts_vector_by(
                     self.query_tokens,
                     self.fields.iter().map(|field| field.tokens.as_slice()),
+                    literal_token_match,
                 )
             }
         })
     }
 
-    fn get_exact_distinct_coverage(&self) -> usize {
-        *self.exact_distinct_coverage.get_or_init(|| {
-            if self.query_tokens.is_empty() || self.fields.is_empty() {
-                0
-            } else {
-                exact_distinct_coverage(
-                    self.query_tokens,
-                    self.fields.iter().map(|field| field.tokens.as_slice()),
-                )
-            }
+    fn get_exact_whole_phrase_present(&self) -> bool {
+        self.get_exact_whole_phrase_occurrences() > 0
+    }
+
+    fn get_exact_coverage_rank(&self) -> &CoverageRank {
+        self.exact_coverage_rank.get_or_init(|| {
+            CoverageRank::new(
+                position_vector(
+                    self.query_tokens.iter().map(|query_token| {
+                        best_exact_token_scope(query_token, &self.fields)
+                            .map(|scope| scope as usize)
+                    }),
+                    4,
+                ),
+                &[4, 2, 2, 1],
+            )
+        })
+    }
+
+    fn get_fuzzy_coverage_rank(&self) -> &CoverageRank {
+        self.fuzzy_coverage_rank.get_or_init(|| {
+            let matches = self.fuzzy_best_matches.get_or_init(|| {
+                self.query_tokens
+                    .iter()
+                    .map(|query_token| {
+                        best_fuzzy_token_match(query_token, &self.fields, self.allow_typo)
+                    })
+                    .collect()
+            });
+            CoverageRank::new(metadata_fuzzy_coverage_vector(matches), &[4, 2, 2, 1, 1])
         })
     }
 
     fn get_fuzzy_whole_phrase(&self) -> bool {
-        if self.query_tokens.is_empty() || self.fields.is_empty() {
-            return false;
-        }
-        let vector = self.fuzzy_phrase_vector.get_or_init(|| {
-            fuzzy_phrase_run_vector(self.query_tokens, &self.fields)
-        });
-        vector.first().copied().unwrap_or_default() > 0
+        *self.fuzzy_whole_phrase.get_or_init(|| {
+            fuzzy_whole_phrase_present(self.query_tokens, &self.fields, self.allow_typo)
+        })
     }
 
-    fn get_fuzzy_run_vector(&self) -> &[usize] {
+    fn get_fuzzy_subphrase_counts_vector(&self) -> &[usize] {
         if self.query_tokens.is_empty() || self.fields.is_empty() {
             return &[];
         }
-        self.fuzzy_phrase_vector.get_or_init(|| {
-            fuzzy_phrase_run_vector(self.query_tokens, &self.fields)
-        });
-        let vector = self.fuzzy_phrase_vector.get().unwrap();
-        if vector.is_empty() {
-            &[]
-        } else {
-            &vector[1..]
-        }
-    }
-
-    fn get_total_distinct_coverage(&self) -> usize {
-        if self.query_tokens.is_empty() || self.fields.is_empty() {
-            return 0;
-        }
-        let matches = self.fuzzy_best_matches.get_or_init(|| {
-            self.query_tokens
-                .iter()
-                .map(|query_token| {
-                    best_fuzzy_token_match(query_token, &self.fields, self.allow_typo)
-                })
-                .collect()
-        });
-        matches.iter().filter(|m| m.exact || m.fuzzy).count()
+        self.fuzzy_subphrase_counts_vector
+            .get_or_init(|| fuzzy_subphrase_counts_vector(self.query_tokens, &self.fields))
     }
 
     fn get_typo_severity(&self) -> TypoSeverity {
@@ -448,78 +467,89 @@ impl<'a> LazyRelevance<'a> {
                 })
                 .collect()
         });
-        matches
-            .iter()
-            .filter(|matched| matched.fuzzy && !matched.exact)
-            .fold(TypoSeverity::default(), |acc, matched| TypoSeverity {
-                core_cost: acc.core_cost + matched.severity.core_cost,
-                position: acc.position + matched.severity.position,
-                insertions: acc.insertions + matched.severity.insertions,
-            })
+        TypoSeverity::from_matches(matches)
     }
 
-    fn get_all_query_tokens_matched(&self) -> bool {
-        self.get_total_distinct_coverage() == self.query_tokens.len()
-    }
-
-    fn get_field_quality(&self) -> u8 {
-        *self.field_quality.get_or_init(|| {
+    fn get_exact_field_quality(&self) -> u8 {
+        *self.exact_field_quality.get_or_init(|| {
             if self.query_tokens.is_empty() || self.fields.is_empty() {
                 u8::MAX
             } else {
-                best_field_priority(self.query_tokens, &self.fields, self.allow_typo)
+                best_exact_field_priority(self.query_tokens, &self.fields)
             }
         })
     }
 
-    fn get_same_order_scattered(&self) -> bool {
-        if self.query_tokens.is_empty() || self.fields.is_empty() {
-            return false;
-        }
-        self.scattered_stats.get_or_init(|| {
-            same_order_scattered_stats(self.query_tokens, &self.fields, self.allow_typo)
-        }).0
+    fn get_fuzzy_field_quality(&self) -> u8 {
+        *self.fuzzy_field_quality.get_or_init(|| {
+            self.fuzzy_best_matches
+                .get_or_init(|| {
+                    self.query_tokens
+                        .iter()
+                        .map(|query_token| {
+                            best_fuzzy_token_match(query_token, &self.fields, self.allow_typo)
+                        })
+                        .collect()
+                })
+                .iter()
+                .filter(|matched| matched.fuzzy && !matched.exact)
+                .map(|matched| matched.field_priority)
+                .min()
+                .unwrap_or(u8::MAX)
+        })
     }
 
-    fn get_closeness_gap_distance(&self) -> usize {
+    fn get_order_distance(&self) -> usize {
         if self.query_tokens.is_empty() || self.fields.is_empty() {
             return usize::MAX;
         }
-        self.scattered_stats.get_or_init(|| {
-            same_order_scattered_stats(self.query_tokens, &self.fields, self.allow_typo)
-        }).1
+        self.scattered_stats
+            .get_or_init(|| ordered_span_stats(self.query_tokens, &self.fields, self.allow_typo))
+            .0
     }
 
-    fn get_repeated_exact_phrase_bonus(&self) -> usize {
-        self.get_exact_whole_phrase_occurrences().min(3)
-    }
-
-    fn get_repeated_token_bonus(&self) -> usize {
+    fn get_total_gap(&self) -> usize {
         if self.query_tokens.is_empty() || self.fields.is_empty() {
-            return 0;
+            return usize::MAX;
         }
-        let exact_occurrence_counts = self.query_tokens
-            .iter()
-            .map(|query_token| {
-                self.fields
+        self.scattered_stats
+            .get_or_init(|| ordered_span_stats(self.query_tokens, &self.fields, self.allow_typo))
+            .1
+    }
+
+    fn get_exact_phrase_occurrence_rank(&self) -> &FieldOccurrenceRank {
+        self.exact_phrase_occurrence_rank.get_or_init(|| {
+            field_occurrence_rank(&self.fields, |field| {
+                exact_phrase_count_by(
+                    self.query_tokens,
+                    std::iter::once(field.tokens.as_slice()),
+                    literal_token_match,
+                )
+            })
+        })
+    }
+
+    fn get_exact_token_occurrence_rank(&self) -> &FieldOccurrenceRank {
+        self.exact_token_occurrence_rank.get_or_init(|| {
+            field_occurrence_rank(&self.fields, |field| {
+                field
+                    .tokens
                     .iter()
-                    .map(|field| {
-                        field
-                            .tokens
+                    .map(|candidate| {
+                        self.query_tokens
                             .iter()
-                            .filter(|candidate_token| candidate_token.starts_with(query_token))
+                            .filter(|query| literal_token_match(query, candidate))
                             .count()
                     })
-                    .sum::<usize>()
+                    .sum()
             })
-            .collect::<Vec<_>>();
-        exact_occurrence_counts.iter().map(|count| count.min(&3)).sum()
+        })
     }
 
-    fn get_density_stats(&self) -> (usize, usize) {
-        *self.density_stats.get_or_init(|| {
+    fn get_density_rank(&self) -> DensityRank {
+        *self.density_rank.get_or_init(|| {
             if self.query_tokens.is_empty() || self.fields.is_empty() {
-                (0, usize::MAX)
+                DensityRank::new(0, usize::MAX)
             } else {
                 let matches = self.fuzzy_best_matches.get_or_init(|| {
                     self.query_tokens
@@ -535,70 +565,121 @@ impl<'a> LazyRelevance<'a> {
     }
 
     fn compare(&self, other: &Self) -> Ordering {
-        other.get_exact_whole_phrase_occurrences()
-            .cmp(&self.get_exact_whole_phrase_occurrences())
+        other
+            .get_exact_whole_phrase_present()
+            .cmp(&self.get_exact_whole_phrase_present())
             .then_with(|| {
-                other.get_exact_run_vector().cmp(self.get_exact_run_vector())
+                other
+                    .get_exact_subphrase_counts_vector()
+                    .cmp(self.get_exact_subphrase_counts_vector())
             })
             .then_with(|| {
-                other.get_exact_distinct_coverage().cmp(&self.get_exact_distinct_coverage())
+                other
+                    .get_exact_coverage_rank()
+                    .cmp(self.get_exact_coverage_rank())
             })
             .then_with(|| {
-                other.get_fuzzy_whole_phrase().cmp(&self.get_fuzzy_whole_phrase())
+                self.get_exact_field_quality()
+                    .cmp(&other.get_exact_field_quality())
             })
             .then_with(|| {
-                other.get_fuzzy_run_vector().cmp(self.get_fuzzy_run_vector())
+                other
+                    .get_fuzzy_whole_phrase()
+                    .cmp(&self.get_fuzzy_whole_phrase())
             })
             .then_with(|| {
-                other.get_total_distinct_coverage().cmp(&self.get_total_distinct_coverage())
+                other
+                    .get_fuzzy_subphrase_counts_vector()
+                    .cmp(self.get_fuzzy_subphrase_counts_vector())
             })
             .then_with(|| {
-                self.get_typo_severity().cmp(&other.get_typo_severity())
+                other
+                    .get_fuzzy_coverage_rank()
+                    .cmp(self.get_fuzzy_coverage_rank())
             })
             .then_with(|| {
-                other.get_all_query_tokens_matched().cmp(&self.get_all_query_tokens_matched())
+                self.get_fuzzy_field_quality()
+                    .cmp(&other.get_fuzzy_field_quality())
+            })
+            .then_with(|| self.get_order_distance().cmp(&other.get_order_distance()))
+            .then_with(|| self.get_total_gap().cmp(&other.get_total_gap()))
+            .then_with(|| self.get_typo_severity().cmp(&other.get_typo_severity()))
+            .then_with(|| {
+                other
+                    .get_exact_phrase_occurrence_rank()
+                    .cmp(self.get_exact_phrase_occurrence_rank())
             })
             .then_with(|| {
-                self.get_field_quality().cmp(&other.get_field_quality())
+                other
+                    .get_exact_token_occurrence_rank()
+                    .cmp(self.get_exact_token_occurrence_rank())
             })
-            .then_with(|| {
-                other.get_same_order_scattered().cmp(&self.get_same_order_scattered())
-            })
-            .then_with(|| {
-                self.get_closeness_gap_distance().cmp(&other.get_closeness_gap_distance())
-            })
-            .then_with(|| {
-                other.get_repeated_exact_phrase_bonus().cmp(&self.get_repeated_exact_phrase_bonus())
-            })
-            .then_with(|| {
-                other.get_repeated_token_bonus().cmp(&self.get_repeated_token_bonus())
-            })
-            .then_with(|| {
-                let (left_matched, left_len) = self.get_density_stats();
-                let (right_matched, right_len) = other.get_density_stats();
-                (right_matched * left_len).cmp(&(left_matched * right_len))
-            })
-            .then_with(|| {
-                let (_, left_len) = self.get_density_stats();
-                let (_, right_len) = other.get_density_stats();
-                left_len.cmp(&right_len)
-            })
+            .then_with(|| self.get_density_rank().cmp(&other.get_density_rank()))
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct TypoSeverity {
+    core_costs: TypoCostVector,
+    positions: TypoCostVector,
+    insertions: InsertionVector,
+}
+
+impl TypoSeverity {
+    fn from_matches(matches: &[TokenMatch]) -> Self {
+        let core_costs = TypoCostVector::new(
+            matches
+                .iter()
+                .map(|matched| {
+                    (matched.fuzzy && !matched.exact)
+                        .then_some(matched.severity.core_cost)
+                        .unwrap_or(0)
+                })
+                .collect(),
+        );
+        let positions = TypoCostVector::new(
+            matches
+                .iter()
+                .map(|matched| matched.severity.position)
+                .collect(),
+        );
+        let insertions = InsertionVector::new(
+            matches
+                .iter()
+                .map(|matched| matched.severity.insertions)
+                .collect(),
+        );
+        Self {
+            core_costs,
+            positions,
+            insertions,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
+struct TokenTypoSeverity {
     core_cost: usize,
     position: usize,
     insertions: usize,
 }
 
+impl TokenTypoSeverity {
+    fn new(core_cost: usize, position: usize, insertions: usize) -> Self {
+        Self {
+            core_cost,
+            position,
+            insertions,
+        }
+    }
+}
+
 impl Ord for TypoSeverity {
     fn cmp(&self, other: &Self) -> Ordering {
-        (self.core_cost, self.position, self.insertions).cmp(&(
-            other.core_cost,
-            other.position,
-            other.insertions,
+        (&self.core_costs, &self.positions, &self.insertions).cmp(&(
+            &other.core_costs,
+            &other.positions,
+            &other.insertions,
         ))
     }
 }
@@ -612,44 +693,55 @@ impl PartialOrd for TypoSeverity {
 #[allow(dead_code)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct MetadataRelevanceRank {
-    exact_whole_phrase_occurrences: usize,
-    exact_run_vector: Vec<usize>,
-    exact_distinct_coverage: usize,
+    exact_whole_phrase_present: bool,
+    exact_subphrase_counts_vector: Vec<usize>,
+    exact_coverage_rank: CoverageRank,
+    exact_field_quality: u8,
+    fuzzy_coverage_rank: CoverageRank,
     fuzzy_whole_phrase: bool,
-    fuzzy_run_vector: Vec<usize>,
-    total_distinct_coverage: usize,
+    fuzzy_subphrase_counts_vector: Vec<usize>,
+    fuzzy_field_quality: u8,
+    order_distance: usize,
+    total_gap: usize,
     typo_severity: TypoSeverity,
-    all_query_tokens_matched: bool,
-    field_quality: u8,
-    same_order_scattered: bool,
-    closeness_gap_distance: usize,
-    repeated_exact_phrase_bonus: usize,
-    repeated_token_bonus: usize,
-    density_matched_tokens: usize,
-    density_field_len: usize,
+    exact_phrase_occurrence_rank: FieldOccurrenceRank,
+    exact_token_occurrence_rank: FieldOccurrenceRank,
+    density: DensityRank,
 }
 
 impl Ord for MetadataRelevanceRank {
     fn cmp(&self, other: &Self) -> Ordering {
-        Reverse(self.exact_whole_phrase_occurrences)
-            .cmp(&Reverse(other.exact_whole_phrase_occurrences))
-            .then_with(|| Reverse(&self.exact_run_vector).cmp(&Reverse(&other.exact_run_vector)))
-            .then_with(|| Reverse(self.exact_distinct_coverage).cmp(&Reverse(other.exact_distinct_coverage)))
-            .then_with(|| Reverse(self.fuzzy_whole_phrase).cmp(&Reverse(other.fuzzy_whole_phrase)))
-            .then_with(|| Reverse(&self.fuzzy_run_vector).cmp(&Reverse(&other.fuzzy_run_vector)))
-            .then_with(|| Reverse(self.total_distinct_coverage).cmp(&Reverse(other.total_distinct_coverage)))
-            .then_with(|| self.typo_severity.cmp(&other.typo_severity))
-            .then_with(|| Reverse(self.all_query_tokens_matched).cmp(&Reverse(other.all_query_tokens_matched)))
-            .then_with(|| self.field_quality.cmp(&other.field_quality))
-            .then_with(|| Reverse(self.same_order_scattered).cmp(&Reverse(other.same_order_scattered)))
-            .then_with(|| self.closeness_gap_distance.cmp(&other.closeness_gap_distance))
-            .then_with(|| Reverse(self.repeated_exact_phrase_bonus).cmp(&Reverse(other.repeated_exact_phrase_bonus)))
-            .then_with(|| Reverse(self.repeated_token_bonus).cmp(&Reverse(other.repeated_token_bonus)))
+        Reverse(self.exact_whole_phrase_present)
+            .cmp(&Reverse(other.exact_whole_phrase_present))
             .then_with(|| {
-                (other.density_matched_tokens * self.density_field_len)
-                    .cmp(&(self.density_matched_tokens * other.density_field_len))
+                Reverse(&self.exact_subphrase_counts_vector)
+                    .cmp(&Reverse(&other.exact_subphrase_counts_vector))
             })
-            .then_with(|| self.density_field_len.cmp(&other.density_field_len))
+            .then_with(|| {
+                Reverse(&self.exact_coverage_rank).cmp(&Reverse(&other.exact_coverage_rank))
+            })
+            .then_with(|| self.exact_field_quality.cmp(&other.exact_field_quality))
+            .then_with(|| Reverse(self.fuzzy_whole_phrase).cmp(&Reverse(other.fuzzy_whole_phrase)))
+            .then_with(|| {
+                Reverse(&self.fuzzy_subphrase_counts_vector)
+                    .cmp(&Reverse(&other.fuzzy_subphrase_counts_vector))
+            })
+            .then_with(|| {
+                Reverse(&self.fuzzy_coverage_rank).cmp(&Reverse(&other.fuzzy_coverage_rank))
+            })
+            .then_with(|| self.fuzzy_field_quality.cmp(&other.fuzzy_field_quality))
+            .then_with(|| self.order_distance.cmp(&other.order_distance))
+            .then_with(|| self.total_gap.cmp(&other.total_gap))
+            .then_with(|| self.typo_severity.cmp(&other.typo_severity))
+            .then_with(|| {
+                Reverse(&self.exact_phrase_occurrence_rank)
+                    .cmp(&Reverse(&other.exact_phrase_occurrence_rank))
+            })
+            .then_with(|| {
+                Reverse(&self.exact_token_occurrence_rank)
+                    .cmp(&Reverse(&other.exact_token_occurrence_rank))
+            })
+            .then_with(|| self.density.cmp(&other.density))
     }
 }
 
@@ -694,11 +786,93 @@ struct NormalizedMetadataField {
     tokens: Vec<String>,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct FieldOccurrenceRank(Vec<(u8, usize)>);
+
+impl Ord for FieldOccurrenceRank {
+    fn cmp(&self, other: &Self) -> Ordering {
+        let mut priorities = self
+            .0
+            .iter()
+            .map(|(priority, _)| *priority)
+            .chain(other.0.iter().map(|(priority, _)| *priority))
+            .collect::<Vec<_>>();
+        priorities.sort_unstable();
+        priorities.dedup();
+
+        priorities
+            .into_iter()
+            .map(|priority| {
+                let left = self
+                    .0
+                    .iter()
+                    .find(|(candidate_priority, _)| *candidate_priority == priority)
+                    .map(|(_, count)| *count)
+                    .unwrap_or(0);
+                let right = other
+                    .0
+                    .iter()
+                    .find(|(candidate_priority, _)| *candidate_priority == priority)
+                    .map(|(_, count)| *count)
+                    .unwrap_or(0);
+                left.cmp(&right)
+            })
+            .find(|ordering| *ordering != Ordering::Equal)
+            .unwrap_or(Ordering::Equal)
+    }
+}
+
+impl PartialOrd for FieldOccurrenceRank {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+fn field_occurrence_rank(
+    fields: &[NormalizedMetadataField],
+    count: impl Fn(&NormalizedMetadataField) -> usize,
+) -> FieldOccurrenceRank {
+    let mut entries = fields
+        .iter()
+        .map(|field| (field.priority, count(field)))
+        .collect::<Vec<_>>();
+    entries.sort_unstable_by_key(|(priority, _)| *priority);
+
+    let mut merged = Vec::new();
+    for (priority, count) in entries {
+        if let Some((last_priority, last_count)) = merged.last_mut()
+            && *last_priority == priority
+        {
+            *last_count += count;
+        } else {
+            merged.push((priority, count));
+        }
+    }
+    FieldOccurrenceRank(merged)
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct TokenMatch {
     exact: bool,
     fuzzy: bool,
-    severity: TypoSeverity,
+    severity: TokenTypoSeverity,
+    scope: Option<TokenMatchScope>,
+    field_priority: u8,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum TokenMatchScope {
+    WholeToken,
+    Prefix,
+    Suffix,
+    Substring,
+    Fragmented,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TokenMatchDetail {
+    severity: TokenTypoSeverity,
+    scope: TokenMatchScope,
 }
 
 #[allow(dead_code)]
@@ -724,112 +898,186 @@ fn metadata_relevance_rank(
 
     if query_tokens.is_empty() || normalized_fields.is_empty() {
         return MetadataRelevanceRank {
-            exact_whole_phrase_occurrences: 0,
-            exact_run_vector: Vec::new(),
-            exact_distinct_coverage: 0,
+            exact_whole_phrase_present: false,
+            exact_subphrase_counts_vector: Vec::new(),
+            exact_coverage_rank: CoverageRank::default(),
+            exact_field_quality: u8::MAX,
+            fuzzy_coverage_rank: CoverageRank::default(),
             fuzzy_whole_phrase: false,
-            fuzzy_run_vector: Vec::new(),
-            total_distinct_coverage: 0,
+            fuzzy_subphrase_counts_vector: Vec::new(),
+            fuzzy_field_quality: u8::MAX,
+            order_distance: usize::MAX,
+            total_gap: usize::MAX,
             typo_severity: TypoSeverity::default(),
-            all_query_tokens_matched: false,
-            field_quality: u8::MAX,
-            same_order_scattered: false,
-            closeness_gap_distance: usize::MAX,
-            repeated_exact_phrase_bonus: 0,
-            repeated_token_bonus: 0,
-            density_matched_tokens: 0,
-            density_field_len: usize::MAX,
+            exact_phrase_occurrence_rank: FieldOccurrenceRank::default(),
+            exact_token_occurrence_rank: FieldOccurrenceRank::default(),
+            density: DensityRank::new(0, usize::MAX),
         };
     }
-
-    let query_len = query_tokens.len();
-    let exact_occurrence_counts = exact_token_occurrence_counts(
-        query_tokens,
-        normalized_fields.iter().map(|field| field.tokens.as_slice()),
-    );
 
     let fuzzy_best_matches = query_tokens
         .iter()
         .map(|query_token| best_fuzzy_token_match(query_token, &normalized_fields, allow_typo))
         .collect::<Vec<_>>();
 
-    let exact_whole_phrase_occurrences = exact_phrase_count(
+    let exact_whole_phrase_occurrences = exact_phrase_count_by(
         query_tokens,
-        normalized_fields.iter().map(|field| field.tokens.as_slice()),
+        normalized_fields
+            .iter()
+            .map(|field| field.tokens.as_slice()),
+        literal_token_match,
     );
 
-    let exact_run_vector = exact_phrase_run_vector(
+    let exact_subphrase_counts_vector = exact_subphrase_counts_vector_by(
         query_tokens,
-        normalized_fields.iter().map(|field| field.tokens.as_slice()),
+        normalized_fields
+            .iter()
+            .map(|field| field.tokens.as_slice()),
+        literal_token_match,
     );
-    let fuzzy_phrase_vector = fuzzy_phrase_run_vector(query_tokens, &normalized_fields);
-    let fuzzy_whole_phrase = fuzzy_phrase_vector
-        .first()
-        .copied()
-        .unwrap_or_default()
-        > 0;
-    let fuzzy_run_vector = fuzzy_phrase_vector.into_iter().skip(1).collect::<Vec<_>>();
-
-    let exact_distinct_coverage = exact_distinct_coverage(
-        query_tokens,
-        normalized_fields.iter().map(|field| field.tokens.as_slice()),
+    let fuzzy_subphrase_counts_vector =
+        fuzzy_subphrase_counts_vector(query_tokens, &normalized_fields);
+    let exact_coverage_rank = CoverageRank::new(
+        position_vector(
+            query_tokens.iter().map(|query_token| {
+                best_exact_token_scope(query_token, &normalized_fields).map(|scope| scope as usize)
+            }),
+            4,
+        ),
+        &[4, 2, 2, 1],
     );
-    let total_distinct_coverage = fuzzy_best_matches
-        .iter()
-        .filter(|matched| matched.exact || matched.fuzzy)
-        .count();
+    let fuzzy_coverage_rank = CoverageRank::new(
+        metadata_fuzzy_coverage_vector(&fuzzy_best_matches),
+        &[4, 2, 2, 1, 1],
+    );
+    let fuzzy_whole_phrase =
+        fuzzy_whole_phrase_present(query_tokens, &normalized_fields, allow_typo);
 
-    let typo_severity = fuzzy_best_matches
+    let typo_severity = TypoSeverity::from_matches(&fuzzy_best_matches);
+
+    let exact_field_quality = best_exact_field_priority(query_tokens, &normalized_fields);
+    let fuzzy_field_quality = fuzzy_best_matches
         .iter()
         .filter(|matched| matched.fuzzy && !matched.exact)
-        .fold(TypoSeverity::default(), |acc, matched| TypoSeverity {
-            core_cost: acc.core_cost + matched.severity.core_cost,
-            position: acc.position + matched.severity.position,
-            insertions: acc.insertions + matched.severity.insertions,
-        });
+        .map(|matched| matched.field_priority)
+        .min()
+        .unwrap_or(u8::MAX);
+    let (order_distance, total_gap) =
+        ordered_span_stats(query_tokens, &normalized_fields, allow_typo);
 
-    let all_query_tokens_matched = total_distinct_coverage == query_len;
+    let exact_phrase_occurrence_rank = field_occurrence_rank(&normalized_fields, |field| {
+        exact_phrase_count_by(
+            query_tokens,
+            std::iter::once(field.tokens.as_slice()),
+            literal_token_match,
+        )
+    });
+    let exact_token_occurrence_rank = field_occurrence_rank(&normalized_fields, |field| {
+        field
+            .tokens
+            .iter()
+            .map(|candidate| {
+                query_tokens
+                    .iter()
+                    .filter(|query| literal_token_match(query, candidate))
+                    .count()
+            })
+            .sum()
+    });
 
-    let field_quality = best_field_priority(query_tokens, &normalized_fields, allow_typo);
-    let (same_order_scattered, closeness_gap_distance) =
-        same_order_scattered_stats(query_tokens, &normalized_fields, allow_typo);
-
-    let repeated_exact_phrase_bonus = exact_whole_phrase_occurrences.min(3);
-    let repeated_token_bonus = exact_occurrence_counts
-        .iter()
-        .map(|count| count.min(&3))
-        .sum::<usize>();
-
-    let (density_matched_tokens, density_field_len) =
-        density_stats(query_tokens, &normalized_fields, &fuzzy_best_matches);
+    let density = density_stats(query_tokens, &normalized_fields, &fuzzy_best_matches);
 
     MetadataRelevanceRank {
-        exact_whole_phrase_occurrences,
-        exact_run_vector,
-        exact_distinct_coverage,
+        exact_whole_phrase_present: exact_whole_phrase_occurrences > 0,
+        exact_subphrase_counts_vector,
+        exact_coverage_rank,
+        exact_field_quality,
+        fuzzy_coverage_rank,
         fuzzy_whole_phrase,
-        fuzzy_run_vector,
-        total_distinct_coverage,
+        fuzzy_subphrase_counts_vector,
+        fuzzy_field_quality,
+        order_distance,
+        total_gap,
         typo_severity,
-        all_query_tokens_matched,
-        field_quality,
-        same_order_scattered,
-        closeness_gap_distance,
-        repeated_exact_phrase_bonus,
-        repeated_token_bonus,
-        density_matched_tokens,
-        density_field_len,
+        exact_phrase_occurrence_rank,
+        exact_token_occurrence_rank,
+        density,
     }
 }
 
-fn fuzzy_phrase_run_vector(
+fn literal_token_match(query: &str, candidate: &str) -> bool {
+    candidate.contains(query)
+}
+
+fn literal_token_scope(query: &str, candidate: &str) -> Option<TokenMatchScope> {
+    if candidate == query {
+        Some(TokenMatchScope::WholeToken)
+    } else if candidate.starts_with(query) {
+        Some(TokenMatchScope::Prefix)
+    } else if candidate.ends_with(query) {
+        Some(TokenMatchScope::Suffix)
+    } else if candidate.contains(query) {
+        Some(TokenMatchScope::Substring)
+    } else {
+        None
+    }
+}
+
+fn best_exact_token_scope(
+    query: &str,
+    fields: &[NormalizedMetadataField],
+) -> Option<TokenMatchScope> {
+    fields
+        .iter()
+        .flat_map(|field| field.tokens.iter())
+        .filter_map(|candidate| literal_token_scope(query, candidate))
+        .min()
+}
+
+fn metadata_fuzzy_coverage_vector(matches: &[TokenMatch]) -> Vec<usize> {
+    position_vector(
+        matches.iter().map(|matched| match matched.scope {
+            Some(scope) if matched.fuzzy && !matched.exact => Some(scope as usize),
+            _ => None,
+        }),
+        5,
+    )
+}
+
+fn fuzzy_whole_phrase_present(
+    query_tokens: &[String],
+    fields: &[NormalizedMetadataField],
+    allow_typo: bool,
+) -> bool {
+    if !allow_typo || query_tokens.is_empty() {
+        return false;
+    }
+
+    fields.iter().any(|field| {
+        field.tokens.windows(query_tokens.len()).any(|window| {
+            let mut contains_fuzzy = false;
+            for (query, candidate) in query_tokens.iter().zip(window) {
+                if literal_token_match(query, candidate) {
+                    continue;
+                }
+                if fuzzy_or_exact_token_match(candidate, query).is_none() {
+                    return false;
+                }
+                contains_fuzzy = true;
+            }
+            contains_fuzzy
+        })
+    })
+}
+
+fn fuzzy_subphrase_counts_vector(
     query_tokens: &[String],
     fields: &[NormalizedMetadataField],
 ) -> Vec<usize> {
-    if query_tokens.is_empty() {
+    if query_tokens.len() < 3 {
         return Vec::new();
     }
-    (2..=query_tokens.len())
+    (2..query_tokens.len())
         .rev()
         .map(|window_len| {
             let mut count = 0;
@@ -843,12 +1091,11 @@ fn fuzzy_phrase_run_vector(
                         .tokens
                         .windows(window_len)
                         .filter(|candidate_window| {
-                            candidate_window
-                                .iter()
-                                .zip(query_window.iter())
-                                .all(|(candidate, query)| {
+                            candidate_window.iter().zip(query_window.iter()).all(
+                                |(candidate, query)| {
                                     fuzzy_or_exact_token_match(candidate, query).is_some()
-                                })
+                                },
+                            )
                         })
                         .count();
                 }
@@ -866,25 +1113,43 @@ fn best_fuzzy_token_match(
     let mut best = TokenMatch::default();
     for field in fields {
         for candidate_token in &field.tokens {
-            if candidate_token.starts_with(query_token) {
-                return TokenMatch {
+            if let Some(scope) = literal_token_scope(query_token, candidate_token) {
+                let candidate = TokenMatch {
                     exact: true,
                     fuzzy: true,
-                    severity: TypoSeverity::default(),
+                    severity: TokenTypoSeverity::default(),
+                    scope: Some(scope),
+                    field_priority: field.priority,
                 };
+                if !best.exact
+                    || (candidate.scope, candidate.field_priority)
+                        < (best.scope, best.field_priority)
+                {
+                    best = candidate;
+                }
+                continue;
             }
             if !allow_typo {
                 continue;
             }
-            let Some(severity) = fuzzy_or_exact_token_match(candidate_token, query_token) else {
+            let Some(detail) = fuzzy_or_exact_token_match(candidate_token, query_token) else {
                 continue;
             };
             let candidate = TokenMatch {
                 exact: false,
                 fuzzy: true,
-                severity,
+                severity: detail.severity,
+                scope: Some(detail.scope),
+                field_priority: field.priority,
             };
-            if !best.fuzzy || candidate.severity < best.severity {
+            if !best.fuzzy
+                || (!best.exact
+                    && (
+                        candidate.scope,
+                        candidate.severity,
+                        candidate.field_priority,
+                    ) < (best.scope, best.severity, best.field_priority))
+            {
                 best = candidate;
             }
         }
@@ -892,9 +1157,15 @@ fn best_fuzzy_token_match(
     best
 }
 
-fn fuzzy_or_exact_token_match(candidate_token: &str, query_token: &str) -> Option<TypoSeverity> {
-    if candidate_token.starts_with(query_token) {
-        return Some(TypoSeverity::default());
+fn fuzzy_or_exact_token_match(
+    candidate_token: &str,
+    query_token: &str,
+) -> Option<TokenMatchDetail> {
+    if let Some(scope) = literal_token_scope(query_token, candidate_token) {
+        return Some(TokenMatchDetail {
+            severity: TokenTypoSeverity::default(),
+            scope,
+        });
     }
     let query_len = query_token.chars().count();
     if query_len < 3 || !token_has_signal(query_token, candidate_token) {
@@ -909,10 +1180,12 @@ fn fuzzy_or_exact_token_match(candidate_token: &str, query_token: &str) -> Optio
         let end = end_idx.min(candidate_chars.len());
         let start_min = start_idx.saturating_sub(limit).min(end);
         let start_max = (start_idx + limit).min(end);
-        let mut best_severity: Option<TypoSeverity> = None;
+        let mut best_match: Option<TokenMatchDetail> = None;
         for s in start_min..=start_max {
             let sliced: String = candidate_chars[s..end].iter().collect();
-            if let Some((_distance, operations)) = bounded_damerau_levenshtein(&sliced, query_token, limit) {
+            if let Some((_distance, operations)) =
+                bounded_damerau_levenshtein(&sliced, query_token, limit)
+            {
                 let position = if s == 0 {
                     0
                 } else if end == candidate_chars.len() {
@@ -920,32 +1193,56 @@ fn fuzzy_or_exact_token_match(candidate_token: &str, query_token: &str) -> Optio
                 } else {
                     2
                 };
-                let severity = TypoSeverity {
-                    core_cost: operations.core_typo_cost(),
-                    position,
-                    insertions: operations.insertions,
+                let candidate = TokenMatchDetail {
+                    severity: TokenTypoSeverity::new(
+                        operations.core_typo_cost(),
+                        position,
+                        operations.insertions,
+                    ),
+                    scope: if s == 0 && end == candidate_chars.len() {
+                        TokenMatchScope::WholeToken
+                    } else if s == 0 {
+                        TokenMatchScope::Prefix
+                    } else if end == candidate_chars.len() {
+                        TokenMatchScope::Suffix
+                    } else {
+                        TokenMatchScope::Substring
+                    },
                 };
-                if best_severity.as_ref().is_none_or(|best| severity < *best) {
-                    best_severity = Some(severity);
+                if best_match.as_ref().is_none_or(|best| {
+                    (candidate.scope, candidate.severity) < (best.scope, best.severity)
+                }) {
+                    best_match = Some(candidate);
                 }
             }
         }
-        best_severity
+        best_match
     } else {
         None
     };
 
-    let fragmented = if candidate_token.chars().count().saturating_sub(query_token.chars().count()) > limit {
+    let fragmented = if candidate_token
+        .chars()
+        .count()
+        .saturating_sub(query_token.chars().count())
+        > limit
+    {
         fragmented_token_match(query_token, candidate_token, limit).and_then(|matched| {
             let ratio = matched.distance as f64
-                / query_token.chars().count().max(candidate_token.chars().count()) as f64;
+                / query_token
+                    .chars()
+                    .count()
+                    .max(candidate_token.chars().count()) as f64;
             if ratio > 0.5 || matched.internal_breaks == 0 {
                 return None;
             }
-            Some(TypoSeverity {
-                core_cost: matched.operations.core_typo_cost(),
-                position: matched.position_rank,
-                insertions: matched.operations.insertions,
+            Some(TokenMatchDetail {
+                severity: TokenTypoSeverity::new(
+                    matched.operations.core_typo_cost(),
+                    matched.position_rank,
+                    matched.operations.insertions,
+                ),
+                scope: TokenMatchScope::Fragmented,
             })
         })
     } else {
@@ -953,25 +1250,26 @@ fn fuzzy_or_exact_token_match(candidate_token: &str, query_token: &str) -> Optio
     };
 
     match (contiguous, fragmented) {
-        (Some(left), Some(right)) => Some(if right < left { right } else { left }),
+        (Some(left), Some(right)) => Some(
+            if (right.scope, right.severity) < (left.scope, left.severity) {
+                right
+            } else {
+                left
+            },
+        ),
         (Some(value), None) | (None, Some(value)) => Some(value),
         (None, None) => None,
     }
 }
 
-fn best_field_priority(
-    query_tokens: &[String],
-    fields: &[NormalizedMetadataField],
-    allow_typo: bool,
-) -> u8 {
+fn best_exact_field_priority(query_tokens: &[String], fields: &[NormalizedMetadataField]) -> u8 {
     fields
         .iter()
         .filter(|field| {
             field.tokens.iter().any(|candidate_token| {
-                query_tokens.iter().any(|query_token| {
-                    candidate_token.starts_with(query_token)
-                        || (allow_typo && fuzzy_or_exact_token_match(candidate_token, query_token).is_some())
-                })
+                query_tokens
+                    .iter()
+                    .any(|query_token| literal_token_match(query_token, candidate_token))
             })
         })
         .map(|field| field.priority)
@@ -979,16 +1277,16 @@ fn best_field_priority(
         .unwrap_or(u8::MAX)
 }
 
-fn same_order_scattered_stats(
+fn ordered_span_stats(
     query_tokens: &[String],
     fields: &[NormalizedMetadataField],
     allow_typo: bool,
-) -> (bool, usize) {
+) -> (usize, usize) {
     ordered_token_span(
         query_tokens,
         fields.iter().map(|field| field.tokens.as_slice()),
         |query, candidate| {
-            candidate.starts_with(query)
+            literal_token_match(query, candidate)
                 || (allow_typo && fuzzy_or_exact_token_match(candidate, query).is_some())
         },
     )
@@ -998,21 +1296,30 @@ fn density_stats(
     query_tokens: &[String],
     fields: &[NormalizedMetadataField],
     fuzzy_matches: &[TokenMatch],
-) -> (usize, usize) {
-    let matched_count = fuzzy_matches.iter().filter(|matched| matched.exact || matched.fuzzy).count();
+) -> DensityRank {
+    let matched_count = fuzzy_matches
+        .iter()
+        .filter(|matched| matched.exact || matched.fuzzy)
+        .count();
     let best_field_len = fields
         .iter()
         .filter(|field| {
             field.tokens.iter().any(|candidate_token| {
                 query_tokens
                     .iter()
-                    .any(|query_token| candidate_token.starts_with(query_token))
+                    .any(|query_token| literal_token_match(query_token, candidate_token))
             })
         })
         .map(|field| field.tokens.len())
         .min()
-        .unwrap_or_else(|| fields.iter().map(|field| field.tokens.len()).min().unwrap_or(usize::MAX));
-    (matched_count, best_field_len)
+        .unwrap_or_else(|| {
+            fields
+                .iter()
+                .map(|field| field.tokens.len())
+                .min()
+                .unwrap_or(usize::MAX)
+        });
+    DensityRank::new(matched_count, best_field_len)
 }
 
 pub fn dedup_push_search_field<'a>(
@@ -1338,7 +1645,7 @@ fn best_abbreviation_rank(query: &str, fields: &[SearchField<'_>]) -> Option<Abb
         }
 
         let target_lower = to_lowercase(target);
-        
+
         // Fast path: check if target contains all characters of query in order
         let mut target_chars_iter = target_lower.chars();
         let mut found_all = true;
@@ -1661,7 +1968,9 @@ mod tests {
                 MetadataQuery::new("git").unwrap().search_rank(b).unwrap(),
             ),
         ];
-        MetadataQuery::new("git").unwrap().sort_matches(&mut matches);
+        MetadataQuery::new("git")
+            .unwrap()
+            .sort_matches(&mut matches);
         assert_eq!(matches[0].0.key, "b");
     }
 
@@ -1682,14 +1991,227 @@ mod tests {
             fields: &fields,
             score: 0.0,
         };
-        assert!(MetadataQuery::new("term1 term2 term3 term4")
-            .unwrap()
-            .search_rank(candidate)
-            .is_some());
+        assert!(
+            MetadataQuery::new("term1 term2 term3 term4")
+                .unwrap()
+                .search_rank(candidate)
+                .is_some()
+        );
     }
 
     #[test]
-    fn metadata_phrase_coverage_orders_longer_query_windows_first() {
+    fn total_coverage_breaks_exact_coverage_ties_with_one_typo() {
+        let partial_fields = [SearchField {
+            priority: 0,
+            value: "one two three",
+        }];
+        let typo_fields = [SearchField {
+            priority: 0,
+            value: "one two three fuor",
+        }];
+        let partial = MetadataCandidate {
+            key: "partial",
+            fields: &partial_fields,
+            score: 0.0,
+        };
+        let typo = MetadataCandidate {
+            key: "typo",
+            fields: &typo_fields,
+            score: 0.0,
+        };
+        let query = MetadataQuery::new("one two three four")
+            .unwrap()
+            .with_typo_fallback(true);
+        let mut matches = vec![
+            (partial, query.search_rank(partial).unwrap()),
+            (typo, query.search_rank(typo).unwrap()),
+        ];
+
+        query.sort_matches(&mut matches);
+
+        assert_eq!(matches[0].0.key, "typo");
+    }
+
+    #[test]
+    fn exact_token_classes_rank_whole_prefix_suffix_then_substring() {
+        let whole_fields = [SearchField {
+            priority: 0,
+            value: "app",
+        }];
+        let prefix_fields = [SearchField {
+            priority: 0,
+            value: "application",
+        }];
+        let suffix_fields = [SearchField {
+            priority: 0,
+            value: "myapp",
+        }];
+        let substring_fields = [SearchField {
+            priority: 0,
+            value: "myapplication",
+        }];
+        let whole = MetadataCandidate {
+            key: "whole",
+            fields: &whole_fields,
+            score: 0.0,
+        };
+        let prefix = MetadataCandidate {
+            key: "prefix",
+            fields: &prefix_fields,
+            score: 100.0,
+        };
+        let suffix = MetadataCandidate {
+            key: "suffix",
+            fields: &suffix_fields,
+            score: 200.0,
+        };
+        let substring = MetadataCandidate {
+            key: "substring",
+            fields: &substring_fields,
+            score: 300.0,
+        };
+        let query = MetadataQuery::new("app").unwrap();
+        let mut matches = vec![
+            (substring, query.search_rank(substring).unwrap()),
+            (suffix, query.search_rank(suffix).unwrap()),
+            (prefix, query.search_rank(prefix).unwrap()),
+            (whole, query.search_rank(whole).unwrap()),
+        ];
+
+        query.sort_matches(&mut matches);
+
+        assert_eq!(
+            matches
+                .iter()
+                .map(|(candidate, _)| candidate.key)
+                .collect::<Vec<_>>(),
+            ["whole", "prefix", "suffix", "substring"]
+        );
+    }
+
+    #[test]
+    fn weighted_exact_coverage_balances_quality_and_distinct_tokens() {
+        let query = MetadataQuery::new("chrome profile error").unwrap();
+        let one_whole_fields = [SearchField {
+            priority: 0,
+            value: "chrome settings",
+        }];
+        let three_prefix_fields = [
+            SearchField {
+                priority: 0,
+                value: "chromedriver",
+            },
+            SearchField {
+                priority: 0,
+                value: "profilemanager",
+            },
+            SearchField {
+                priority: 0,
+                value: "errorlog",
+            },
+        ];
+        let two_whole_fields = [
+            SearchField {
+                priority: 0,
+                value: "chrome",
+            },
+            SearchField {
+                priority: 0,
+                value: "profile",
+            },
+        ];
+        let candidate = |key, fields| MetadataCandidate {
+            key,
+            fields,
+            score: 0.0,
+        };
+        let one_whole = candidate("one-whole", &one_whole_fields);
+        let three_prefix = candidate("three-prefix", &three_prefix_fields);
+        let two_whole = candidate("two-whole", &two_whole_fields);
+
+        let mut first = vec![
+            (one_whole, query.search_rank(one_whole).unwrap()),
+            (three_prefix, query.search_rank(three_prefix).unwrap()),
+        ];
+        query.sort_matches(&mut first);
+        assert_eq!(first[0].0.key, "three-prefix");
+
+        let mut second = vec![
+            (three_prefix, query.search_rank(three_prefix).unwrap()),
+            (two_whole, query.search_rank(two_whole).unwrap()),
+        ];
+        query.sort_matches(&mut second);
+        assert_eq!(second[0].0.key, "two-whole");
+    }
+
+    #[test]
+    fn fuzzy_whole_token_beats_fuzzy_prefix() {
+        let whole_fields = [SearchField {
+            priority: 0,
+            value: "chrome",
+        }];
+        let prefix_fields = [SearchField {
+            priority: 0,
+            value: "chromedriver",
+        }];
+        let whole = MetadataCandidate {
+            key: "whole",
+            fields: &whole_fields,
+            score: 0.0,
+        };
+        let prefix = MetadataCandidate {
+            key: "prefix",
+            fields: &prefix_fields,
+            score: 100.0,
+        };
+        let query = MetadataQuery::new("krome")
+            .unwrap()
+            .with_typo_fallback(true);
+        let mut matches = vec![
+            (prefix, query.search_rank(prefix).unwrap()),
+            (whole, query.search_rank(whole).unwrap()),
+        ];
+
+        query.sort_matches(&mut matches);
+
+        assert_eq!(matches[0].0.key, "whole");
+    }
+
+    #[test]
+    fn fuzzy_field_quality_uses_the_field_that_supplied_the_fuzzy_match() {
+        let preferred_fields = [SearchField {
+            priority: 0,
+            value: "chrome",
+        }];
+        let fallback_fields = [SearchField {
+            priority: 5,
+            value: "chrome",
+        }];
+        let preferred = MetadataCandidate {
+            key: "preferred",
+            fields: &preferred_fields,
+            score: 0.0,
+        };
+        let fallback = MetadataCandidate {
+            key: "fallback",
+            fields: &fallback_fields,
+            score: 100.0,
+        };
+        let query = MetadataQuery::new("krome")
+            .unwrap()
+            .with_typo_fallback(true);
+        let mut matches = vec![
+            (fallback, query.search_rank(fallback).unwrap()),
+            (preferred, query.search_rank(preferred).unwrap()),
+        ];
+
+        query.sort_matches(&mut matches);
+
+        assert_eq!(matches[0].0.key, "preferred");
+    }
+
+    #[test]
+    fn metadata_subphrase_counts_precede_coverage() {
         let query = MetadataQuery::new("term1 term2 term3 term4").unwrap();
 
         let full_fields = [SearchField {
@@ -1775,7 +2297,10 @@ mod tests {
         query.sort_matches(&mut matches);
 
         assert_eq!(
-            matches.iter().map(|(candidate, _)| candidate.key).collect::<Vec<_>>(),
+            matches
+                .iter()
+                .map(|(candidate, _)| candidate.key)
+                .collect::<Vec<_>>(),
             vec![
                 "full",
                 "two-three",
@@ -1784,6 +2309,116 @@ mod tests {
                 "three-two",
             ]
         );
+    }
+
+    #[test]
+    fn repeated_exact_phrase_does_not_beat_better_field_quality() {
+        let preferred_fields = [SearchField {
+            priority: 0,
+            value: "app",
+        }];
+        let repeated_fields = [SearchField {
+            priority: 5,
+            value: "app app app app app",
+        }];
+        let preferred = MetadataCandidate {
+            key: "preferred",
+            fields: &preferred_fields,
+            score: 0.0,
+        };
+        let repeated = MetadataCandidate {
+            key: "repeated",
+            fields: &repeated_fields,
+            score: 100.0,
+        };
+        let query = MetadataQuery::new("app").unwrap();
+        let mut matches = vec![
+            (repeated, query.search_rank(repeated).unwrap()),
+            (preferred, query.search_rank(preferred).unwrap()),
+        ];
+
+        query.sort_matches(&mut matches);
+
+        assert_eq!(matches[0].0.key, "preferred");
+    }
+
+    #[test]
+    fn occurrence_ranks_prioritize_title_hits_over_command_line_hits() {
+        let title_heavy_fields = [
+            SearchField {
+                priority: 0,
+                value: "codex codex",
+            },
+            SearchField {
+                priority: 5,
+                value: "command",
+            },
+        ];
+        let command_line_heavy_fields = [
+            SearchField {
+                priority: 0,
+                value: "codex",
+            },
+            SearchField {
+                priority: 5,
+                value: "codex codex codex codex codex codex codex codex",
+            },
+        ];
+        let title_heavy = MetadataCandidate {
+            key: "title-heavy",
+            fields: &title_heavy_fields,
+            score: 0.0,
+        };
+        let command_line_heavy = MetadataCandidate {
+            key: "command-line-heavy",
+            fields: &command_line_heavy_fields,
+            score: 0.0,
+        };
+        let query = MetadataQuery::new("codex").unwrap();
+        let mut matches = vec![
+            (
+                command_line_heavy,
+                query.search_rank(command_line_heavy).unwrap(),
+            ),
+            (title_heavy, query.search_rank(title_heavy).unwrap()),
+        ];
+
+        query.sort_matches(&mut matches);
+
+        assert_eq!(matches[0].0.key, "title-heavy");
+    }
+
+    #[test]
+    fn fuzzy_whole_phrase_beats_scattered_fuzzy_tokens() {
+        let phrase_fields = [SearchField {
+            priority: 0,
+            value: "visual stduio code",
+        }];
+        let scattered_fields = [SearchField {
+            priority: 0,
+            value: "visual unrelated stduio unrelated code",
+        }];
+        let phrase = MetadataCandidate {
+            key: "phrase",
+            fields: &phrase_fields,
+            score: 0.0,
+        };
+        let scattered = MetadataCandidate {
+            key: "scattered",
+            fields: &scattered_fields,
+            score: 100.0,
+        };
+        let query = MetadataQuery::new("visual studio code")
+            .unwrap()
+            .with_typo_fallback(true);
+        let mut matches = vec![
+            (scattered, query.search_rank(scattered).unwrap()),
+            (phrase, query.search_rank(phrase).unwrap()),
+        ];
+
+        query.sort_matches(&mut matches);
+
+        assert_eq!(matches[0].0.key, "phrase");
     }
 
     #[test]
@@ -1915,7 +2550,9 @@ mod tests {
             fields: &splurge_fields,
             score: 1.0,
         };
-        let query = MetadataQuery::new("splyush").unwrap().with_typo_fallback(true);
+        let query = MetadataQuery::new("splyush")
+            .unwrap()
+            .with_typo_fallback(true);
         let mut matches = vec![
             (splurge, query.search_rank(splurge).unwrap()),
             (unsplash, query.search_rank(unsplash).unwrap()),
@@ -1944,7 +2581,9 @@ mod tests {
             priority: 0,
             value: "mike-uderevsky-JuJYPgv4Rag-unsplash exported",
         }];
-        let query = MetadataQuery::new("splyush").unwrap().with_typo_fallback(true);
+        let query = MetadataQuery::new("splyush")
+            .unwrap()
+            .with_typo_fallback(true);
         let list = MetadataCandidate {
             key: "window:list-google",
             fields: &list_fields,
@@ -2049,13 +2688,13 @@ mod tests {
                 value: "~/Dev/chatbot",
             },
         ];
-        let unsplash_fields = [
-            SearchField {
-                priority: 0,
-                value: "*[mike-uderevsky-JuJYPgv4Rag-unsplash] (exported)-1.0 (RGB colour 8-bit non-linear integer, sRGB IEC61966-2.1, 1 layer)",
-            },
-        ];
-        let query = MetadataQuery::new("splyush").unwrap().with_typo_fallback(true);
+        let unsplash_fields = [SearchField {
+            priority: 0,
+            value: "*[mike-uderevsky-JuJYPgv4Rag-unsplash] (exported)-1.0 (RGB colour 8-bit non-linear integer, sRGB IEC61966-2.1, 1 layer)",
+        }];
+        let query = MetadataQuery::new("splyush")
+            .unwrap()
+            .with_typo_fallback(true);
         let list = MetadataCandidate {
             key: "window:list-google",
             fields: &list_fields,
@@ -2066,7 +2705,7 @@ mod tests {
             fields: &unsplash_fields,
             score: 1.0,
         };
-        
+
         let list_rank = query.search_rank(list);
         let unsplash_rank = query.search_rank(unsplash);
         println!("list_rank: {:?}", list_rank);
@@ -2104,12 +2743,10 @@ mod tests {
                 value: "~/Dev/chatbot",
             },
         ];
-        let unsplash_fields = [
-            SearchField {
-                priority: 0,
-                value: "*[mike-uderevsky-JuJYPgv4Rag-unsplash] (exported)-1.0 (RGB colour 8-bit non-linear integer, sRGB IEC61966-2.1, 1 layer)",
-            },
-        ];
+        let unsplash_fields = [SearchField {
+            priority: 0,
+            value: "*[mike-uderevsky-JuJYPgv4Rag-unsplash] (exported)-1.0 (RGB colour 8-bit non-linear integer, sRGB IEC61966-2.1, 1 layer)",
+        }];
         let query = MetadataQuery::new("unsplash").unwrap();
         let list = MetadataCandidate {
             key: "window:list-google",
@@ -2121,7 +2758,7 @@ mod tests {
             fields: &unsplash_fields,
             score: 1.0,
         };
-        
+
         let list_rank = query.search_rank(list);
         let unsplash_rank = query.search_rank(unsplash);
         println!("list_rank: {:?}", list_rank);
@@ -2132,7 +2769,7 @@ mod tests {
             (unsplash, unsplash_rank.unwrap()),
         ];
         query.sort_matches(&mut matches);
-        
+
         println!("Sorted results:");
         for (candidate, rank) in &matches {
             println!("  key: {}, rank: {:?}", candidate.key, rank);
@@ -2169,14 +2806,14 @@ mod tests {
                 value: "~/Dev/chatbot",
             },
         ];
-        let unsplash_fields = [
-            SearchField {
-                priority: 0,
-                value: "*[mike-uderevsky-JuJYPgv4Rag-unsplash] (exported)-1.0 (RGB colour 8-bit non-linear integer, sRGB IEC61966-2.1, 1 layer)",
-            },
-        ];
+        let unsplash_fields = [SearchField {
+            priority: 0,
+            value: "*[mike-uderevsky-JuJYPgv4Rag-unsplash] (exported)-1.0 (RGB colour 8-bit non-linear integer, sRGB IEC61966-2.1, 1 layer)",
+        }];
         let query_str = "splyush";
-        let query = MetadataQuery::new(query_str).unwrap().with_typo_fallback(true);
+        let query = MetadataQuery::new(query_str)
+            .unwrap()
+            .with_typo_fallback(true);
         let list = MetadataCandidate {
             key: "window:list-google",
             fields: &list_fields,
@@ -2237,17 +2874,35 @@ fn alnum_tokens_with_char_ranges(text: &str) -> Vec<CharToken> {
         }
         if let Some(start) = token_start.take() {
             let end = char_idx;
-            let val = text.chars().skip(start).take(end - start).collect::<String>().to_lowercase();
+            let val = text
+                .chars()
+                .skip(start)
+                .take(end - start)
+                .collect::<String>()
+                .to_lowercase();
             if !val.is_empty() {
-                tokens.push(CharToken { start, _end: end, value: val });
+                tokens.push(CharToken {
+                    start,
+                    _end: end,
+                    value: val,
+                });
             }
         }
     }
     if let Some(start) = token_start {
         let end = text.chars().count();
-        let val = text.chars().skip(start).take(end - start).collect::<String>().to_lowercase();
+        let val = text
+            .chars()
+            .skip(start)
+            .take(end - start)
+            .collect::<String>()
+            .to_lowercase();
         if !val.is_empty() {
-            tokens.push(CharToken { start, _end: end, value: val });
+            tokens.push(CharToken {
+                start,
+                _end: end,
+                value: val,
+            });
         }
     }
     tokens
@@ -2271,9 +2926,17 @@ fn char_indices_to_byte_range(text: &str, start_char: usize, end_char: usize) ->
     (byte_start, byte_end)
 }
 
-fn typo_match_token_slice(candidate_token: &str, query_token: &str) -> Option<(usize, usize, TypoSeverity)> {
-    if candidate_token.starts_with(query_token) {
-        return Some((0, query_token.chars().count(), TypoSeverity::default()));
+fn typo_match_token_slice(
+    candidate_token: &str,
+    query_token: &str,
+) -> Option<(usize, usize, TokenTypoSeverity)> {
+    if let Some(start_byte) = candidate_token.find(query_token) {
+        let start_char = candidate_token[..start_byte].chars().count();
+        return Some((
+            start_char,
+            start_char + query_token.chars().count(),
+            TokenTypoSeverity::default(),
+        ));
     }
     let query_len = query_token.chars().count();
     if query_len < 3 || !token_has_signal(query_token, candidate_token) {
@@ -2288,10 +2951,12 @@ fn typo_match_token_slice(candidate_token: &str, query_token: &str) -> Option<(u
         let end = end_idx.min(candidate_chars.len());
         let start_min = start_idx.saturating_sub(limit).min(end);
         let start_max = (start_idx + limit).min(end);
-        let mut best_severity: Option<(usize, usize, TypoSeverity)> = None;
+        let mut best_severity: Option<(usize, usize, TokenTypoSeverity)> = None;
         for s in start_min..=start_max {
             let sliced: String = candidate_chars[s..end].iter().collect();
-            if let Some((_distance, operations)) = bounded_damerau_levenshtein(&sliced, query_token, limit) {
+            if let Some((_distance, operations)) =
+                bounded_damerau_levenshtein(&sliced, query_token, limit)
+            {
                 let position = if s == 0 {
                     0
                 } else if end == candidate_chars.len() {
@@ -2299,12 +2964,15 @@ fn typo_match_token_slice(candidate_token: &str, query_token: &str) -> Option<(u
                 } else {
                     2
                 };
-                let severity = TypoSeverity {
-                    core_cost: operations.core_typo_cost(),
+                let severity = TokenTypoSeverity::new(
+                    operations.core_typo_cost(),
                     position,
-                    insertions: operations.insertions,
-                };
-                if best_severity.as_ref().is_none_or(|(_, _, best)| severity < *best) {
+                    operations.insertions,
+                );
+                if best_severity
+                    .as_ref()
+                    .is_none_or(|(_, _, best)| severity < *best)
+                {
                     best_severity = Some((s, end, severity));
                 }
             }
@@ -2314,18 +2982,26 @@ fn typo_match_token_slice(candidate_token: &str, query_token: &str) -> Option<(u
         None
     };
 
-    let fragmented = if candidate_token.chars().count().saturating_sub(query_token.chars().count()) > limit {
+    let fragmented = if candidate_token
+        .chars()
+        .count()
+        .saturating_sub(query_token.chars().count())
+        > limit
+    {
         fragmented_token_match(query_token, candidate_token, limit).and_then(|matched| {
             let ratio = matched.distance as f64
-                / query_token.chars().count().max(candidate_token.chars().count()) as f64;
+                / query_token
+                    .chars()
+                    .count()
+                    .max(candidate_token.chars().count()) as f64;
             if ratio > 0.5 || matched.internal_breaks == 0 {
                 return None;
             }
-            let severity = TypoSeverity {
-                core_cost: matched.operations.core_typo_cost(),
-                position: matched.position_rank,
-                insertions: matched.operations.insertions,
-            };
+            let severity = TokenTypoSeverity::new(
+                matched.operations.core_typo_cost(),
+                matched.position_rank,
+                matched.operations.insertions,
+            );
             Some((0, candidate_token.chars().count(), severity))
         })
     } else {

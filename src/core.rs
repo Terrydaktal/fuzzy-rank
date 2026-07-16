@@ -1,5 +1,54 @@
 use std::cmp::Ordering;
 
+#[derive(Clone, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
+pub struct CoverageRank {
+    pub weighted_quality: usize,
+    pub distinct_coverage: usize,
+    pub class_counts: Vec<usize>,
+}
+
+impl CoverageRank {
+    pub fn new(class_counts: Vec<usize>, weights: &[usize]) -> Self {
+        debug_assert_eq!(class_counts.len(), weights.len());
+        let weighted_quality = class_counts
+            .iter()
+            .zip(weights)
+            .map(|(count, weight)| count.saturating_mul(*weight))
+            .sum();
+        let distinct_coverage = class_counts.iter().sum();
+        Self {
+            weighted_quality,
+            distinct_coverage,
+            class_counts,
+        }
+    }
+}
+
+pub fn position_vector(
+    classes: impl IntoIterator<Item = Option<usize>>,
+    class_count: usize,
+) -> Vec<usize> {
+    let mut vector = vec![0; class_count];
+    for class in classes.into_iter().flatten() {
+        if let Some(count) = vector.get_mut(class) {
+            *count += 1;
+        }
+    }
+    vector
+}
+
+pub fn position_vector_simple(classes: impl IntoIterator<Item = usize>) -> [usize; 3] {
+    let mut vector = [0; 3];
+    for class in classes {
+        increment_position_vector_simple(&mut vector, class, 1);
+    }
+    vector
+}
+
+pub fn increment_position_vector_simple(vector: &mut [usize; 3], class: usize, count: usize) {
+    vector[class.min(2)] += count;
+}
+
 pub fn compare_score_desc(left: f64, right: f64) -> Ordering {
     right.total_cmp(&left)
 }
@@ -12,11 +61,56 @@ pub fn ratio_milli(distance: usize, compared_len: usize) -> usize {
     distance * 1000 / compared_len.max(1)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DensityRank {
+    pub matched_tokens: usize,
+    pub field_len: usize,
+}
+
+impl DensityRank {
+    pub fn new(matched_tokens: usize, field_len: usize) -> Self {
+        Self {
+            matched_tokens,
+            field_len,
+        }
+    }
+}
+
+impl Ord for DensityRank {
+    fn cmp(&self, other: &Self) -> Ordering {
+        ((other.matched_tokens as u128) * (self.field_len as u128))
+            .cmp(&((self.matched_tokens as u128) * (other.field_len as u128)))
+            .then_with(|| self.field_len.cmp(&other.field_len))
+    }
+}
+
+impl PartialOrd for DensityRank {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 pub fn exact_phrase_count<'a, Q, C, I>(query_tokens: &[Q], fields: I) -> usize
 where
     Q: AsRef<str>,
     C: AsRef<str> + 'a,
     I: IntoIterator<Item = &'a [C]>,
+{
+    exact_phrase_count_by(query_tokens, fields, |query, candidate| {
+        candidate.starts_with(query)
+    })
+}
+
+pub fn exact_phrase_count_by<'a, Q, C, I, F>(
+    query_tokens: &[Q],
+    fields: I,
+    token_matches: F,
+) -> usize
+where
+    Q: AsRef<str>,
+    C: AsRef<str> + 'a,
+    I: IntoIterator<Item = &'a [C]>,
+    F: Fn(&str, &str) -> bool + Copy,
 {
     if query_tokens.is_empty() {
         return 0;
@@ -26,23 +120,39 @@ where
         .map(|tokens| {
             tokens
                 .windows(query_tokens.len())
-                .filter(|window| exact_prefix_window(query_tokens, window))
+                .filter(|window| token_window_matches(query_tokens, window, token_matches))
                 .count()
         })
         .sum()
 }
 
-pub fn exact_phrase_run_vector<'a, Q, C, I>(query_tokens: &[Q], fields: I) -> Vec<usize>
+pub fn exact_subphrase_counts_vector<'a, Q, C, I>(query_tokens: &[Q], fields: I) -> Vec<usize>
 where
     Q: AsRef<str>,
     C: AsRef<str> + 'a,
     I: IntoIterator<Item = &'a [C]>,
 {
-    if query_tokens.is_empty() {
+    exact_subphrase_counts_vector_by(query_tokens, fields, |query, candidate| {
+        candidate.starts_with(query)
+    })
+}
+
+pub fn exact_subphrase_counts_vector_by<'a, Q, C, I, F>(
+    query_tokens: &[Q],
+    fields: I,
+    token_matches: F,
+) -> Vec<usize>
+where
+    Q: AsRef<str>,
+    C: AsRef<str> + 'a,
+    I: IntoIterator<Item = &'a [C]>,
+    F: Fn(&str, &str) -> bool + Copy,
+{
+    if query_tokens.len() < 3 {
         return Vec::new();
     }
     let fields = fields.into_iter().collect::<Vec<_>>();
-    (2..=query_tokens.len())
+    (2..query_tokens.len())
         .rev()
         .map(|window_len| {
             let mut count = 0;
@@ -53,7 +163,9 @@ where
                     .map(|tokens| {
                         tokens
                             .windows(window_len)
-                            .filter(|window| exact_prefix_window(query_window, window))
+                            .filter(|window| {
+                                token_window_matches(query_window, window, token_matches)
+                            })
                             .count()
                     })
                     .sum::<usize>();
@@ -69,6 +181,22 @@ where
     C: AsRef<str> + 'a,
     I: IntoIterator<Item = &'a [C]>,
 {
+    exact_distinct_coverage_by(query_tokens, fields, |query, candidate| {
+        candidate.starts_with(query)
+    })
+}
+
+pub fn exact_distinct_coverage_by<'a, Q, C, I, F>(
+    query_tokens: &[Q],
+    fields: I,
+    token_matches: F,
+) -> usize
+where
+    Q: AsRef<str>,
+    C: AsRef<str> + 'a,
+    I: IntoIterator<Item = &'a [C]>,
+    F: Fn(&str, &str) -> bool + Copy,
+{
     let fields = fields.into_iter().collect::<Vec<_>>();
     query_tokens
         .iter()
@@ -76,7 +204,7 @@ where
             fields.iter().any(|tokens| {
                 tokens
                     .iter()
-                    .any(|candidate| candidate.as_ref().starts_with(query.as_ref()))
+                    .any(|candidate| token_matches(query.as_ref(), candidate.as_ref()))
             })
         })
         .count()
@@ -88,6 +216,22 @@ where
     C: AsRef<str> + 'a,
     I: IntoIterator<Item = &'a [C]>,
 {
+    exact_token_occurrence_counts_by(query_tokens, fields, |query, candidate| {
+        candidate.starts_with(query)
+    })
+}
+
+pub fn exact_token_occurrence_counts_by<'a, Q, C, I, F>(
+    query_tokens: &[Q],
+    fields: I,
+    token_matches: F,
+) -> Vec<usize>
+where
+    Q: AsRef<str>,
+    C: AsRef<str> + 'a,
+    I: IntoIterator<Item = &'a [C]>,
+    F: Fn(&str, &str) -> bool + Copy,
+{
     let fields = fields.into_iter().collect::<Vec<_>>();
     query_tokens
         .iter()
@@ -97,7 +241,7 @@ where
                 .map(|tokens| {
                     tokens
                         .iter()
-                        .filter(|candidate| candidate.as_ref().starts_with(query.as_ref()))
+                        .filter(|candidate| token_matches(query.as_ref(), candidate.as_ref()))
                         .count()
                 })
                 .sum()
@@ -105,11 +249,32 @@ where
         .collect()
 }
 
+pub fn saturated_exact_query_token_occurrence_total(counts: &[usize]) -> usize {
+    counts.iter().map(|count| (*count).min(3)).sum()
+}
+
+pub fn saturated_exact_phrase_count(count: usize) -> usize {
+    count.min(3)
+}
+
+pub fn inversion_count(values: &[usize]) -> usize {
+    values
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            values[index + 1..]
+                .iter()
+                .filter(|later| *later < value)
+                .count()
+        })
+        .sum()
+}
+
 pub fn ordered_token_span<'a, Q, C, I, F>(
     query_tokens: &[Q],
     fields: I,
     mut token_matches: F,
-) -> (bool, usize)
+) -> (usize, usize)
 where
     Q: AsRef<str>,
     C: AsRef<str> + 'a,
@@ -117,44 +282,57 @@ where
     F: FnMut(&str, &str) -> bool,
 {
     if query_tokens.is_empty() {
-        return (false, usize::MAX);
+        return (usize::MAX, usize::MAX);
     }
 
-    let mut found = false;
-    let mut best_gap = usize::MAX;
+    let mut best: Option<(usize, usize, usize)> = None;
     for field in fields {
-        let mut search_from = 0;
-        let mut first = None;
-        let mut last = 0;
-        let mut matched = 0;
+        let mut used = vec![false; field.len()];
+        let mut positions = Vec::new();
         for query in query_tokens {
-            let Some((idx, _)) = field
-                .iter()
-                .enumerate()
-                .skip(search_from)
-                .find(|(_, candidate)| token_matches(query.as_ref(), candidate.as_ref()))
-            else {
-                break;
+            let Some((idx, _)) = field.iter().enumerate().find(|(idx, candidate)| {
+                !used[*idx] && token_matches(query.as_ref(), candidate.as_ref())
+            }) else {
+                continue;
             };
-            first.get_or_insert(idx);
-            last = idx;
-            matched += 1;
-            search_from = idx + 1;
+            used[idx] = true;
+            positions.push(idx);
         }
-        if matched == query_tokens.len() {
-            found = true;
-            let span = last - first.unwrap_or(last);
-            best_gap = best_gap.min(span.saturating_sub(query_tokens.len() - 1));
+
+        if positions.is_empty() {
+            continue;
+        }
+
+        let order_distance = inversion_count(&positions);
+        let total_gap = positions
+            .windows(2)
+            .map(|pair| pair[0].abs_diff(pair[1]).saturating_sub(1))
+            .sum::<usize>();
+        let candidate = (positions.len(), order_distance, total_gap);
+        if best.is_none_or(|current| {
+            candidate.0 > current.0
+                || (candidate.0 == current.0 && candidate.1 < current.1)
+                || (candidate.0 == current.0 && candidate.1 == current.1 && candidate.2 < current.2)
+        }) {
+            best = Some(candidate);
         }
     }
-    (found, best_gap)
+
+    best.map_or((usize::MAX, usize::MAX), |(_, order, gap)| (order, gap))
 }
 
-fn exact_prefix_window<Q: AsRef<str>, C: AsRef<str>>(query: &[Q], candidate: &[C]) -> bool {
+fn token_window_matches<Q: AsRef<str>, C: AsRef<str>, F>(
+    query: &[Q],
+    candidate: &[C],
+    token_matches: F,
+) -> bool
+where
+    F: Fn(&str, &str) -> bool + Copy,
+{
     candidate
         .iter()
         .zip(query)
-        .all(|(candidate, query)| candidate.as_ref().starts_with(query.as_ref()))
+        .all(|(candidate, query)| token_matches(query.as_ref(), candidate.as_ref()))
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -208,7 +386,12 @@ impl OperationProfile {
         self
     }
 
-    pub fn with_insertion(mut self, inserted: char, prev: Option<char>, next: Option<char>) -> Self {
+    pub fn with_insertion(
+        mut self,
+        inserted: char,
+        prev: Option<char>,
+        next: Option<char>,
+    ) -> Self {
         self.insertions += 1;
         self.insertion_penalty += insertion_likelihood_penalty(inserted, prev, next);
         self
@@ -279,7 +462,11 @@ fn substitution_likelihood_penalty(keyboard_distance: usize) -> usize {
     keyboard_distance
 }
 
-fn insertion_likelihood_penalty(_inserted: char, _prev: Option<char>, _next: Option<char>) -> usize {
+fn insertion_likelihood_penalty(
+    _inserted: char,
+    _prev: Option<char>,
+    _next: Option<char>,
+) -> usize {
     6
 }
 
@@ -418,10 +605,7 @@ pub fn bounded_damerau_levenshtein(
             };
             let mut cell = deletion.min(insertion).min(substitution);
 
-            if i > 1
-                && j > 1
-                && intended[i - 1] == typed[j - 2]
-                && intended[i - 2] == typed[j - 1]
+            if i > 1 && j > 1 && intended[i - 1] == typed[j - 2] && intended[i - 2] == typed[j - 1]
             {
                 cell = cell.min(prev_prev[j - 2].with_transposition());
             }
@@ -454,9 +638,54 @@ mod tests {
         let fields = [first.as_slice(), second.as_slice()];
 
         assert_eq!(exact_phrase_count(&query, fields), 0);
-        assert_eq!(exact_phrase_run_vector(&query, fields), vec![0, 2]);
+        assert_eq!(exact_subphrase_counts_vector(&query, fields), vec![2]);
         assert_eq!(exact_distinct_coverage(&query, fields), 3);
         assert_eq!(exact_token_occurrence_counts(&query, fields), vec![2, 2, 1]);
+    }
+
+    #[test]
+    fn query_token_occurrence_total_saturates_each_token_at_three() {
+        assert_eq!(saturated_exact_query_token_occurrence_total(&[10, 2, 0]), 5);
+        assert_eq!(saturated_exact_phrase_count(10), 3);
+    }
+
+    #[test]
+    fn coverage_rank_balances_quality_and_distinct_coverage() {
+        let weights = [4, 2, 2, 1, 1];
+        let one_whole = CoverageRank::new(vec![1, 0, 0, 0, 0], &weights);
+        let three_prefixes = CoverageRank::new(vec![0, 3, 0, 0, 0], &weights);
+        let two_whole = CoverageRank::new(vec![2, 0, 0, 0, 0], &weights);
+
+        assert!(three_prefixes > one_whole);
+        assert!(two_whole > three_prefixes);
+    }
+
+    #[test]
+    fn typo_cost_vector_retains_query_order_but_compares_worst_cost_first() {
+        let left = TypoCostVector::new(vec![1, 3, 0]);
+        let same_errors_different_order = TypoCostVector::new(vec![3, 0, 1]);
+        let lower_worst_error = TypoCostVector::new(vec![2, 0, 0]);
+
+        assert_eq!(left.aligned(), [1, 3, 0]);
+        assert_eq!(left.worst_first(), [3, 1, 0]);
+        assert_eq!(left.cmp(&same_errors_different_order), Ordering::Equal);
+        assert!(lower_worst_error < left);
+    }
+
+    #[test]
+    fn shared_position_vectors_support_simple_and_configurable_class_maps() {
+        assert_eq!(position_vector_simple([0, 0, 1, 2]), [2, 1, 1]);
+        assert_eq!(
+            position_vector([Some(0), Some(1), Some(3), None], 4),
+            [1, 1, 0, 1]
+        );
+    }
+
+    #[test]
+    fn density_prefers_higher_ratio_then_shorter_field() {
+        assert!(DensityRank::new(2, 4) < DensityRank::new(1, 4));
+        assert!(DensityRank::new(1, 2) < DensityRank::new(2, 6));
+        assert!(DensityRank::new(1, 2) < DensityRank::new(2, 4));
     }
 
     #[test]
@@ -468,7 +697,19 @@ mod tests {
             ordered_token_span(&query, [&scattered[..], &closer[..]], |query, candidate| {
                 candidate.starts_with(query)
             }),
-            (true, 0)
+            (0, 0)
+        );
+    }
+
+    #[test]
+    fn ordered_span_scores_partial_matches_by_order_and_gap() {
+        let query = ["one", "two", "three"];
+        let partial = ["three", "x", "one"];
+        assert_eq!(
+            ordered_token_span(&query, [&partial[..]], |query, candidate| {
+                candidate.starts_with(query)
+            }),
+            (1, 1)
         );
     }
 
@@ -523,3 +764,42 @@ mod tests {
         assert!(extra.1 < far.1);
     }
 }
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RankedTokenVector {
+    aligned: Vec<usize>,
+    worst_first: Vec<usize>,
+}
+
+impl RankedTokenVector {
+    pub fn new(aligned: Vec<usize>) -> Self {
+        let mut worst_first = aligned.clone();
+        worst_first.sort_unstable_by(|left, right| right.cmp(left));
+        Self {
+            aligned,
+            worst_first,
+        }
+    }
+
+    pub fn aligned(&self) -> &[usize] {
+        &self.aligned
+    }
+
+    pub fn worst_first(&self) -> &[usize] {
+        &self.worst_first
+    }
+}
+
+impl Ord for RankedTokenVector {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.worst_first.cmp(&other.worst_first)
+    }
+}
+
+impl PartialOrd for RankedTokenVector {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+pub type TypoCostVector = RankedTokenVector;
+pub type InsertionVector = RankedTokenVector;

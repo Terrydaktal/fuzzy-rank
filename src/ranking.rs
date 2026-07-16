@@ -1,6 +1,8 @@
 use std::cmp::Ordering;
 
-use crate::core::{OperationProfile, compare_key_asc, compare_score_desc};
+use crate::core::{
+    InsertionVector, OperationProfile, TypoCostVector, compare_key_asc, compare_score_desc,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StructuralRank {
@@ -228,43 +230,15 @@ pub fn compare_search_results(
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct TypoSortKey<'a> {
-    pub exact_count: usize,
-    pub span_len: usize,
-    pub distance: usize,
-    pub operations: OperationProfile,
-    pub ratio_milli: usize,
-    pub recency: f64,
-    pub alphabetical: &'a str,
-}
-
-pub fn compare_typo_sort_keys(left: &TypoSortKey<'_>, right: &TypoSortKey<'_>) -> Ordering {
-    right
-        .exact_count
-        .cmp(&left.exact_count)
-        .then_with(|| left.span_len.cmp(&right.span_len))
-        .then_with(|| left.distance.cmp(&right.distance))
-        .then_with(|| left.operations.cmp(&right.operations))
-        .then_with(|| left.ratio_milli.cmp(&right.ratio_milli))
-        .then_with(|| compare_score_desc(left.recency, right.recency))
-        .then_with(|| compare_key_asc(left.alphabetical, right.alphabetical))
-}
-
-pub fn typo_keys_are_ambiguous(left: &TypoSortKey<'_>, right: &TypoSortKey<'_>) -> bool {
-    left.exact_count == right.exact_count
-        && left.span_len == right.span_len
-        && left.distance == right.distance
-        && left.ratio_milli.abs_diff(right.ratio_milli) <= 20
-        && left.recency.total_cmp(&right.recency).is_eq()
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PathTypoSortKey<'a> {
     pub exact: bool,
     pub distance: usize,
+    pub order_distance: usize,
     pub operations: OperationProfile,
-    pub segment: usize,
-    pub position: usize,
+    pub typo_costs: &'a TypoCostVector,
+    pub insertions: &'a InsertionVector,
+    pub segment: &'a [usize],
+    pub position: &'a [usize; 3],
     pub score: f64,
     pub key: &'a str,
 }
@@ -280,20 +254,18 @@ pub fn compare_path_typo_sort_keys(
     right
         .exact
         .cmp(&left.exact)
-        .then_with(|| effective_path_core_cost(left).cmp(&effective_path_core_cost(right)))
+        .then_with(|| left.typo_costs.cmp(right.typo_costs))
+        .then_with(|| left.order_distance.cmp(&right.order_distance))
         .then_with(|| compare_path_tail(left, right))
 }
 
-fn effective_path_core_cost(key: &PathTypoSortKey<'_>) -> usize {
-    if key.exact { 0 } else { key.operations.core_typo_cost() }
-}
-
 fn compare_path_tail(left: &PathTypoSortKey<'_>, right: &PathTypoSortKey<'_>) -> Ordering {
-    left.segment
-        .cmp(&right.segment)
-        .then_with(|| left.position.cmp(&right.position))
+    right
+        .segment
+        .cmp(left.segment)
+        .then_with(|| right.position.cmp(left.position))
         .then_with(|| compare_score_desc(left.score, right.score))
-        .then_with(|| left.operations.insertions.cmp(&right.operations.insertions))
+        .then_with(|| left.insertions.cmp(right.insertions))
         .then_with(|| path_depth(left.key).cmp(&path_depth(right.key)))
         .then_with(|| compare_key_asc(left.key, right.key))
 }
@@ -303,9 +275,50 @@ pub fn path_typo_keys_are_ambiguous(
     right: &PathTypoSortKey<'_>,
 ) -> bool {
     left.exact == right.exact
-        && effective_path_core_cost(left) == effective_path_core_cost(right)
+        && left.typo_costs == right.typo_costs
+        && left.order_distance == right.order_distance
         && left.segment == right.segment
         && left.position == right.position
         && left.score.total_cmp(&right.score).is_eq()
-        && left.operations.insertions == right.operations.insertions
+        && left.insertions == right.insertions
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn path_key<'a>(
+        segment: &'a [usize],
+        position: &'a [usize; 3],
+        typo_costs: &'a TypoCostVector,
+        insertions: &'a InsertionVector,
+    ) -> PathTypoSortKey<'a> {
+        PathTypoSortKey {
+            exact: false,
+            distance: 1,
+            order_distance: 0,
+            operations: OperationProfile::default(),
+            typo_costs,
+            insertions,
+            segment,
+            position,
+            score: 0.0,
+            key: "/same/depth",
+        }
+    }
+
+    #[test]
+    fn path_vectors_prefer_stronger_segment_then_position_counts() {
+        let typo_costs = TypoCostVector::default();
+        let insertions = InsertionVector::default();
+        let basename_and_grandparent = path_key(&[1, 0, 1], &[0, 2, 0], &typo_costs, &insertions);
+        let two_parent_matches = path_key(&[0, 2], &[2, 0, 0], &typo_costs, &insertions);
+        assert!(
+            compare_path_typo_sort_keys(&basename_and_grandparent, &two_parent_matches).is_lt()
+        );
+
+        let whole_or_prefix = path_key(&[2], &[2, 0, 0], &typo_costs, &insertions);
+        let suffixes = path_key(&[2], &[0, 2, 0], &typo_costs, &insertions);
+        assert!(compare_path_typo_sort_keys(&whole_or_prefix, &suffixes).is_lt());
+    }
 }

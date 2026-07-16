@@ -2,8 +2,9 @@ use std::cmp::{Ordering, Reverse};
 use std::collections::HashMap;
 
 use crate::core::{
-    compare_key_asc, compare_score_desc, exact_distinct_coverage, exact_phrase_count,
-    exact_phrase_run_vector, exact_token_occurrence_counts, ordered_token_span,
+    DensityRank, compare_key_asc, compare_score_desc, exact_distinct_coverage, exact_phrase_count,
+    exact_subphrase_counts_vector, exact_token_occurrence_counts, ordered_token_span,
+    saturated_exact_query_token_occurrence_total,
 };
 use crate::text::{split_search_tokens, to_lowercase};
 
@@ -37,14 +38,12 @@ pub struct MessageMatch<'a> {
     pub text: &'a str,
     pub score: Score,
     pub exact_whole_phrase_occurrences: usize,
-    pub exact_run_vector: Vec<usize>,
+    pub exact_subphrase_counts_vector: Vec<usize>,
     pub exact_distinct_coverage: usize,
-    pub same_order_scattered: bool,
-    pub closeness_gap_distance: usize,
-    pub repeated_exact_phrase_bonus: usize,
-    pub repeated_token_bonus: usize,
-    pub density_matched_tokens: usize,
-    pub density_field_len: usize,
+    pub order_distance: usize,
+    pub total_gap: usize,
+    pub saturated_exact_query_token_occurrence_total: usize,
+    pub density: DensityRank,
 }
 
 impl<'a> MessageCandidate<'a> {
@@ -128,30 +127,27 @@ impl MessageQuery {
         }
 
         let exact_whole_phrase_occurrences = exact_phrase_count(&self.tokens, fields.clone());
-        let exact_run_vector = exact_phrase_run_vector(&self.tokens, fields);
-        let (same_order_scattered, closeness_gap_distance) = ordered_token_span(
+        let exact_subphrase_counts_vector = exact_subphrase_counts_vector(&self.tokens, fields);
+        let (order_distance, total_gap) = ordered_token_span(
             &self.tokens,
             std::iter::once(candidate_tokens),
             |query, candidate| candidate.starts_with(query),
         );
-        let repeated_exact_phrase_bonus = exact_whole_phrase_occurrences.min(3);
-        let repeated_token_bonus = counts.iter().map(|count| (*count).min(3)).sum::<usize>();
-        let density_matched_tokens = exact_distinct_coverage;
-        let density_field_len = candidate_tokens.len();
+        let saturated_exact_query_token_occurrence_total =
+            saturated_exact_query_token_occurrence_total(&counts);
+        let density = DensityRank::new(exact_distinct_coverage, candidate_tokens.len());
 
         Some(MessageMatch {
             key,
             text,
             score,
             exact_whole_phrase_occurrences,
-            exact_run_vector,
+            exact_subphrase_counts_vector,
             exact_distinct_coverage,
-            same_order_scattered,
-            closeness_gap_distance,
-            repeated_exact_phrase_bonus,
-            repeated_token_bonus,
-            density_matched_tokens,
-            density_field_len,
+            order_distance,
+            total_gap,
+            saturated_exact_query_token_occurrence_total,
+            density,
         })
     }
 }
@@ -163,17 +159,20 @@ pub fn sort_matches(matches: &mut [MessageMatch<'_>]) {
 fn compare_matches(left: &MessageMatch<'_>, right: &MessageMatch<'_>) -> Ordering {
     Reverse(left.exact_whole_phrase_occurrences)
         .cmp(&Reverse(right.exact_whole_phrase_occurrences))
-        .then_with(|| Reverse(&left.exact_run_vector).cmp(&Reverse(&right.exact_run_vector)))
-        .then_with(|| Reverse(left.exact_distinct_coverage).cmp(&Reverse(right.exact_distinct_coverage)))
-        .then_with(|| Reverse(left.same_order_scattered).cmp(&Reverse(right.same_order_scattered)))
-        .then_with(|| left.closeness_gap_distance.cmp(&right.closeness_gap_distance))
-        .then_with(|| Reverse(left.repeated_exact_phrase_bonus).cmp(&Reverse(right.repeated_exact_phrase_bonus)))
-        .then_with(|| Reverse(left.repeated_token_bonus).cmp(&Reverse(right.repeated_token_bonus)))
         .then_with(|| {
-            (right.density_matched_tokens * left.density_field_len)
-                .cmp(&(left.density_matched_tokens * right.density_field_len))
+            Reverse(left.exact_distinct_coverage).cmp(&Reverse(right.exact_distinct_coverage))
         })
-        .then_with(|| left.density_field_len.cmp(&right.density_field_len))
+        .then_with(|| {
+            Reverse(&left.exact_subphrase_counts_vector)
+                .cmp(&Reverse(&right.exact_subphrase_counts_vector))
+        })
+        .then_with(|| left.order_distance.cmp(&right.order_distance))
+        .then_with(|| left.total_gap.cmp(&right.total_gap))
+        .then_with(|| {
+            Reverse(left.saturated_exact_query_token_occurrence_total)
+                .cmp(&Reverse(right.saturated_exact_query_token_occurrence_total))
+        })
+        .then_with(|| left.density.cmp(&right.density))
         .then_with(|| compare_score_desc(left.score, right.score))
         .then_with(|| compare_key_asc(left.key, right.key))
 }
@@ -246,7 +245,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_phrase_count_can_beat_scattered_full_coverage() {
+    fn broader_coverage_beats_repeated_partial_subphrases() {
         let candidates = [
             prepare("all", "word1 far away word2 and then word3", 0.0),
             prepare("partial-phrase", "word1 word2 word1 word2", 10.0),
@@ -254,7 +253,7 @@ mod tests {
 
         assert_eq!(
             matched_keys("word1 word2 word3", &candidates),
-            vec!["partial-phrase", "all"]
+            vec!["all", "partial-phrase"]
         );
     }
 

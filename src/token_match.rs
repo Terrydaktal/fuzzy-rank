@@ -1,4 +1,7 @@
-use crate::core::{OperationProfile, bounded_damerau_levenshtein, max_typos};
+use crate::core::{
+    OperationProfile, bounded_damerau_levenshtein, increment_position_vector_simple,
+    inversion_count, max_typos,
+};
 
 #[derive(Clone, Copy)]
 pub struct PositionedToken<'a> {
@@ -33,20 +36,23 @@ impl FragmentCost {
     }
 }
 
-
 pub fn choose_path_token_match(
     query: &str,
     candidate: &str,
     limit: usize,
 ) -> Option<(usize, usize, usize, usize, OperationProfile)> {
-    let contiguous = best_token_match(query, candidate, limit)
-        .map(|(distance, penalty, position_rank, _len, operations)| {
+    let contiguous = best_token_match(query, candidate, limit).map(
+        |(distance, penalty, position_rank, _len, operations)| {
             (distance, penalty, position_rank, 0usize, operations)
-        });
+        },
+    );
     let fragmented = {
         let local_limit = limit.min(max_typos(query.chars().count()));
         fragmented_token_match(query, candidate, local_limit).map(|matched| {
-            let penalty = candidate.chars().count().saturating_sub(query.chars().count());
+            let penalty = candidate
+                .chars()
+                .count()
+                .saturating_sub(query.chars().count());
             (
                 matched.distance,
                 penalty,
@@ -86,59 +92,137 @@ pub fn aligned_token_distance(
     query_tokens: &[&str],
     candidate_tokens: &[PositionedToken<'_>],
     limit: usize,
-) -> Option<(usize, usize, usize, usize, usize, OperationProfile)> {
+) -> Option<(
+    usize,
+    usize,
+    Vec<usize>,
+    [usize; 3],
+    usize,
+    usize,
+    OperationProfile,
+    Vec<usize>,
+    Vec<usize>,
+)> {
     if candidate_tokens.len() < query_tokens.len() {
         return None;
     }
 
-    let mut best = None;
+    let mut best: Option<(
+        usize,
+        usize,
+        Vec<usize>,
+        [usize; 3],
+        usize,
+        usize,
+        OperationProfile,
+        Vec<usize>,
+        Vec<usize>,
+    )> = None;
+    let assignments = unordered_assignments(query_tokens.len());
     for start in 0..=candidate_tokens.len() - query_tokens.len() {
-        let mut distance = 0;
-        let mut segment = 0;
-        let mut position = 0;
-        let mut internal_breaks = 0;
-        let mut structure = 0;
-        let mut operations = OperationProfile::default();
-        let mut failed = false;
+        let window = &candidate_tokens[start..start + query_tokens.len()];
+        for assignment in &assignments {
+            let mut distance = 0;
+            let mut segment = Vec::new();
+            let mut position = [0; 3];
+            let mut internal_breaks = 0;
+            let mut structure = 0;
+            let mut operations = OperationProfile::default();
+            let mut typo_costs = Vec::with_capacity(query_tokens.len());
+            let mut insertions = Vec::with_capacity(query_tokens.len());
+            let mut failed = false;
 
-        for (query_token, candidate) in query_tokens
-            .iter()
-            .zip(candidate_tokens[start..start + query_tokens.len()].iter())
-        {
-            let Some(remaining) = limit.checked_sub(distance) else {
-                failed = true;
-                break;
-            };
-            let Some((cost, penalty, position_rank, token_internal_breaks, token_operations)) =
-                choose_path_token_match(query_token, candidate.token, remaining)
-            else {
-                failed = true;
-                break;
-            };
-            distance += cost;
-            segment += candidate.segment;
-            position += position_rank;
-            internal_breaks += token_internal_breaks;
-            structure += penalty;
-            operations = operations.merge(token_operations);
-            if distance > limit {
-                failed = true;
+            for (query_idx, candidate_idx) in assignment.iter().enumerate() {
+                let query_token = query_tokens[query_idx];
+                let candidate = &window[*candidate_idx];
+                let Some(remaining) = limit.checked_sub(distance) else {
+                    failed = true;
+                    break;
+                };
+                let Some((cost, penalty, position_rank, token_internal_breaks, token_operations)) =
+                    choose_path_token_match(query_token, candidate.token, remaining)
+                else {
+                    failed = true;
+                    break;
+                };
+                distance += cost;
+                if segment.len() <= candidate.segment {
+                    segment.resize(candidate.segment + 1, 0);
+                }
+                segment[candidate.segment] += 1;
+                increment_position_vector_simple(&mut position, position_rank, 1);
+                internal_breaks += token_internal_breaks;
+                structure += penalty;
+                operations = operations.merge(token_operations);
+                typo_costs.push(token_operations.core_typo_cost());
+                insertions.push(token_operations.insertions);
+                if distance > limit {
+                    failed = true;
+                    break;
+                }
+            }
+
+            if failed {
+                continue;
+            }
+
+            let total = (
+                distance,
+                inversion_count(assignment),
+                segment.clone(),
+                position,
+                internal_breaks,
+                structure,
+                operations,
+                typo_costs.clone(),
+                insertions.clone(),
+            );
+            best = Some(match best {
+                None => total,
+                Some(current)
+                    if total
+                        .0
+                        .cmp(&current.0)
+                        .then_with(|| total.1.cmp(&current.1))
+                        .then_with(|| current.2.cmp(&total.2))
+                        .then_with(|| current.3.cmp(&total.3))
+                        .then_with(|| total.4.cmp(&current.4))
+                        .then_with(|| total.5.cmp(&current.5))
+                        .then_with(|| total.6.cmp(&current.6))
+                        .then_with(|| total.7.cmp(&current.7))
+                        .then_with(|| total.8.cmp(&current.8))
+                        .is_lt() =>
+                {
+                    total
+                }
+                Some(current) => current,
+            });
+
+            if best.as_ref().is_some_and(|candidate| {
+                candidate.0 == 0
+                    && candidate.1 == 0
+                    && candidate.2.first() == Some(&query_tokens.len())
+                    && candidate.3[0] == query_tokens.len()
+                    && candidate.4 == 0
+                    && candidate.5 == 0
+                    && candidate.6 == OperationProfile::default()
+                    && candidate.7.iter().all(|cost| *cost == 0)
+                    && candidate.8.iter().all(|count| *count == 0)
+            }) {
                 break;
             }
         }
-
-        if failed {
-            continue;
-        }
-
-        let segment = segment / query_tokens.len().max(1);
-        let total = (distance, segment, position, internal_breaks, structure, operations);
-        best = Some(match best {
-            None => total,
-            Some(current) if total < current => total,
-            Some(current) => current,
-        });
-        if best == Some((0, 0, 0, 0, 0, OperationProfile::default())) {
+        if best.as_ref().is_some_and(|candidate| {
+            candidate.0 == 0
+                && candidate.1 == 0
+                && candidate.2.first() == Some(&query_tokens.len())
+                && candidate.3[0] == query_tokens.len()
+                && candidate.4 == 0
+                && candidate.5 == 0
+                && candidate.6 == OperationProfile::default()
+                && candidate.7.iter().all(|cost| *cost == 0)
+                && candidate.8.iter().all(|count| *count == 0)
+        }) {
             break;
         }
     }
@@ -146,11 +230,45 @@ pub fn aligned_token_distance(
     best
 }
 
+fn unordered_assignments(len: usize) -> Vec<Vec<usize>> {
+    if len > 8 {
+        return vec![(0..len).collect()];
+    }
+
+    fn build(prefix: &mut Vec<usize>, used: &mut [bool], output: &mut Vec<Vec<usize>>) {
+        if prefix.len() == used.len() {
+            output.push(prefix.clone());
+            return;
+        }
+        for index in 0..used.len() {
+            if used[index] {
+                continue;
+            }
+            used[index] = true;
+            prefix.push(index);
+            build(prefix, used, output);
+            prefix.pop();
+            used[index] = false;
+        }
+    }
+
+    let mut output = Vec::new();
+    build(&mut Vec::new(), &mut vec![false; len], &mut output);
+    output
+}
+
 pub fn partitioned_token_distance(
     query_tokens: &[&str],
     candidate: &str,
     limit: usize,
-) -> Option<(usize, usize, usize, OperationProfile)> {
+) -> Option<(
+    usize,
+    usize,
+    [usize; 3],
+    OperationProfile,
+    Vec<usize>,
+    Vec<usize>,
+)> {
     let mut boundaries: Vec<usize> = candidate.char_indices().map(|(idx, _)| idx).collect();
     boundaries.push(candidate.len());
     if boundaries.len() <= query_tokens.len() {
@@ -167,11 +285,25 @@ fn partitioned_token_distance_impl(
     token_idx: usize,
     start_boundary: usize,
     remaining: usize,
-) -> Option<(usize, usize, usize, OperationProfile)> {
+) -> Option<(
+    usize,
+    usize,
+    [usize; 3],
+    OperationProfile,
+    Vec<usize>,
+    Vec<usize>,
+)> {
     let last_token = token_idx + 1 == query_tokens.len();
     let min_end_boundary = start_boundary + 1;
     let max_end_boundary = boundaries.len() - (query_tokens.len() - token_idx);
-    let mut best = None;
+    let mut best: Option<(
+        usize,
+        usize,
+        [usize; 3],
+        OperationProfile,
+        Vec<usize>,
+        Vec<usize>,
+    )> = None;
 
     for end_boundary in min_end_boundary..=max_end_boundary {
         if !last_token && end_boundary == boundaries.len() - 1 {
@@ -193,35 +325,77 @@ fn partitioned_token_distance_impl(
             continue;
         }
 
+        let mut position = [0; 3];
+        increment_position_vector_simple(&mut position, position_rank, 1);
         let total = if last_token {
-            (cost, structure, position_rank, operations)
+            (
+                cost,
+                structure,
+                position,
+                operations,
+                vec![operations.core_typo_cost()],
+                vec![operations.insertions],
+            )
         } else {
-            let Some((tail_cost, tail_structure, tail_position, tail_operations)) =
-                partitioned_token_distance_impl(
-                    query_tokens,
-                    candidate,
-                    boundaries,
-                    token_idx + 1,
-                    end_boundary,
-                    remaining - cost,
-                )
+            let Some((
+                tail_cost,
+                tail_structure,
+                tail_position,
+                tail_operations,
+                tail_costs,
+                tail_insertions,
+            )) = partitioned_token_distance_impl(
+                query_tokens,
+                candidate,
+                boundaries,
+                token_idx + 1,
+                end_boundary,
+                remaining - cost,
+            )
             else {
                 continue;
             };
+            let mut typo_costs = Vec::with_capacity(tail_costs.len() + 1);
+            typo_costs.push(operations.core_typo_cost());
+            typo_costs.extend(tail_costs);
+            let mut insertions = Vec::with_capacity(tail_insertions.len() + 1);
+            insertions.push(operations.insertions);
+            insertions.extend(tail_insertions);
             (
                 cost + tail_cost,
                 structure + tail_structure,
-                position_rank + tail_position,
+                std::array::from_fn(|idx| position[idx] + tail_position[idx]),
                 operations.merge(tail_operations),
+                typo_costs,
+                insertions,
             )
         };
 
         best = Some(match best {
             None => total,
-            Some(current) if total < current => total,
+            Some(current)
+                if total
+                    .0
+                    .cmp(&current.0)
+                    .then_with(|| total.1.cmp(&current.1))
+                    .then_with(|| current.2.cmp(&total.2))
+                    .then_with(|| total.3.cmp(&current.3))
+                    .then_with(|| total.4.cmp(&current.4))
+                    .then_with(|| total.5.cmp(&current.5))
+                    .is_lt() =>
+            {
+                total
+            }
             Some(current) => current,
         });
-        if best == Some((0, 0, 0, OperationProfile::default())) {
+        if best.as_ref().is_some_and(|candidate| {
+            candidate.0 == 0
+                && candidate.1 == 0
+                && candidate.2[0] == query_tokens.len()
+                && candidate.3 == OperationProfile::default()
+                && candidate.4.iter().all(|cost| *cost == 0)
+                && candidate.5.iter().all(|count| *count == 0)
+        }) {
             break;
         }
 
@@ -324,8 +498,9 @@ pub fn fragmented_token_match(
             return;
         }
         match slot {
-            Some(current) if current.sort_key(state_position_rank(state_idx))
-                <= candidate.sort_key(state_position_rank(state_idx)) => {}
+            Some(current)
+                if current.sort_key(state_position_rank(state_idx))
+                    <= candidate.sort_key(state_position_rank(state_idx)) => {}
             _ => *slot = Some(candidate),
         }
     };
@@ -360,7 +535,11 @@ pub fn fragmented_token_match(
                         x if x == State::GapStartZero as usize => State::GapStartZero,
                         _ => State::GapStartNonZero,
                     };
-                    update(&mut dp[i + 1][j][next_state as usize], next, next_state as usize);
+                    update(
+                        &mut dp[i + 1][j][next_state as usize],
+                        next,
+                        next_state as usize,
+                    );
                 }
 
                 if j < m {
@@ -378,15 +557,20 @@ pub fn fragmented_token_match(
                         x if x == State::GapStartZero as usize => State::GapStartZero,
                         _ => State::GapStartNonZero,
                     };
-                    update(&mut dp[i][j + 1][next_state as usize], next, next_state as usize);
+                    update(
+                        &mut dp[i][j + 1][next_state as usize],
+                        next,
+                        next_state as usize,
+                    );
                 }
 
                 if i < n && j < m {
                     let mut next = cost;
                     if candidate_chars[i] != query_chars[j] {
                         next.distance += 1;
-                        next.operations =
-                            next.operations.with_substitution(candidate_chars[i], query_chars[j]);
+                        next.operations = next
+                            .operations
+                            .with_substitution(candidate_chars[i], query_chars[j]);
                     }
                     let next_state = match state_idx {
                         x if x == State::NoRun as usize && i == 0 => State::InRunStartZero,
@@ -396,7 +580,11 @@ pub fn fragmented_token_match(
                         x if x == State::InRunStartZero as usize => State::InRunStartZero,
                         _ => State::InRunStartNonZero,
                     };
-                    update(&mut dp[i + 1][j + 1][next_state as usize], next, next_state as usize);
+                    update(
+                        &mut dp[i + 1][j + 1][next_state as usize],
+                        next,
+                        next_state as usize,
+                    );
                 }
 
                 if i + 1 < n
@@ -415,7 +603,11 @@ pub fn fragmented_token_match(
                         x if x == State::InRunStartZero as usize => State::InRunStartZero,
                         _ => State::InRunStartNonZero,
                     };
-                    update(&mut dp[i + 2][j + 2][next_state as usize], next, next_state as usize);
+                    update(
+                        &mut dp[i + 2][j + 2][next_state as usize],
+                        next,
+                        next_state as usize,
+                    );
                 }
             }
         }
@@ -428,16 +620,16 @@ pub fn fragmented_token_match(
         State::GapStartNonZero as usize,
     ]
     .into_iter()
-        .filter_map(|state| {
-            dp[n][m][state]
-                .filter(|cost| cost.internal_breaks > 0)
-                .map(|cost| (state, cost))
-        })
-        .min_by_key(|(state, cost)| cost.sort_key(state_position_rank(*state)))
-        .map(|(state, cost)| FragmentedTokenMatch {
-            distance: cost.distance,
-            internal_breaks: cost.internal_breaks,
-            operations: cost.operations,
-            position_rank: state_position_rank(state),
-        })
+    .filter_map(|state| {
+        dp[n][m][state]
+            .filter(|cost| cost.internal_breaks > 0)
+            .map(|cost| (state, cost))
+    })
+    .min_by_key(|(state, cost)| cost.sort_key(state_position_rank(*state)))
+    .map(|(state, cost)| FragmentedTokenMatch {
+        distance: cost.distance,
+        internal_breaks: cost.internal_breaks,
+        operations: cost.operations,
+        position_rank: state_position_rank(state),
+    })
 }

@@ -2,14 +2,13 @@ use std::cell::OnceCell;
 use std::sync::Arc;
 
 use crate::core::{
-    OperationProfile, bounded_damerau_levenshtein, exact_distinct_coverage, exact_phrase_count,
-    exact_phrase_run_vector, max_typos,
+    InsertionVector, OperationProfile, TypoCostVector, bounded_damerau_levenshtein,
+    exact_distinct_coverage, exact_phrase_count, exact_subphrase_counts_vector,
+    increment_position_vector_simple, max_typos, position_vector_simple,
 };
-use crate::path::exact::{exact_match, match_penalty};
 use crate::path::Score;
-use crate::ranking::{
-    PathTypoSortKey, compare_path_typo_sort_keys, path_typo_keys_are_ambiguous,
-};
+use crate::path::exact::{exact_match, match_penalties};
+use crate::ranking::{PathTypoSortKey, compare_path_typo_sort_keys, path_typo_keys_are_ambiguous};
 use crate::text::{has_query_signal, split_path_tokens, to_lowercase};
 use crate::token_match::{
     PositionedToken, aligned_token_distance, best_token_match, fragmented_token_match,
@@ -30,10 +29,13 @@ pub struct PathMatch<'a> {
     pub path: &'a str,
     pub exact: bool,
     pub distance: usize,
+    pub order_distance: usize,
     pub ratio: f64,
-    pub segment: usize,
-    pub position: usize,
+    pub segment: Vec<usize>,
+    pub position: [usize; 3],
     pub operations: OperationProfile,
+    pub typo_costs: TypoCostVector,
+    pub insertions: InsertionVector,
     pub score: Score,
     exact_relevance: Option<PathExactRelevance<'a>>,
 }
@@ -43,9 +45,12 @@ impl<'a> PathMatch<'a> {
         PathTypoSortKey {
             exact: self.exact,
             distance: self.distance,
+            order_distance: self.order_distance,
             operations: self.operations,
-            segment: self.segment,
-            position: self.position,
+            typo_costs: &self.typo_costs,
+            insertions: &self.insertions,
+            segment: &self.segment,
+            position: &self.position,
             score: self.score,
             key: self.path,
         }
@@ -55,16 +60,16 @@ impl<'a> PathMatch<'a> {
         other
             .exact
             .cmp(&self.exact)
-            .then_with(|| {
-                other
-                    .exact_whole_phrase()
-                    .cmp(&self.exact_whole_phrase())
-            })
-            .then_with(|| other.exact_run_vector().cmp(self.exact_run_vector()))
+            .then_with(|| other.exact_whole_phrase().cmp(&self.exact_whole_phrase()))
             .then_with(|| {
                 other
                     .exact_distinct_coverage()
                     .cmp(&self.exact_distinct_coverage())
+            })
+            .then_with(|| {
+                other
+                    .exact_subphrase_counts_vector()
+                    .cmp(self.exact_subphrase_counts_vector())
             })
             .then_with(|| compare_path_typo_sort_keys(&self.sort_key(), &other.sort_key()))
     }
@@ -75,7 +80,7 @@ impl<'a> PathMatch<'a> {
             .is_some_and(PathExactRelevance::whole_phrase)
     }
 
-    pub fn exact_run_vector(&self) -> &[usize] {
+    pub fn exact_subphrase_counts_vector(&self) -> &[usize] {
         self.exact_relevance
             .as_ref()
             .map_or(&[], PathExactRelevance::run_vector)
@@ -157,7 +162,7 @@ pub fn sort_matches(matches: &mut [PathMatch<'_>]) {
 pub fn is_ambiguous(first: &PathMatch<'_>, second: &PathMatch<'_>) -> bool {
     first.exact == second.exact
         && first.exact_whole_phrase() == second.exact_whole_phrase()
-        && first.exact_run_vector() == second.exact_run_vector()
+        && first.exact_subphrase_counts_vector() == second.exact_subphrase_counts_vector()
         && first.exact_distinct_coverage() == second.exact_distinct_coverage()
         && path_typo_keys_are_ambiguous(&first.sort_key(), &second.sort_key())
 }
@@ -221,11 +226,13 @@ fn with_exact_relevance<'a>(
 
 fn exact_path_match<'a>(path: &'a str, score: Score, query: &TypoQuery) -> Option<PathMatch<'a>> {
     let matched = exact_match(path, &query.keywords, score)?;
-    let insertions = match_penalty(path, &query.keywords)?;
+    let insertion_costs = match_penalties(path, &query.keywords)?;
+    let insertions = insertion_costs.iter().sum();
     Some(PathMatch {
         path,
         exact: true,
         distance: 0,
+        order_distance: 0,
         ratio: 0.0,
         segment: matched.segment,
         position: matched.position,
@@ -233,9 +240,17 @@ fn exact_path_match<'a>(path: &'a str, score: Score, query: &TypoQuery) -> Optio
             insertions,
             ..OperationProfile::default()
         },
+        typo_costs: TypoCostVector::new(vec![0; query.keywords.len()]),
+        insertions: InsertionVector::new(insertion_costs),
         score,
         exact_relevance: None,
     })
+}
+
+fn segment_vector(segment: usize, count: usize) -> Vec<usize> {
+    let mut vector = vec![0; segment + 1];
+    vector[segment] = count;
+    vector
 }
 
 fn best_match_inner<'a>(
@@ -480,18 +495,25 @@ fn candidate_for_text<'a>(
                     path: ctx.path,
                     exact: false,
                     distance: insertions,
+                    order_distance: 0,
                     ratio,
-                    segment: path_position,
-                    position: position_rank,
+                    segment: segment_vector(path_position, 1),
+                    position: position_vector_simple([position_rank]),
                     operations: OperationProfile {
                         insertions,
                         ..OperationProfile::default()
                     },
+                    typo_costs: TypoCostVector::new(vec![0]),
+                    insertions: InsertionVector::new(vec![insertions]),
                     score: ctx.score,
                     exact_relevance: None,
                 });
             }
         }
+    }
+
+    if query_token_count != 1 {
+        return None;
     }
 
     if ctx.limit == 0 || ctx.query_len.abs_diff(candidate_len) > ctx.limit {
@@ -516,10 +538,13 @@ fn candidate_for_text<'a>(
         path: ctx.path,
         exact: false,
         distance,
+        order_distance: 0,
         ratio,
-        segment: path_position,
-        position: position_rank,
+        segment: segment_vector(path_position, query_token_count),
+        position: position_vector_simple(std::iter::repeat_n(position_rank, query_token_count)),
         operations,
+        typo_costs: TypoCostVector::new(vec![operations.core_typo_cost()]),
+        insertions: InsertionVector::new(vec![operations.insertions]),
         score: ctx.score,
         exact_relevance: None,
     })
@@ -535,18 +560,23 @@ fn candidate_for_token_sequence<'a>(
     if query_tokens.len() < 2 || query_tokens.len() != candidate_tokens.len() {
         return None;
     }
+    let query_token_count = query_tokens.len();
 
     let mut distance = 0;
-    let mut position = 0;
+    let mut position = [0; 3];
     let mut operations = OperationProfile::default();
+    let mut typo_costs = Vec::with_capacity(query_token_count);
+    let mut insertion_costs = Vec::with_capacity(query_token_count);
     for (query_token, candidate_token) in query_tokens.into_iter().zip(candidate_tokens) {
         let remaining = ctx.limit.checked_sub(distance)?;
         let (cost, penalty, position_rank, _, token_operations) =
             best_token_match(query_token, candidate_token, remaining)?;
         distance += cost;
-        position += position_rank;
+        increment_position_vector_simple(&mut position, position_rank, 1);
         let _ = penalty;
         operations = operations.merge(token_operations);
+        typo_costs.push(token_operations.core_typo_cost());
+        insertion_costs.push(token_operations.insertions);
     }
 
     let ratio = distance as f64 / ctx.query_len as f64;
@@ -558,10 +588,13 @@ fn candidate_for_token_sequence<'a>(
         path: ctx.path,
         exact: false,
         distance,
+        order_distance: 0,
         ratio,
-        segment: path_position,
+        segment: segment_vector(path_position, query_token_count),
         position,
         operations,
+        typo_costs: TypoCostVector::new(typo_costs),
+        insertions: InsertionVector::new(insertion_costs),
         score: ctx.score,
         exact_relevance: None,
     })
@@ -578,7 +611,7 @@ fn candidate_for_compound_component<'a>(
         return None;
     }
 
-    let (distance, _structure, position, operations) =
+    let (distance, _structure, position, operations, typo_costs, insertion_costs) =
         partitioned_token_distance(&query_tokens, candidate, ctx.limit)?;
     let ratio = distance as f64 / ctx.query_len.max(candidate.chars().count()) as f64;
     if ratio > 0.5 {
@@ -589,10 +622,13 @@ fn candidate_for_compound_component<'a>(
         path: ctx.path,
         exact: false,
         distance,
+        order_distance: 0,
         ratio,
-        segment: path_position,
+        segment: segment_vector(path_position, query_tokens.len()),
         position,
         operations,
+        typo_costs: TypoCostVector::new(typo_costs),
+        insertions: InsertionVector::new(insertion_costs),
         score: ctx.score,
         exact_relevance: None,
     })
@@ -617,10 +653,13 @@ fn candidate_for_partitioned_single_query<'a>(
             path: ctx.path,
             exact: false,
             distance: matched.distance,
+            order_distance: 0,
             ratio,
-            segment: path_position,
-            position: matched.position_rank,
+            segment: segment_vector(path_position, 1),
+            position: position_vector_simple([matched.position_rank]),
             operations: matched.operations,
+            typo_costs: TypoCostVector::new(vec![matched.operations.core_typo_cost()]),
+            insertions: InsertionVector::new(vec![matched.operations.insertions]),
             score: ctx.score,
             exact_relevance: None,
         });
@@ -635,10 +674,13 @@ fn candidate_for_partitioned_single_query<'a>(
         path: ctx.path,
         exact: false,
         distance: matched.distance,
+        order_distance: 0,
         ratio,
-        segment: path_position,
-        position: matched.position_rank,
+        segment: segment_vector(path_position, 1),
+        position: position_vector_simple([matched.position_rank]),
         operations: matched.operations,
+        typo_costs: TypoCostVector::new(vec![matched.operations.core_typo_cost()]),
+        insertions: InsertionVector::new(vec![matched.operations.insertions]),
         score: ctx.score,
         exact_relevance: None,
     })
@@ -671,8 +713,17 @@ fn candidate_for_component_sequence<'a>(
         return None;
     }
 
-    let (distance, segment, position, _breaks, _structure, operations) =
-        aligned_token_distance(&query_tokens, &candidate_tokens, ctx.limit)?;
+    let (
+        distance,
+        order_distance,
+        segment,
+        position,
+        _breaks,
+        _structure,
+        operations,
+        typo_costs,
+        insertion_costs,
+    ) = aligned_token_distance(&query_tokens, &candidate_tokens, ctx.limit)?;
     let ratio = distance as f64 / ctx.query_len as f64;
     if ratio > 0.5 {
         return None;
@@ -682,10 +733,13 @@ fn candidate_for_component_sequence<'a>(
         path: ctx.path,
         exact: false,
         distance,
+        order_distance,
         ratio,
         segment,
         position,
         operations,
+        typo_costs: TypoCostVector::new(typo_costs),
+        insertions: InsertionVector::new(insertion_costs),
         score: ctx.score,
         exact_relevance: None,
     })
@@ -715,10 +769,7 @@ impl<'a> PathExactRelevance<'a> {
                 .into_iter()
                 .map(split_path_tokens)
                 .collect::<Vec<_>>();
-            exact_phrase_count(
-                &self.query_tokens,
-                components.iter().map(Vec::as_slice),
-            ) > 0
+            exact_phrase_count(&self.query_tokens, components.iter().map(Vec::as_slice)) > 0
         })
     }
 
@@ -729,7 +780,7 @@ impl<'a> PathExactRelevance<'a> {
                 .into_iter()
                 .map(split_path_tokens)
                 .collect::<Vec<_>>();
-            exact_phrase_run_vector(
+            exact_subphrase_counts_vector(
                 &self.query_tokens,
                 component_tokens.iter().map(Vec::as_slice),
             )
@@ -743,10 +794,7 @@ impl<'a> PathExactRelevance<'a> {
                 .into_iter()
                 .map(split_path_tokens)
                 .collect::<Vec<_>>();
-            exact_distinct_coverage(
-                &self.query_tokens,
-                components.iter().map(Vec::as_slice),
-            )
+            exact_distinct_coverage(&self.query_tokens, components.iter().map(Vec::as_slice))
         })
     }
 }
@@ -787,8 +835,8 @@ mod tests {
     #[test]
     fn single_token_component_matches_use_token_relative_position() {
         let candidate = best_match("/home/lewis/tasks/config", 10.0, "onfig").unwrap();
-        assert_eq!(candidate.segment, 0);
-        assert_eq!(candidate.position, 1);
+        assert_eq!(candidate.segment, [1]);
+        assert_eq!(candidate.position, [0, 1, 0]);
     }
 
     #[test]
@@ -800,8 +848,7 @@ mod tests {
     #[test]
     fn spaced_query_tokens_can_match_single_compound_token() {
         let candidate = best_match("/home/lewis/applicationlauncher", 10.0, "app laucnh").unwrap();
-        assert_eq!(candidate.segment, 0);
-        assert_eq!(candidate.position, 0);
+        assert_eq!(candidate.segment, [2]);
         assert_eq!(candidate.distance, 1);
     }
 
@@ -815,9 +862,18 @@ mod tests {
     #[test]
     fn spaced_query_tokens_can_match_component_sequence() {
         let candidate = best_match("/home/lewis/tasks/config", 10.0, "tasks cinfig").unwrap();
-        assert_eq!(candidate.segment, 0);
-        assert_eq!(candidate.position, 0);
+        assert_eq!(candidate.segment, [1, 1]);
         assert_eq!(candidate.distance, 1);
+        assert_eq!(candidate.typo_costs.aligned(), [0, 2]);
+    }
+
+    #[test]
+    fn reordered_exact_tokens_have_zero_typo_cost() {
+        let candidate = best_match("/home/lewis/repos/codex", 10.0, "codex rep").unwrap();
+        assert_eq!(candidate.distance, 0);
+        assert_eq!(candidate.order_distance, 1);
+        assert_eq!(candidate.operations.core_typo_cost(), 0);
+        assert_eq!(candidate.typo_costs.aligned(), [0, 0]);
     }
 
     #[test]
@@ -850,8 +906,7 @@ mod tests {
             "tasks cinfig",
         )
         .unwrap();
-        assert_eq!(candidate.segment, 0);
-        assert_eq!(candidate.position, 0);
+        assert_eq!(candidate.segment, [1, 1]);
         assert_eq!(candidate.distance, 1);
     }
 
@@ -864,8 +919,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(candidate.distance, 0);
-        assert_eq!(candidate.segment, 2);
-        assert_eq!(candidate.position, 0);
+        assert_eq!(candidate.segment, [0, 0, 2]);
     }
 
     #[test]
@@ -1004,12 +1058,8 @@ mod tests {
 
     #[test]
     fn multi_token_component_sequence_can_use_fragmented_token_matching() {
-        let candidate = best_match(
-            "/home/lewis/Dev/applicationlauncher",
-            93.2,
-            "dev applaunch",
-        )
-        .unwrap();
+        let candidate =
+            best_match("/home/lewis/Dev/applicationlauncher", 93.2, "dev applaunch").unwrap();
         assert_eq!(candidate.operations.core_typo_cost(), 0);
         assert_eq!(candidate.operations.insertions, 0);
     }
@@ -1033,27 +1083,38 @@ mod tests {
         ];
         sort_matches(&mut matches);
         assert_eq!(matches[0].path, "/home/one-two-three-x-four");
-        assert_eq!(matches[0].exact_run_vector(), [0, 1, 2]);
+        assert_eq!(matches[0].exact_subphrase_counts_vector(), [1, 2]);
     }
 
     #[test]
     fn test_zoxide_lcunaher() {
-        let applications = best_match("/home/lewis/.local/share/applications", 1.9, "application lcunaher");
-        let launcher = best_match("/home/lewis/Dev/applicationlauncher", 190.4, "application lcunaher");
+        let applications = best_match(
+            "/home/lewis/.local/share/applications",
+            1.9,
+            "application lcunaher",
+        );
+        let launcher = best_match(
+            "/home/lewis/Dev/applicationlauncher",
+            190.4,
+            "application lcunaher",
+        );
         println!("applications match: {:#?}", applications);
         println!("launcher match: {:#?}", launcher);
-        
-        let mut matches = vec![
-            applications.unwrap(),
-            launcher.unwrap(),
-        ];
+
+        let mut matches = vec![applications.unwrap(), launcher.unwrap()];
         sort_matches(&mut matches);
-        
+
         println!("Sorted:");
         for m in &matches {
-            println!("  path: {}, distance: {}, core_typo_cost: {}, score: {}", m.path, m.distance, m.operations.core_typo_cost(), m.score);
+            println!(
+                "  path: {}, distance: {}, core_typo_cost: {}, score: {}",
+                m.path,
+                m.distance,
+                m.operations.core_typo_cost(),
+                m.score
+            );
         }
-        
+
         assert_eq!(matches[0].path, "/home/lewis/Dev/applicationlauncher");
     }
 }
