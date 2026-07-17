@@ -7,6 +7,69 @@ pub struct CoverageRank {
     pub class_counts: Vec<usize>,
 }
 
+/// Compares occurrence counts by field priority, giving lower priorities
+/// precedence and comparing counts within each priority.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct FieldOccurrenceRank(Vec<(u8, usize)>);
+
+impl FieldOccurrenceRank {
+    pub fn from_entries(entries: impl IntoIterator<Item = (u8, usize)>) -> Self {
+        let mut entries = entries.into_iter().collect::<Vec<_>>();
+        entries.sort_unstable_by_key(|(priority, _)| *priority);
+
+        let mut merged = Vec::new();
+        for (priority, count) in entries {
+            if let Some((last_priority, last_count)) = merged.last_mut()
+                && *last_priority == priority
+            {
+                *last_count += count;
+            } else {
+                merged.push((priority, count));
+            }
+        }
+        Self(merged)
+    }
+}
+
+impl Ord for FieldOccurrenceRank {
+    fn cmp(&self, other: &Self) -> Ordering {
+        let mut priorities = self
+            .0
+            .iter()
+            .map(|(priority, _)| *priority)
+            .chain(other.0.iter().map(|(priority, _)| *priority))
+            .collect::<Vec<_>>();
+        priorities.sort_unstable();
+        priorities.dedup();
+
+        priorities
+            .into_iter()
+            .map(|priority| {
+                let left = self
+                    .0
+                    .iter()
+                    .find(|(candidate_priority, _)| *candidate_priority == priority)
+                    .map(|(_, count)| *count)
+                    .unwrap_or(0);
+                let right = other
+                    .0
+                    .iter()
+                    .find(|(candidate_priority, _)| *candidate_priority == priority)
+                    .map(|(_, count)| *count)
+                    .unwrap_or(0);
+                left.cmp(&right)
+            })
+            .find(|ordering| *ordering != Ordering::Equal)
+            .unwrap_or(Ordering::Equal)
+    }
+}
+
+impl PartialOrd for FieldOccurrenceRank {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 impl CoverageRank {
     pub fn new(class_counts: Vec<usize>, weights: &[usize]) -> Self {
         debug_assert_eq!(class_counts.len(), weights.len());
@@ -43,6 +106,22 @@ pub fn position_vector_simple(classes: impl IntoIterator<Item = usize>) -> [usiz
         increment_position_vector_simple(&mut vector, class, 1);
     }
     vector
+}
+
+/// Returns the best exact position class for a query within one candidate
+/// token: whole, prefix, suffix, or arbitrary substring.
+pub fn exact_token_position(query: &str, candidate: &str) -> Option<usize> {
+    if candidate == query {
+        Some(0)
+    } else if candidate.starts_with(query) {
+        Some(1)
+    } else if candidate.ends_with(query) {
+        Some(2)
+    } else if candidate.contains(query) {
+        Some(3)
+    } else {
+        None
+    }
 }
 
 pub fn increment_position_vector_simple(vector: &mut [usize; 3], class: usize, count: usize) {
@@ -90,18 +169,59 @@ impl PartialOrd for DensityRank {
     }
 }
 
-pub fn exact_phrase_count<'a, Q, C, I>(query_tokens: &[Q], fields: I) -> usize
+/// Returns whether the complete query phrase occurs at least once.
+///
+/// This is the structural phrase stage used by the adapters. It deliberately
+/// stops at the first matching window; repeated occurrences are not stronger
+/// evidence at this stage.
+pub fn exact_phrase_present<'a, Q, C, I>(query_tokens: &[Q], fields: I) -> bool
 where
     Q: AsRef<str>,
     C: AsRef<str> + 'a,
     I: IntoIterator<Item = &'a [C]>,
 {
-    exact_phrase_count_by(query_tokens, fields, |query, candidate| {
+    exact_phrase_present_by(query_tokens, fields, |query, candidate| {
         candidate.starts_with(query)
     })
 }
 
-pub fn exact_phrase_count_by<'a, Q, C, I, F>(
+pub fn exact_phrase_present_by<'a, Q, C, I, F>(
+    query_tokens: &[Q],
+    fields: I,
+    token_matches: F,
+) -> bool
+where
+    Q: AsRef<str>,
+    C: AsRef<str> + 'a,
+    I: IntoIterator<Item = &'a [C]>,
+    F: Fn(&str, &str) -> bool + Copy,
+{
+    if query_tokens.is_empty() {
+        return false;
+    }
+    fields.into_iter().any(|tokens| {
+        tokens
+            .windows(query_tokens.len())
+            .any(|window| token_window_matches(query_tokens, window, token_matches))
+    })
+}
+
+/// Counts every matching complete-phrase window across the supplied fields.
+///
+/// Adapters should use this only for an explicit later occurrence tie-break,
+/// never as the structural whole-phrase presence stage.
+pub fn exact_phrase_occurrence_count<'a, Q, C, I>(query_tokens: &[Q], fields: I) -> usize
+where
+    Q: AsRef<str>,
+    C: AsRef<str> + 'a,
+    I: IntoIterator<Item = &'a [C]>,
+{
+    exact_phrase_occurrence_count_by(query_tokens, fields, |query, candidate| {
+        candidate.starts_with(query)
+    })
+}
+
+pub fn exact_phrase_occurrence_count_by<'a, Q, C, I, F>(
     query_tokens: &[Q],
     fields: I,
     token_matches: F,
@@ -137,6 +257,11 @@ where
     })
 }
 
+/// Counts distinct contiguous query subphrases present at least once.
+///
+/// Each vector entry corresponds to one subphrase length, starting with the
+/// longest proper length. Repeated candidate occurrences of the same query
+/// subphrase do not increase the entry.
 pub fn exact_subphrase_counts_vector_by<'a, Q, C, I, F>(
     query_tokens: &[Q],
     fields: I,
@@ -155,22 +280,16 @@ where
     (2..query_tokens.len())
         .rev()
         .map(|window_len| {
-            let mut count = 0;
-            for query_start in 0..=query_tokens.len() - window_len {
-                let query_window = &query_tokens[query_start..query_start + window_len];
-                count += fields
-                    .iter()
-                    .map(|tokens| {
+            (0..=query_tokens.len() - window_len)
+                .filter(|query_start| {
+                    let query_window = &query_tokens[*query_start..*query_start + window_len];
+                    fields.iter().any(|tokens| {
                         tokens
                             .windows(window_len)
-                            .filter(|window| {
-                                token_window_matches(query_window, window, token_matches)
-                            })
-                            .count()
+                            .any(|window| token_window_matches(query_window, window, token_matches))
                     })
-                    .sum::<usize>();
-            }
-            count
+                })
+                .count()
         })
         .collect()
 }
@@ -253,7 +372,7 @@ pub fn saturated_exact_query_token_occurrence_total(counts: &[usize]) -> usize {
     counts.iter().map(|count| (*count).min(3)).sum()
 }
 
-pub fn saturated_exact_phrase_count(count: usize) -> usize {
+pub fn saturated_exact_phrase_occurrence_count(count: usize) -> usize {
     count.min(3)
 }
 
@@ -335,6 +454,10 @@ where
         .all(|(candidate, query)| token_matches(query.as_ref(), candidate.as_ref()))
 }
 
+/// Edit counts use candidate-to-query direction:
+///
+/// - `insertions` are candidate characters absent from the query.
+/// - `deletions` are query characters absent from the candidate.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct OperationProfile {
     pub substitutions: usize,
@@ -388,18 +511,23 @@ impl OperationProfile {
 
     pub fn with_insertion(
         mut self,
-        inserted: char,
+        candidate_char: char,
         prev: Option<char>,
         next: Option<char>,
     ) -> Self {
         self.insertions += 1;
-        self.insertion_penalty += insertion_likelihood_penalty(inserted, prev, next);
+        self.insertion_penalty += insertion_likelihood_penalty(candidate_char, prev, next);
         self
     }
 
-    pub fn with_deletion(mut self, deleted: char, prev: Option<char>, next: Option<char>) -> Self {
+    pub fn with_deletion(
+        mut self,
+        query_char: char,
+        prev: Option<char>,
+        next: Option<char>,
+    ) -> Self {
         self.deletions += 1;
-        self.substitution_penalty += deletion_likelihood_penalty(deleted, prev, next);
+        self.substitution_penalty += deletion_likelihood_penalty(query_char, prev, next);
         self
     }
 
@@ -425,7 +553,7 @@ impl OperationProfile {
     }
 
     pub fn core_typo_cost(&self) -> usize {
-        self.keyboard_distance + self.insertions * 6
+        self.keyboard_distance + self.deletions * 6
     }
 }
 
@@ -536,26 +664,26 @@ pub fn max_typos(len: usize) -> usize {
 }
 
 pub fn bounded_damerau_levenshtein(
-    intended: &str,
-    typed: &str,
+    candidate: &str,
+    query: &str,
     limit: usize,
 ) -> Option<(usize, OperationProfile)> {
-    let intended: Vec<_> = intended.chars().collect();
-    let typed: Vec<_> = typed.chars().collect();
-    if intended.len().abs_diff(typed.len()) > limit {
+    let candidate: Vec<_> = candidate.chars().collect();
+    let query: Vec<_> = query.chars().collect();
+    if candidate.len().abs_diff(query.len()) > limit {
         return None;
     }
 
     let inf = EditCost::infinite(limit);
-    let mut prev_prev = vec![inf; typed.len() + 1];
-    let mut prev = vec![EditCost::default(); typed.len() + 1];
+    let mut prev_prev = vec![inf; query.len() + 1];
+    let mut prev = vec![EditCost::default(); query.len() + 1];
     for (idx, cell) in prev.iter_mut().enumerate() {
         *cell = EditCost {
             distance: idx,
             operations: OperationProfile {
                 substitutions: 0,
-                insertions: idx,
-                deletions: 0,
+                insertions: 0,
+                deletions: idx,
                 transpositions: 0,
                 keyboard_distance: 0,
                 substitution_penalty: 0,
@@ -563,16 +691,16 @@ pub fn bounded_damerau_levenshtein(
             },
         };
     }
-    let mut curr = vec![inf; typed.len() + 1];
+    let mut curr = vec![inf; query.len() + 1];
 
-    for i in 1..=intended.len() {
+    for i in 1..=candidate.len() {
         curr.fill(inf);
         curr[0] = EditCost {
             distance: i,
             operations: OperationProfile {
                 substitutions: 0,
-                insertions: 0,
-                deletions: i,
+                insertions: i,
+                deletions: 0,
                 transpositions: 0,
                 keyboard_distance: 0,
                 substitution_penalty: 0,
@@ -581,31 +709,34 @@ pub fn bounded_damerau_levenshtein(
         };
 
         let start = i.saturating_sub(limit).max(1);
-        let end = (i + limit).min(typed.len());
+        let end = (i + limit).min(query.len());
         if start > end {
             return None;
         }
 
         let mut row_min = inf;
         for j in start..=end {
-            let deletion = prev[j].with_deletion(
-                intended[i - 1],
-                i.checked_sub(2).map(|idx| intended[idx]),
-                intended.get(i).copied(),
+            let insertion = prev[j].with_insertion(
+                candidate[i - 1],
+                i.checked_sub(2).map(|idx| candidate[idx]),
+                candidate.get(i).copied(),
             );
-            let insertion = curr[j - 1].with_insertion(
-                typed[j - 1],
-                i.checked_sub(1).map(|idx| intended[idx]),
-                intended.get(i).copied(),
+            let deletion = curr[j - 1].with_deletion(
+                query[j - 1],
+                i.checked_sub(1).map(|idx| candidate[idx]),
+                candidate.get(i).copied(),
             );
-            let substitution = if intended[i - 1] == typed[j - 1] {
+            let substitution = if candidate[i - 1] == query[j - 1] {
                 prev[j - 1]
             } else {
-                prev[j - 1].with_substitution(intended[i - 1], typed[j - 1])
+                prev[j - 1].with_substitution(candidate[i - 1], query[j - 1])
             };
             let mut cell = deletion.min(insertion).min(substitution);
 
-            if i > 1 && j > 1 && intended[i - 1] == typed[j - 2] && intended[i - 2] == typed[j - 1]
+            if i > 1
+                && j > 1
+                && candidate[i - 1] == query[j - 2]
+                && candidate[i - 2] == query[j - 1]
             {
                 cell = cell.min(prev_prev[j - 2].with_transposition());
             }
@@ -622,7 +753,7 @@ pub fn bounded_damerau_levenshtein(
         std::mem::swap(&mut prev, &mut curr);
     }
 
-    let cost = prev[typed.len()];
+    let cost = prev[query.len()];
     (cost.distance <= limit).then_some((cost.distance, cost.operations))
 }
 
@@ -637,16 +768,46 @@ mod tests {
         let second = vec!["three".to_string(), "one".to_string(), "two".to_string()];
         let fields = [first.as_slice(), second.as_slice()];
 
-        assert_eq!(exact_phrase_count(&query, fields), 0);
-        assert_eq!(exact_subphrase_counts_vector(&query, fields), vec![2]);
+        assert!(!exact_phrase_present(&query, fields));
+        assert_eq!(exact_subphrase_counts_vector(&query, fields), vec![1]);
         assert_eq!(exact_distinct_coverage(&query, fields), 3);
         assert_eq!(exact_token_occurrence_counts(&query, fields), vec![2, 2, 1]);
     }
 
     #[test]
+    fn exact_phrase_presence_does_not_count_repeated_occurrences() {
+        let query = vec!["one", "two"];
+        let field = vec![
+            "one".to_string(),
+            "two".to_string(),
+            "one".to_string(),
+            "two".to_string(),
+        ];
+
+        assert!(exact_phrase_present(&query, [field.as_slice()]));
+        assert_eq!(exact_phrase_occurrence_count(&query, [field.as_slice()]), 2);
+    }
+
+    #[test]
+    fn exact_subphrase_vector_counts_presence_not_repeated_occurrences() {
+        let query = vec!["one", "two", "three"];
+        let field = vec![
+            "one".to_string(),
+            "two".to_string(),
+            "one".to_string(),
+            "two".to_string(),
+        ];
+
+        assert_eq!(
+            exact_subphrase_counts_vector(&query, [field.as_slice()]),
+            vec![1]
+        );
+    }
+
+    #[test]
     fn query_token_occurrence_total_saturates_each_token_at_three() {
         assert_eq!(saturated_exact_query_token_occurrence_total(&[10, 2, 0]), 5);
-        assert_eq!(saturated_exact_phrase_count(10), 3);
+        assert_eq!(saturated_exact_phrase_occurrence_count(10), 3);
     }
 
     #[test]
@@ -762,6 +923,19 @@ mod tests {
         let far = bounded_damerau_levenshtein("film", "pilm", 1).unwrap();
         assert_eq!(extra.0, far.0);
         assert!(extra.1 < far.1);
+    }
+
+    #[test]
+    fn query_and_candidate_only_characters_have_directional_costs() {
+        let query_deletion = bounded_damerau_levenshtein("target", "tarxget", 1).unwrap();
+        assert_eq!(query_deletion.1.deletions, 1);
+        assert_eq!(query_deletion.1.insertions, 0);
+        assert_eq!(query_deletion.1.core_typo_cost(), 6);
+
+        let candidate_insertion = bounded_damerau_levenshtein("tarxget", "target", 1).unwrap();
+        assert_eq!(candidate_insertion.1.deletions, 0);
+        assert_eq!(candidate_insertion.1.insertions, 1);
+        assert_eq!(candidate_insertion.1.core_typo_cost(), 0);
     }
 }
 #[derive(Clone, Debug, Default, Eq, PartialEq)]

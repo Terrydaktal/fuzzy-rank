@@ -2,7 +2,7 @@ use std::cmp::{Ordering, Reverse};
 
 use crate::core::{
     InsertionVector, OperationProfile, TypoCostVector, bounded_damerau_levenshtein,
-    compare_key_asc, compare_score_desc, exact_distinct_coverage, exact_phrase_count,
+    compare_key_asc, compare_score_desc, exact_distinct_coverage, exact_phrase_present,
     exact_subphrase_counts_vector, max_typos, ordered_token_span,
 };
 use crate::text::{has_query_signal, split_search_tokens, split_whitespace_tokens, to_lowercase};
@@ -19,7 +19,7 @@ pub struct CommandHistoryCandidate<'a> {
 #[derive(Clone, Debug)]
 pub struct CommandHistoryMatch<'a> {
     pub candidate: CommandHistoryCandidate<'a>,
-    pub exact_phrase_count: usize,
+    pub exact_phrase_present: bool,
     pub exact_coverage: usize,
     pub exact_subphrase_counts_vector: Vec<usize>,
     pub total_coverage: usize,
@@ -37,7 +37,7 @@ pub struct CommandHistoryMatch<'a> {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommandHistoryRank {
-    pub exact_phrase_count: usize,
+    pub exact_phrase_present: bool,
     pub exact_coverage: usize,
     pub exact_subphrase_counts_vector: Vec<usize>,
     pub total_coverage: usize,
@@ -52,7 +52,7 @@ pub struct CommandHistoryRank {
 impl<'a> CommandHistoryMatch<'a> {
     pub fn rank(&self) -> CommandHistoryRank {
         CommandHistoryRank {
-            exact_phrase_count: self.exact_phrase_count,
+            exact_phrase_present: self.exact_phrase_present,
             exact_coverage: self.exact_coverage,
             exact_subphrase_counts_vector: self.exact_subphrase_counts_vector.clone(),
             total_coverage: self.total_coverage,
@@ -85,8 +85,8 @@ pub fn compare_ranks(
     right_recency: Recency,
     right_command: &str,
 ) -> Ordering {
-    Reverse(left.exact_phrase_count)
-        .cmp(&Reverse(right.exact_phrase_count))
+    Reverse(left.exact_phrase_present)
+        .cmp(&Reverse(right.exact_phrase_present))
         .then_with(|| Reverse(left.exact_coverage).cmp(&Reverse(right.exact_coverage)))
         .then_with(|| {
             Reverse(&left.exact_subphrase_counts_vector)
@@ -185,7 +185,7 @@ pub fn sort_matches(matches: &mut [CommandHistoryMatch<'_>]) {
 }
 
 pub fn is_ambiguous(first: &CommandHistoryMatch<'_>, second: &CommandHistoryMatch<'_>) -> bool {
-    first.exact_phrase_count == second.exact_phrase_count
+    first.exact_phrase_present == second.exact_phrase_present
         && first.exact_coverage == second.exact_coverage
         && first.exact_subphrase_counts_vector == second.exact_subphrase_counts_vector
         && first.total_coverage == second.total_coverage
@@ -223,7 +223,7 @@ fn best_match_inner<'a>(
         .map(str::to_string)
         .collect::<Vec<_>>();
     let fields = std::iter::once(candidate.tokens.as_slice());
-    let exact_phrase_count = exact_phrase_count(&query_tokens, fields.clone());
+    let exact_phrase_present = exact_phrase_present(&query_tokens, fields.clone());
     let exact_coverage = exact_distinct_coverage(&query_tokens, fields.clone());
     let exact_subphrase_counts_vector = exact_subphrase_counts_vector(&query_tokens, fields);
 
@@ -279,7 +279,7 @@ fn best_match_inner<'a>(
 
     Some(CommandHistoryMatch {
         candidate: candidate.original,
-        exact_phrase_count,
+        exact_phrase_present,
         exact_coverage,
         exact_subphrase_counts_vector,
         total_coverage,

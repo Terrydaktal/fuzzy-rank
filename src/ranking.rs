@@ -231,7 +231,6 @@ pub fn compare_search_results(
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PathTypoSortKey<'a> {
-    pub exact: bool,
     pub distance: usize,
     pub order_distance: usize,
     pub operations: OperationProfile,
@@ -251,10 +250,8 @@ pub fn compare_path_typo_sort_keys(
     left: &PathTypoSortKey<'_>,
     right: &PathTypoSortKey<'_>,
 ) -> Ordering {
-    right
-        .exact
-        .cmp(&left.exact)
-        .then_with(|| left.typo_costs.cmp(right.typo_costs))
+    left.typo_costs
+        .cmp(right.typo_costs)
         .then_with(|| left.order_distance.cmp(&right.order_distance))
         .then_with(|| compare_path_tail(left, right))
 }
@@ -274,8 +271,7 @@ pub fn path_typo_keys_are_ambiguous(
     left: &PathTypoSortKey<'_>,
     right: &PathTypoSortKey<'_>,
 ) -> bool {
-    left.exact == right.exact
-        && left.typo_costs == right.typo_costs
+    left.typo_costs == right.typo_costs
         && left.order_distance == right.order_distance
         && left.segment == right.segment
         && left.position == right.position
@@ -294,7 +290,6 @@ mod tests {
         insertions: &'a InsertionVector,
     ) -> PathTypoSortKey<'a> {
         PathTypoSortKey {
-            exact: false,
             distance: 1,
             order_distance: 0,
             operations: OperationProfile::default(),

@@ -1,8 +1,11 @@
 use crate::core::{
-    CoverageRank, DensityRank, InsertionVector, TypoCostVector, bounded_damerau_levenshtein,
-    compare_key_asc, compare_score_desc, exact_phrase_count_by, exact_subphrase_counts_vector_by,
-    keyboard_substitution_cost, max_typos, ordered_token_span, position_vector, ratio_milli,
+    CoverageRank, DensityRank, FieldOccurrenceRank, InsertionVector, RankedTokenVector,
+    TypoCostVector, bounded_damerau_levenshtein, compare_key_asc, compare_score_desc,
+    exact_phrase_occurrence_count_by, exact_phrase_present_by, exact_subphrase_counts_vector_by,
+    exact_token_position, keyboard_substitution_cost, max_typos, ordered_token_span,
+    position_vector, ratio_milli,
 };
+use crate::debug::{DebugReport, DebugStage};
 use crate::ranking::{
     AbbreviationRank, DistanceRank, SearchRank, StructuralRank, compare_search_results,
 };
@@ -145,6 +148,93 @@ impl MetadataQuery {
         for (i, (cand, rank, _)) in lazy_matches.into_iter().enumerate() {
             matches[i] = (cand, rank);
         }
+    }
+
+    /// Explain every metadata comparator stage for one candidate.
+    ///
+    /// Unlike normal sorting, this deliberately evaluates every stage so the
+    /// debug CLI can show values that a lazy comparison would not need for a
+    /// particular candidate.
+    pub fn debug_report<'a>(&self, candidate: MetadataCandidate<'a>) -> DebugReport {
+        let relevance = LazyRelevance::new(&self.query_tokens, self.allow_typo, candidate.fields);
+        let rank = self.search_rank(candidate);
+        let stages = vec![
+            DebugStage::new(
+                "CORE.EXACT_PHRASE_PRESENT",
+                format!("{}", relevance.get_exact_whole_phrase_present()),
+            ),
+            DebugStage::new(
+                "CORE.EXACT_SUBPHRASE_COUNTS_VECTOR",
+                format!("{:?}", relevance.get_exact_subphrase_counts_vector()),
+            ),
+            DebugStage::new(
+                "CORE.EXACT_COVERAGE_RANK",
+                Self::format_coverage_rank(relevance.get_exact_coverage_rank()),
+            ),
+            DebugStage::new(
+                "CORE.EXACT_FIELD_QUALITY",
+                format!("{}", relevance.get_exact_field_quality()),
+            ),
+            DebugStage::new(
+                "METADATA.FUZZY_WHOLE_PHRASE",
+                format!("{}", relevance.get_fuzzy_whole_phrase()),
+            ),
+            DebugStage::new(
+                "METADATA.FUZZY_SUBPHRASE_COUNTS_VECTOR",
+                format!("{:?}", relevance.get_fuzzy_subphrase_counts_vector()),
+            ),
+            DebugStage::new(
+                "METADATA.FUZZY_COVERAGE_RANK",
+                format!("{:?}", relevance.get_fuzzy_coverage_rank()),
+            ),
+            DebugStage::new(
+                "METADATA.FUZZY_FIELD_QUALITY",
+                format!("{}", relevance.get_fuzzy_field_quality()),
+            ),
+            DebugStage::new(
+                "CORE.TYPO_COST_VECTOR",
+                format_ranked_vector(relevance.get_typo_cost_vector()),
+            ),
+            DebugStage::new(
+                "CORE.INSERTION_VECTOR",
+                format_ranked_vector(relevance.get_insertion_vector()),
+            ),
+            DebugStage::new(
+                "CORE.ORDER_VIOLATION_DISTANCE",
+                format!("{}", relevance.get_order_distance()),
+            ),
+            DebugStage::new(
+                "CORE.ORDERED_SPAN.GAP",
+                format!("{}", relevance.get_total_gap()),
+            ),
+            DebugStage::new(
+                "CORE.EXACT_PHRASE_OCCURRENCE_RANK",
+                format!("{:?}", relevance.get_exact_phrase_occurrence_rank()),
+            ),
+            DebugStage::new(
+                "CORE.EXACT_TOKEN_OCCURRENCE_RANK",
+                format!("{:?}", relevance.get_exact_token_occurrence_rank()),
+            ),
+            DebugStage::new(
+                "CORE.DENSITY",
+                format!("{:?}", relevance.get_density_rank()),
+            ),
+            DebugStage::new("CORE.SCORE_DESC", format!("{}", candidate.score)),
+            DebugStage::new("RANKING.SEARCH_RANK", format!("{:?}", rank.as_ref())),
+            DebugStage::new("CORE.KEY_ASC", candidate.key),
+        ];
+
+        match rank {
+            Some(rank) => DebugReport::matched(format!("{:?}", rank), stages),
+            None => DebugReport::no_match("no metadata match", stages),
+        }
+    }
+
+    fn format_coverage_rank(rank: &CoverageRank) -> String {
+        format!(
+            "weighted_quality: {}\ndistinct_coverage: {}\nclass_counts: {:?}\nclasses: [whole, prefix, suffix, substring]\nweights: [4, 2, 2, 1]",
+            rank.weighted_quality, rank.distinct_coverage, rank.class_counts
+        )
     }
 
     pub fn search_rank_with_highlights(
@@ -323,12 +413,20 @@ impl MetadataQuery {
     }
 }
 
+fn format_ranked_vector(vector: &RankedTokenVector) -> String {
+    format!(
+        "aligned={:?}, worst_first={:?}",
+        vector.aligned(),
+        vector.worst_first()
+    )
+}
+
 struct LazyRelevance<'a> {
     query_tokens: &'a [String],
     allow_typo: bool,
     fields: Vec<NormalizedMetadataField>,
 
-    exact_whole_phrase_occurrences: OnceCell<usize>,
+    exact_whole_phrase_present: OnceCell<bool>,
     exact_subphrase_counts_vector: OnceCell<Vec<usize>>,
     exact_coverage_rank: OnceCell<CoverageRank>,
     fuzzy_coverage_rank: OnceCell<CoverageRank>,
@@ -340,6 +438,8 @@ struct LazyRelevance<'a> {
     exact_phrase_occurrence_rank: OnceCell<FieldOccurrenceRank>,
     exact_token_occurrence_rank: OnceCell<FieldOccurrenceRank>,
     scattered_stats: OnceCell<(usize, usize)>,
+    typo_cost_vector: OnceCell<TypoCostVector>,
+    insertion_vector: OnceCell<InsertionVector>,
     density_rank: OnceCell<DensityRank>,
 }
 
@@ -364,7 +464,7 @@ impl<'a> LazyRelevance<'a> {
             query_tokens,
             allow_typo,
             fields: normalized_fields,
-            exact_whole_phrase_occurrences: OnceCell::new(),
+            exact_whole_phrase_present: OnceCell::new(),
             exact_subphrase_counts_vector: OnceCell::new(),
             exact_coverage_rank: OnceCell::new(),
             fuzzy_coverage_rank: OnceCell::new(),
@@ -376,16 +476,18 @@ impl<'a> LazyRelevance<'a> {
             exact_phrase_occurrence_rank: OnceCell::new(),
             exact_token_occurrence_rank: OnceCell::new(),
             scattered_stats: OnceCell::new(),
+            typo_cost_vector: OnceCell::new(),
+            insertion_vector: OnceCell::new(),
             density_rank: OnceCell::new(),
         }
     }
 
-    fn get_exact_whole_phrase_occurrences(&self) -> usize {
-        *self.exact_whole_phrase_occurrences.get_or_init(|| {
+    fn get_exact_whole_phrase_present(&self) -> bool {
+        *self.exact_whole_phrase_present.get_or_init(|| {
             if self.query_tokens.is_empty() || self.fields.is_empty() {
-                0
+                false
             } else {
-                exact_phrase_count_by(
+                exact_phrase_present_by(
                     self.query_tokens,
                     self.fields.iter().map(|field| field.tokens.as_slice()),
                     literal_token_match,
@@ -406,10 +508,6 @@ impl<'a> LazyRelevance<'a> {
                 )
             }
         })
-    }
-
-    fn get_exact_whole_phrase_present(&self) -> bool {
-        self.get_exact_whole_phrase_occurrences() > 0
     }
 
     fn get_exact_coverage_rank(&self) -> &CoverageRank {
@@ -455,19 +553,40 @@ impl<'a> LazyRelevance<'a> {
             .get_or_init(|| fuzzy_subphrase_counts_vector(self.query_tokens, &self.fields))
     }
 
-    fn get_typo_severity(&self) -> TypoSeverity {
-        if self.query_tokens.is_empty() || self.fields.is_empty() {
-            return TypoSeverity::default();
-        }
-        let matches = self.fuzzy_best_matches.get_or_init(|| {
-            self.query_tokens
-                .iter()
-                .map(|query_token| {
-                    best_fuzzy_token_match(query_token, &self.fields, self.allow_typo)
-                })
-                .collect()
-        });
-        TypoSeverity::from_matches(matches)
+    fn get_typo_cost_vector(&self) -> &TypoCostVector {
+        self.typo_cost_vector.get_or_init(|| {
+            if self.query_tokens.is_empty() || self.fields.is_empty() {
+                TypoCostVector::default()
+            } else {
+                let matches = self.fuzzy_best_matches.get_or_init(|| {
+                    self.query_tokens
+                        .iter()
+                        .map(|query_token| {
+                            best_fuzzy_token_match(query_token, &self.fields, self.allow_typo)
+                        })
+                        .collect()
+                });
+                typo_cost_vector(matches)
+            }
+        })
+    }
+
+    fn get_insertion_vector(&self) -> &InsertionVector {
+        self.insertion_vector.get_or_init(|| {
+            if self.query_tokens.is_empty() || self.fields.is_empty() {
+                InsertionVector::default()
+            } else {
+                let matches = self.fuzzy_best_matches.get_or_init(|| {
+                    self.query_tokens
+                        .iter()
+                        .map(|query_token| {
+                            best_fuzzy_token_match(query_token, &self.fields, self.allow_typo)
+                        })
+                        .collect()
+                });
+                insertion_vector(matches)
+            }
+        })
     }
 
     fn get_exact_field_quality(&self) -> u8 {
@@ -520,7 +639,7 @@ impl<'a> LazyRelevance<'a> {
     fn get_exact_phrase_occurrence_rank(&self) -> &FieldOccurrenceRank {
         self.exact_phrase_occurrence_rank.get_or_init(|| {
             field_occurrence_rank(&self.fields, |field| {
-                exact_phrase_count_by(
+                exact_phrase_occurrence_count_by(
                     self.query_tokens,
                     std::iter::once(field.tokens.as_slice()),
                     literal_token_match,
@@ -601,9 +720,16 @@ impl<'a> LazyRelevance<'a> {
                 self.get_fuzzy_field_quality()
                     .cmp(&other.get_fuzzy_field_quality())
             })
+            .then_with(|| {
+                self.get_typo_cost_vector()
+                    .cmp(other.get_typo_cost_vector())
+            })
+            .then_with(|| {
+                self.get_insertion_vector()
+                    .cmp(other.get_insertion_vector())
+            })
             .then_with(|| self.get_order_distance().cmp(&other.get_order_distance()))
             .then_with(|| self.get_total_gap().cmp(&other.get_total_gap()))
-            .then_with(|| self.get_typo_severity().cmp(&other.get_typo_severity()))
             .then_with(|| {
                 other
                     .get_exact_phrase_occurrence_rank()
@@ -615,45 +741,6 @@ impl<'a> LazyRelevance<'a> {
                     .cmp(self.get_exact_token_occurrence_rank())
             })
             .then_with(|| self.get_density_rank().cmp(&other.get_density_rank()))
-    }
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-struct TypoSeverity {
-    core_costs: TypoCostVector,
-    positions: TypoCostVector,
-    insertions: InsertionVector,
-}
-
-impl TypoSeverity {
-    fn from_matches(matches: &[TokenMatch]) -> Self {
-        let core_costs = TypoCostVector::new(
-            matches
-                .iter()
-                .map(|matched| {
-                    (matched.fuzzy && !matched.exact)
-                        .then_some(matched.severity.core_cost)
-                        .unwrap_or(0)
-                })
-                .collect(),
-        );
-        let positions = TypoCostVector::new(
-            matches
-                .iter()
-                .map(|matched| matched.severity.position)
-                .collect(),
-        );
-        let insertions = InsertionVector::new(
-            matches
-                .iter()
-                .map(|matched| matched.severity.insertions)
-                .collect(),
-        );
-        Self {
-            core_costs,
-            positions,
-            insertions,
-        }
     }
 }
 
@@ -674,20 +761,26 @@ impl TokenTypoSeverity {
     }
 }
 
-impl Ord for TypoSeverity {
-    fn cmp(&self, other: &Self) -> Ordering {
-        (&self.core_costs, &self.positions, &self.insertions).cmp(&(
-            &other.core_costs,
-            &other.positions,
-            &other.insertions,
-        ))
-    }
+fn typo_cost_vector(matches: &[TokenMatch]) -> TypoCostVector {
+    TypoCostVector::new(
+        matches
+            .iter()
+            .map(|matched| {
+                (matched.fuzzy && !matched.exact)
+                    .then_some(matched.severity.core_cost)
+                    .unwrap_or(0)
+            })
+            .collect(),
+    )
 }
 
-impl PartialOrd for TypoSeverity {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
+fn insertion_vector(matches: &[TokenMatch]) -> InsertionVector {
+    InsertionVector::new(
+        matches
+            .iter()
+            .map(|matched| matched.severity.insertions)
+            .collect(),
+    )
 }
 
 #[allow(dead_code)]
@@ -703,7 +796,8 @@ struct MetadataRelevanceRank {
     fuzzy_field_quality: u8,
     order_distance: usize,
     total_gap: usize,
-    typo_severity: TypoSeverity,
+    typo_cost_vector: TypoCostVector,
+    insertion_vector: InsertionVector,
     exact_phrase_occurrence_rank: FieldOccurrenceRank,
     exact_token_occurrence_rank: FieldOccurrenceRank,
     density: DensityRank,
@@ -730,9 +824,10 @@ impl Ord for MetadataRelevanceRank {
                 Reverse(&self.fuzzy_coverage_rank).cmp(&Reverse(&other.fuzzy_coverage_rank))
             })
             .then_with(|| self.fuzzy_field_quality.cmp(&other.fuzzy_field_quality))
+            .then_with(|| self.typo_cost_vector.cmp(&other.typo_cost_vector))
+            .then_with(|| self.insertion_vector.cmp(&other.insertion_vector))
             .then_with(|| self.order_distance.cmp(&other.order_distance))
             .then_with(|| self.total_gap.cmp(&other.total_gap))
-            .then_with(|| self.typo_severity.cmp(&other.typo_severity))
             .then_with(|| {
                 Reverse(&self.exact_phrase_occurrence_rank)
                     .cmp(&Reverse(&other.exact_phrase_occurrence_rank))
@@ -786,69 +881,11 @@ struct NormalizedMetadataField {
     tokens: Vec<String>,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-struct FieldOccurrenceRank(Vec<(u8, usize)>);
-
-impl Ord for FieldOccurrenceRank {
-    fn cmp(&self, other: &Self) -> Ordering {
-        let mut priorities = self
-            .0
-            .iter()
-            .map(|(priority, _)| *priority)
-            .chain(other.0.iter().map(|(priority, _)| *priority))
-            .collect::<Vec<_>>();
-        priorities.sort_unstable();
-        priorities.dedup();
-
-        priorities
-            .into_iter()
-            .map(|priority| {
-                let left = self
-                    .0
-                    .iter()
-                    .find(|(candidate_priority, _)| *candidate_priority == priority)
-                    .map(|(_, count)| *count)
-                    .unwrap_or(0);
-                let right = other
-                    .0
-                    .iter()
-                    .find(|(candidate_priority, _)| *candidate_priority == priority)
-                    .map(|(_, count)| *count)
-                    .unwrap_or(0);
-                left.cmp(&right)
-            })
-            .find(|ordering| *ordering != Ordering::Equal)
-            .unwrap_or(Ordering::Equal)
-    }
-}
-
-impl PartialOrd for FieldOccurrenceRank {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
 fn field_occurrence_rank(
     fields: &[NormalizedMetadataField],
     count: impl Fn(&NormalizedMetadataField) -> usize,
 ) -> FieldOccurrenceRank {
-    let mut entries = fields
-        .iter()
-        .map(|field| (field.priority, count(field)))
-        .collect::<Vec<_>>();
-    entries.sort_unstable_by_key(|(priority, _)| *priority);
-
-    let mut merged = Vec::new();
-    for (priority, count) in entries {
-        if let Some((last_priority, last_count)) = merged.last_mut()
-            && *last_priority == priority
-        {
-            *last_count += count;
-        } else {
-            merged.push((priority, count));
-        }
-    }
-    FieldOccurrenceRank(merged)
+    FieldOccurrenceRank::from_entries(fields.iter().map(|field| (field.priority, count(field))))
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -908,7 +945,8 @@ fn metadata_relevance_rank(
             fuzzy_field_quality: u8::MAX,
             order_distance: usize::MAX,
             total_gap: usize::MAX,
-            typo_severity: TypoSeverity::default(),
+            typo_cost_vector: TypoCostVector::default(),
+            insertion_vector: InsertionVector::default(),
             exact_phrase_occurrence_rank: FieldOccurrenceRank::default(),
             exact_token_occurrence_rank: FieldOccurrenceRank::default(),
             density: DensityRank::new(0, usize::MAX),
@@ -920,7 +958,7 @@ fn metadata_relevance_rank(
         .map(|query_token| best_fuzzy_token_match(query_token, &normalized_fields, allow_typo))
         .collect::<Vec<_>>();
 
-    let exact_whole_phrase_occurrences = exact_phrase_count_by(
+    let exact_whole_phrase_present = exact_phrase_present_by(
         query_tokens,
         normalized_fields
             .iter()
@@ -953,7 +991,8 @@ fn metadata_relevance_rank(
     let fuzzy_whole_phrase =
         fuzzy_whole_phrase_present(query_tokens, &normalized_fields, allow_typo);
 
-    let typo_severity = TypoSeverity::from_matches(&fuzzy_best_matches);
+    let typo_cost_vector = typo_cost_vector(&fuzzy_best_matches);
+    let insertion_vector = insertion_vector(&fuzzy_best_matches);
 
     let exact_field_quality = best_exact_field_priority(query_tokens, &normalized_fields);
     let fuzzy_field_quality = fuzzy_best_matches
@@ -966,7 +1005,7 @@ fn metadata_relevance_rank(
         ordered_span_stats(query_tokens, &normalized_fields, allow_typo);
 
     let exact_phrase_occurrence_rank = field_occurrence_rank(&normalized_fields, |field| {
-        exact_phrase_count_by(
+        exact_phrase_occurrence_count_by(
             query_tokens,
             std::iter::once(field.tokens.as_slice()),
             literal_token_match,
@@ -988,7 +1027,7 @@ fn metadata_relevance_rank(
     let density = density_stats(query_tokens, &normalized_fields, &fuzzy_best_matches);
 
     MetadataRelevanceRank {
-        exact_whole_phrase_present: exact_whole_phrase_occurrences > 0,
+        exact_whole_phrase_present,
         exact_subphrase_counts_vector,
         exact_coverage_rank,
         exact_field_quality,
@@ -998,7 +1037,8 @@ fn metadata_relevance_rank(
         fuzzy_field_quality,
         order_distance,
         total_gap,
-        typo_severity,
+        typo_cost_vector,
+        insertion_vector,
         exact_phrase_occurrence_rank,
         exact_token_occurrence_rank,
         density,
@@ -1010,17 +1050,12 @@ fn literal_token_match(query: &str, candidate: &str) -> bool {
 }
 
 fn literal_token_scope(query: &str, candidate: &str) -> Option<TokenMatchScope> {
-    if candidate == query {
-        Some(TokenMatchScope::WholeToken)
-    } else if candidate.starts_with(query) {
-        Some(TokenMatchScope::Prefix)
-    } else if candidate.ends_with(query) {
-        Some(TokenMatchScope::Suffix)
-    } else if candidate.contains(query) {
-        Some(TokenMatchScope::Substring)
-    } else {
-        None
-    }
+    exact_token_position(query, candidate).map(|position| match position {
+        0 => TokenMatchScope::WholeToken,
+        1 => TokenMatchScope::Prefix,
+        2 => TokenMatchScope::Suffix,
+        _ => TokenMatchScope::Substring,
+    })
 }
 
 fn best_exact_token_scope(
@@ -1030,7 +1065,13 @@ fn best_exact_token_scope(
     fields
         .iter()
         .flat_map(|field| field.tokens.iter())
-        .filter_map(|candidate| literal_token_scope(query, candidate))
+        .filter_map(|candidate| exact_token_position(query, candidate))
+        .map(|position| match position {
+            0 => TokenMatchScope::WholeToken,
+            1 => TokenMatchScope::Prefix,
+            2 => TokenMatchScope::Suffix,
+            _ => TokenMatchScope::Substring,
+        })
         .min()
 }
 

@@ -3,13 +3,13 @@ use std::sync::Arc;
 
 use crate::core::{
     InsertionVector, OperationProfile, TypoCostVector, bounded_damerau_levenshtein,
-    exact_distinct_coverage, exact_phrase_count, exact_subphrase_counts_vector,
+    exact_distinct_coverage_by, exact_phrase_present, exact_subphrase_counts_vector,
     increment_position_vector_simple, max_typos, position_vector_simple,
 };
 use crate::path::Score;
 use crate::path::exact::{exact_match, match_penalties};
 use crate::ranking::{PathTypoSortKey, compare_path_typo_sort_keys, path_typo_keys_are_ambiguous};
-use crate::text::{has_query_signal, split_path_tokens, to_lowercase};
+use crate::text::{split_path_tokens, to_lowercase};
 use crate::token_match::{
     PositionedToken, aligned_token_distance, best_token_match, fragmented_token_match,
     partitioned_token_distance,
@@ -19,6 +19,7 @@ use crate::token_match::{
 struct PathExactRelevance<'a> {
     path: &'a str,
     query_tokens: Arc<[String]>,
+    component_tokens: OnceCell<Vec<Vec<String>>>,
     whole_phrase: OnceCell<bool>,
     run_vector: OnceCell<Vec<usize>>,
     distinct_coverage: OnceCell<usize>,
@@ -43,7 +44,6 @@ pub struct PathMatch<'a> {
 impl<'a> PathMatch<'a> {
     fn sort_key(&self) -> PathTypoSortKey<'_> {
         PathTypoSortKey {
-            exact: self.exact,
             distance: self.distance,
             order_distance: self.order_distance,
             operations: self.operations,
@@ -57,20 +57,7 @@ impl<'a> PathMatch<'a> {
     }
 
     pub fn compare(&self, other: &Self) -> std::cmp::Ordering {
-        other
-            .exact
-            .cmp(&self.exact)
-            .then_with(|| other.exact_whole_phrase().cmp(&self.exact_whole_phrase()))
-            .then_with(|| {
-                other
-                    .exact_distinct_coverage()
-                    .cmp(&self.exact_distinct_coverage())
-            })
-            .then_with(|| {
-                other
-                    .exact_subphrase_counts_vector()
-                    .cmp(self.exact_subphrase_counts_vector())
-            })
+        compare_exact_relevance(self, other)
             .then_with(|| compare_path_typo_sort_keys(&self.sort_key(), &other.sort_key()))
     }
 
@@ -90,6 +77,12 @@ impl<'a> PathMatch<'a> {
         self.exact_relevance
             .as_ref()
             .map_or(0, PathExactRelevance::distinct_coverage)
+    }
+
+    fn has_exact_token_signal(&self) -> bool {
+        self.exact_relevance
+            .as_ref()
+            .is_some_and(PathExactRelevance::has_exact_token_signal)
     }
 }
 
@@ -160,10 +153,7 @@ pub fn sort_matches(matches: &mut [PathMatch<'_>]) {
 }
 
 pub fn is_ambiguous(first: &PathMatch<'_>, second: &PathMatch<'_>) -> bool {
-    first.exact == second.exact
-        && first.exact_whole_phrase() == second.exact_whole_phrase()
-        && first.exact_subphrase_counts_vector() == second.exact_subphrase_counts_vector()
-        && first.exact_distinct_coverage() == second.exact_distinct_coverage()
+    compare_exact_relevance(first, second).is_eq()
         && path_typo_keys_are_ambiguous(&first.sort_key(), &second.sort_key())
 }
 
@@ -261,10 +251,6 @@ fn best_match_inner<'a>(
     limit: usize,
 ) -> Option<PathMatch<'a>> {
     let lower_path = to_lowercase(path);
-    if !has_query_signal(split_path_tokens(query), &lower_path) {
-        return None;
-    }
-
     let components = path_components(&lower_path);
     if components.is_empty() {
         return None;
@@ -340,10 +326,6 @@ fn best_basename_match_inner<'a>(
     full_limit: usize,
 ) -> Option<PathMatch<'a>> {
     let lower_path = to_lowercase(path);
-    if !has_query_signal(split_path_tokens(query), &lower_path) {
-        return None;
-    }
-
     let components = path_components(&lower_path);
     if components.is_empty() {
         return None;
@@ -756,47 +738,87 @@ impl<'a> PathExactRelevance<'a> {
         Self {
             path,
             query_tokens,
+            component_tokens: OnceCell::new(),
             whole_phrase: OnceCell::new(),
             run_vector: OnceCell::new(),
             distinct_coverage: OnceCell::new(),
         }
     }
 
+    fn component_tokens(&self) -> &[Vec<String>] {
+        self.component_tokens.get_or_init(|| {
+            path_components(&to_lowercase(self.path))
+                .into_iter()
+                .map(|component| {
+                    split_path_tokens(component)
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect()
+                })
+                .collect()
+        })
+    }
+
+    fn has_exact_token_signal(&self) -> bool {
+        self.component_tokens().iter().any(|component| {
+            component.iter().any(|candidate| {
+                self.query_tokens
+                    .iter()
+                    .any(|query| candidate.contains(query))
+            })
+        })
+    }
+
     fn whole_phrase(&self) -> bool {
         *self.whole_phrase.get_or_init(|| {
-            let lowered = to_lowercase(self.path);
-            let components = path_components(&lowered)
-                .into_iter()
-                .map(split_path_tokens)
-                .collect::<Vec<_>>();
-            exact_phrase_count(&self.query_tokens, components.iter().map(Vec::as_slice)) > 0
+            exact_phrase_present(
+                &self.query_tokens,
+                self.component_tokens().iter().map(Vec::as_slice),
+            )
         })
     }
 
     fn run_vector(&self) -> &[usize] {
         self.run_vector.get_or_init(|| {
-            let lowered = to_lowercase(self.path);
-            let component_tokens = path_components(&lowered)
-                .into_iter()
-                .map(split_path_tokens)
-                .collect::<Vec<_>>();
             exact_subphrase_counts_vector(
                 &self.query_tokens,
-                component_tokens.iter().map(Vec::as_slice),
+                self.component_tokens().iter().map(Vec::as_slice),
             )
         })
     }
 
     fn distinct_coverage(&self) -> usize {
         *self.distinct_coverage.get_or_init(|| {
-            let lowered = to_lowercase(self.path);
-            let components = path_components(&lowered)
-                .into_iter()
-                .map(split_path_tokens)
-                .collect::<Vec<_>>();
-            exact_distinct_coverage(&self.query_tokens, components.iter().map(Vec::as_slice))
+            exact_distinct_coverage_by(
+                &self.query_tokens,
+                self.component_tokens().iter().map(Vec::as_slice),
+                |query, candidate| candidate.contains(query),
+            )
         })
     }
+}
+
+fn compare_exact_relevance(left: &PathMatch<'_>, right: &PathMatch<'_>) -> std::cmp::Ordering {
+    let left_has_signal = left.has_exact_token_signal();
+    let right_has_signal = right.has_exact_token_signal();
+
+    if !left_has_signal && !right_has_signal {
+        return std::cmp::Ordering::Equal;
+    }
+
+    right
+        .exact_whole_phrase()
+        .cmp(&left.exact_whole_phrase())
+        .then_with(|| {
+            right
+                .exact_subphrase_counts_vector()
+                .cmp(left.exact_subphrase_counts_vector())
+        })
+        .then_with(|| {
+            right
+                .exact_distinct_coverage()
+                .cmp(&left.exact_distinct_coverage())
+        })
 }
 
 fn token_relative_match_shape(
@@ -856,7 +878,7 @@ mod tests {
     fn missing_space_query_matches_single_compound_token_via_internal_breaks_and_insertions() {
         let candidate = best_match("/home/lewis/applicationlauncher", 10.0, "applaunch").unwrap();
         assert_eq!(candidate.operations.core_typo_cost(), 0);
-        assert_eq!(candidate.operations.insertions, 0);
+        assert_eq!(candidate.operations.insertions, 10);
     }
 
     #[test]
@@ -923,7 +945,7 @@ mod tests {
     }
 
     #[test]
-    fn extra_typed_character_beats_substitution_for_paths() {
+    fn extra_query_character_beats_substitution_for_paths() {
         let mut matches = [
             best_match("/home/lewis/abdef", 10.0, "abcdef").unwrap(),
             best_match("/home/lewis/abqdef", 10.0, "abcdef").unwrap(),
@@ -931,7 +953,8 @@ mod tests {
         sort_matches(&mut matches);
         assert_eq!(matches[0].path, "/home/lewis/abdef");
         assert_eq!(matches[0].distance, matches[1].distance);
-        assert_eq!(matches[0].operations.insertions, 1);
+        assert_eq!(matches[0].operations.deletions, 1);
+        assert_eq!(matches[0].operations.insertions, 0);
         assert_eq!(matches[0].operations.core_typo_cost(), 6);
         assert!(matches[1].operations.core_typo_cost() > matches[0].operations.core_typo_cost());
     }
@@ -953,6 +976,13 @@ mod tests {
         let candidate = best_match("/home/lewis/xfce4-terminal", 10.0, "zgce4").unwrap();
         assert_eq!(candidate.distance, 2);
         assert_eq!(candidate.ratio, 0.4);
+    }
+
+    #[test]
+    fn typo_matching_does_not_require_shared_character_bigrams() {
+        let candidate = best_match("/home/lewis/fuzzy-rank", 10.0, "fuxxy").unwrap();
+        assert_eq!(candidate.path, "/home/lewis/fuzzy-rank");
+        assert_eq!(candidate.distance, 2);
     }
 
     #[test]
@@ -1061,7 +1091,7 @@ mod tests {
         let candidate =
             best_match("/home/lewis/Dev/applicationlauncher", 93.2, "dev applaunch").unwrap();
         assert_eq!(candidate.operations.core_typo_cost(), 0);
-        assert_eq!(candidate.operations.insertions, 0);
+        assert_eq!(candidate.operations.insertions, 10);
     }
 
     #[test]
@@ -1084,6 +1114,25 @@ mod tests {
         sort_matches(&mut matches);
         assert_eq!(matches[0].path, "/home/one-two-three-x-four");
         assert_eq!(matches[0].exact_subphrase_counts_vector(), [1, 2]);
+    }
+
+    #[test]
+    fn exact_subphrase_run_precedes_broader_scattered_coverage() {
+        let mut matches = vec![
+            best_match("/home/one-two-three-x", 1.0, "one two three four").unwrap(),
+            best_match(
+                "/home/four-x-three-x-two-x-one",
+                1000.0,
+                "one two three four",
+            )
+            .unwrap(),
+        ];
+
+        sort_matches(&mut matches);
+
+        assert_eq!(matches[0].path, "/home/one-two-three-x");
+        assert_eq!(matches[0].exact_subphrase_counts_vector(), [1, 2]);
+        assert_eq!(matches[1].exact_distinct_coverage(), 4);
     }
 
     #[test]

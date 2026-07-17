@@ -514,7 +514,7 @@ pub fn fragmented_token_match(
 
                 if i < n {
                     let mut next = cost;
-                    next.operations = next.operations.with_deletion(
+                    next.operations = next.operations.with_insertion(
                         candidate_chars[i],
                         i.checked_sub(1).map(|idx| candidate_chars[idx]),
                         candidate_chars.get(i + 1).copied(),
@@ -545,7 +545,7 @@ pub fn fragmented_token_match(
                 if j < m {
                     let mut next = cost;
                     next.distance += 1;
-                    next.operations = next.operations.with_insertion(
+                    next.operations = next.operations.with_deletion(
                         query_chars[j],
                         i.checked_sub(1).map(|idx| candidate_chars[idx]),
                         candidate_chars.get(i).copied(),

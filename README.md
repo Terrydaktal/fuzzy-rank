@@ -26,6 +26,7 @@ fuzzy-rank/
 └── src
     ├── lib.rs
     ├── core.rs
+    ├── debug.rs
     ├── ranking.rs
     ├── text.rs
     ├── token_match.rs
@@ -33,10 +34,51 @@ fuzzy-rank/
     ├── path/
     │   ├── exact.rs
     │   └── typo.rs
+    ├── bin/
+    │   └── fuzzy-rank-debug.rs
     ├── command_history.rs
     ├── message.rs
     └── metadata.rs
 ```
+
+## Debug CLI
+
+The crate includes `fuzzy-rank-debug`, a diagnostic command that runs one
+adaptor against one query and candidate and prints every comparator stage with
+the value produced at that stage. It intentionally evaluates all stages for
+the report, even when the normal lazy comparator would stop after an earlier
+stage. ANSI colors are enabled automatically for a terminal; use `--color` or
+`--no-color` to override that behavior.
+
+Run it from this repository with:
+
+```sh
+cargo run --bin fuzzy-rank-debug -- ADAPTOR "QUERY" "CANDIDATE" [OPTIONS]
+```
+
+Examples:
+
+```sh
+cargo run --bin fuzzy-rank-debug -- path::typo applaunch \
+  /home/lewis/Dev/applicationlauncher
+cargo run --bin fuzzy-rank-debug -- message "cachyos ssh" \
+  "cachyos setup uses ssh and ssh-agent" --score 10
+cargo run --bin fuzzy-rank-debug -- message "chat ssh" \
+  "message body" --field "0:Chat title" --field "1:message body"
+cargo run --bin fuzzy-rank-debug -- command-history elextron \
+  "npx electron ." --recency 42
+cargo run --bin fuzzy-rank-debug -- metadata "chrome profile" \
+  chrome --field "0:Google Chrome" --field "2:chrome --profile-directory=Default" --typos
+```
+
+Supported adaptor names are `path`, `path::exact`, `path::typo`, `message`,
+`command-history`, and `metadata`. `path` runs the unified exact-first path
+adapter; the two qualified names force one path class. Metadata treats the
+candidate as one priority-0 field unless one or more repeatable `--field
+PRIORITY:VALUE` options are supplied. Message uses the same rule: its positional
+candidate is a priority-0 field, and repeatable `--field PRIORITY:VALUE`
+options replace it with prioritized message fields. `--score` and `--recency`
+are caller inputs, not values calculated by fuzzy-rank.
 
 ## Ownership Boundaries
 
@@ -83,7 +125,8 @@ Owns domain-neutral matching and comparison primitives:
 - bounded Damerau-Levenshtein
 - `OperationProfile`
 - typo-limit policy via `max_typos`
-- `exact_phrase_count`
+- `exact_phrase_present` and `exact_phrase_present_by`
+- `exact_phrase_occurrence_count` and `exact_phrase_occurrence_count_by`
 - `exact_subphrase_counts_vector`
 - `exact_distinct_coverage`
 - `exact_token_occurrence_counts`
@@ -96,11 +139,12 @@ Owns domain-neutral matching and comparison primitives:
 
 This module is responsible for:
 
-- computing bounded intended-to-typed Damerau-Levenshtein distance
+- computing bounded candidate-to-query Damerau-Levenshtein distance
 - tracking weighted typo-likelihood penalties for substitutions, insertions, deletions, and transpositions
 - supporting bounded early-exit behavior
 - providing a consistent raw typo distance to all adapters
-- counting exact phrases across one or more fields/components using an adapter-supplied token predicate
+- detecting exact phrase presence across one or more fields/components using an adapter-supplied token predicate
+- counting raw exact phrase occurrences only for explicit later tie-breaks
 - calculating exact phrase-run vectors and exact distinct coverage
 - providing shared score and deterministic-key comparisons
 
@@ -147,13 +191,13 @@ Owns shared text preparation helpers:
 - lowercasing
 - token splitting
 - compact alphanumeric normalization
-- cheap signal/prefilter checks
+- cheap signal/prefilter checks for adapters that opt into them
 
 Current helpers include:
 
 - `to_lowercase`
 - `token_has_signal`
-- `has_query_signal`
+- `has_query_signal` (used by command-history prefiltering)
 - `split_whitespace_tokens`
 - `split_search_tokens`
 - `split_path_tokens`
@@ -162,6 +206,29 @@ Current helpers include:
 This module is responsible for cheap, reusable preprocessing.
 
 It does not decide final ranking policy.
+
+### Cheap fuzzy gates
+
+`token_has_signal` and `has_query_signal` are rejection gates, not ranking
+keys. They avoid edit-distance work when the candidate has too little shared
+character signal, so they can affect whether a candidate reaches a matcher but
+never change the order of candidates that pass.
+
+Their current adapter-specific uses are:
+
+- `command_history`: `has_query_signal` runs once per command before command
+  token matching. It requires at least one query-token signal in the command;
+  the later full-query coverage check still requires every query token to
+  match. This gate is retained because shell history can be large.
+- `metadata`: `token_has_signal` gates the field-level fuzzy and typo
+  `SearchRank` paths, each candidate variant in fuzzy ranking, per-token
+  `TOKEN_MATCH` typo fallback, and typo highlighting. Literal substring
+  matches bypass it. Queries shorter than three characters also bypass typo
+  matching.
+- `path`: path exact and typo matching do not use either signal gate. Path
+  typo candidates are filtered by path/token length and the bounded matcher so
+  valid cases such as `fuxxy` -> `fuzzy` cannot be rejected by a bigram
+  heuristic.
 
 ### `token_match.rs`
 
@@ -232,16 +299,15 @@ Shared implementation cross-reference:
 
 | Implementation ID | Used by stages | Shared code |
 | --- | --- | --- |
-| `CORE.EXACT_PHRASE_COUNT` | path, command history, message | `exact_phrase_count` in `core.rs` |
-| `CORE.EXACT_WHOLE_PHRASE_PRESENT` | metadata | `exact_phrase_count` in `core.rs`, reduced to a boolean |
-| `METADATA.EXACT_PHRASE_OCCURRENCE_RANK` | metadata | exact phrase counts grouped by field priority in `metadata.rs` |
-| `CORE.EXACT_SUBPHRASE_COUNTS_VECTOR` | path, message, metadata | `exact_subphrase_counts_vector` in `core.rs` |
-| `CORE.EXACT_COVERAGE` | path, command history, message; contributes to metadata coverage | `exact_distinct_coverage` in `core.rs` |
-| `METADATA.EXACT_COVERAGE_RANK` | metadata | shared `CoverageRank` over exact classes counted by `position_vector` in `core.rs` |
+| `CORE.EXACT_PHRASE_PRESENT` | path, command history, message, metadata | `exact_phrase_present` / `exact_phrase_present_by` in `core.rs` |
+| `CORE.EXACT_PHRASE_OCCURRENCE_COUNT` | message, metadata | `exact_phrase_occurrence_count_by` in `core.rs`, used only by the later field-priority occurrence tie-break |
+| `CORE.EXACT_PHRASE_OCCURRENCE_RANK` | message, metadata | shared `FieldOccurrenceRank` over exact phrase counts grouped by field priority in `core.rs` |
+| `CORE.EXACT_SUBPHRASE_COUNTS_VECTOR` | path, message, metadata | `exact_subphrase_counts_vector` in `core.rs`; counts distinct query subphrases present at least once |
+| `CORE.EXACT_COVERAGE_RANK` | message, metadata | shared `CoverageRank` over exact classes counted by `position_vector` in `core.rs` |
+| `CORE.EXACT_FIELD_QUALITY` | message, metadata | best priority supplying literal evidence; adapter field normalization remains local |
 | `METADATA.FUZZY_COVERAGE_RANK` | metadata | deferred fuzzy `CoverageRank` over classes counted by the shared `position_vector` counter in `core.rs` |
 | `METADATA.FUZZY_WHOLE_PHRASE` | metadata | contiguous metadata token windows through shared token matching |
-| `CORE.SATURATED_EXACT_QUERY_TOKEN_OCCURRENCE_TOTAL` | message | `exact_token_occurrence_counts` followed by `saturated_exact_query_token_occurrence_total` in `core.rs` |
-| `METADATA.EXACT_TOKEN_OCCURRENCE_RANK` | metadata | exact token hits grouped by field priority in `metadata.rs` |
+| `CORE.EXACT_TOKEN_OCCURRENCE_RANK` | message, metadata | shared `FieldOccurrenceRank` over exact token hits grouped by field priority in `core.rs` |
 | `CORE.DENSITY` | message, metadata | `DensityRank` ratio and field-length ordering in `core.rs` |
 | `CORE.ORDER_VIOLATION_DISTANCE` | path, command history, message, metadata | shared `inversion_count` in `core.rs`; `ordered_token_span` uses it for field token positions and path typo uses it for token assignments |
 | `CORE.ORDERED_SPAN.GAP` | command history, message, metadata | total-gap half of `ordered_token_span` in `core.rs` |
@@ -256,31 +322,29 @@ Shared implementation cross-reference:
 | `CORE.KEY_ASC` | every adaptor | `compare_key_asc` in `core.rs` |
 | `RANKING.SEARCH_RANK` | metadata | shared provenance rank in `ranking.rs` |
 
-`CORE.EXACT_SUBPHRASE_COUNTS_VECTOR` counts proper contiguous exact
-query-token windows from one less than the full query length down to two tokens.
-The complete query is deliberately excluded because `CORE.EXACT_PHRASE_COUNT`
-already owns that evidence. For query `term1 term2 term3 term4`, a candidate
-containing the complete phrase once has vector `[2, 3]`: two three-token runs
-and three two-token runs. Vectors are compared lexicographically in descending
-order, so any advantage at a longer subphrase length wins before all shorter
-subphrase counts.
-
-Each element is the total occurrence count for every possible contiguous query
-subphrase of that length across all eligible candidate fields or path
-components. For query `a b c d`, the vector is conceptually:
+`CORE.EXACT_SUBPHRASE_COUNTS_VECTOR` counts how many distinct proper contiguous
+query-token subphrases are present at least once, from one less than the full
+query length down to two tokens. The complete query is deliberately excluded
+because `CORE.EXACT_PHRASE_PRESENT` already owns that evidence. For query
+`term1 term2 term3 term4`, the vector is conceptually:
 
 ```text
 [
-  count("a b c") + count("b c d"),
-  count("a b") + count("b c") + count("c d"),
+  present("term1 term2 term3") + present("term2 term3 term4"),
+  present("term1 term2") + present("term2 term3") + present("term3 term4"),
 ]
 ```
+
+Each `present(...)` value is either zero or one. Repeating the same subphrase
+ten times still contributes one; different query-position subphrases can each
+contribute one. The vector is compared lexicographically in descending order,
+so a longer phrase-run level always wins before shorter levels.
 
 It does not count one-token subphrases, non-contiguous combinations, reordered
 combinations, or typo/fuzzy matches. A phrase cannot cross a metadata field or
 path-component boundary. The adapter chooses the literal token predicate:
-metadata uses arbitrary substring matching, while path, message, and command
-history use token-prefix matching. Overlapping occurrences are counted.
+metadata and message use arbitrary substring matching, while path and command
+history use token-prefix matching.
 
 Queries shorter than three tokens produce an empty vector because they have no
 proper contiguous subphrase of at least two tokens.
@@ -293,23 +357,25 @@ that position; it does not by itself mean the adaptor is missing required policy
 
 | Order | `path::exact` | `path::typo` | `command_history` | `message` | `metadata` |
 | ---: | --- | --- | --- | --- | --- |
-| 1 | `[PATH.SEGMENT_VECTOR]` | `[PATH.MATCH_CLASS]` | `[CORE.EXACT_PHRASE_COUNT]` | `[CORE.EXACT_PHRASE_COUNT]` | `[CORE.EXACT_WHOLE_PHRASE_PRESENT]` |
-| 2 | `[CORE.POSITION_VECTOR_SIMPLE]` | `[CORE.EXACT_PHRASE_COUNT]` | `[CORE.EXACT_COVERAGE]` | `[CORE.EXACT_COVERAGE]` | `[CORE.EXACT_SUBPHRASE_COUNTS_VECTOR]` |
-| 3 | `[CORE.SCORE_DESC]` | `[CORE.EXACT_COVERAGE]` | `[CORE.EXACT_SUBPHRASE_COUNTS_VECTOR]` | `[CORE.EXACT_SUBPHRASE_COUNTS_VECTOR]` | `[METADATA.EXACT_COVERAGE_RANK]` |
-| 4 | `[CORE.INSERTION_VECTOR]` | `[CORE.EXACT_SUBPHRASE_COUNTS_VECTOR]` | `[COMMAND.TOTAL_COVERAGE]` | `[CORE.ORDER_VIOLATION_DISTANCE]` | `[METADATA.EXACT_FIELD_QUALITY]` |
-| 5 | `[PATH.DEPTH]` | `[CORE.TYPO_COST_VECTOR]` | `[COMMAND.FUZZY_SUBPHRASE_COUNTS_VECTOR]` | `[CORE.ORDERED_SPAN.GAP]` | `[METADATA.FUZZY_WHOLE_PHRASE]` |
-| 6 | `[CORE.KEY_ASC]` | `[CORE.ORDER_VIOLATION_DISTANCE]` | `[CORE.TYPO_COST_VECTOR]` | `[CORE.SATURATED_EXACT_QUERY_TOKEN_OCCURRENCE_TOTAL]` | `[METADATA.FUZZY_SUBPHRASE_COUNTS_VECTOR]` |
-| 7 | — | `[PATH.SEGMENT_VECTOR]` | `[CORE.INSERTION_VECTOR]` | `[CORE.DENSITY]` | `[METADATA.FUZZY_COVERAGE_RANK]` |
-| 8 | — | `[CORE.POSITION_VECTOR_SIMPLE]` | `[CORE.OPERATIONS]` | `[CORE.SCORE_DESC]` | `[METADATA.FUZZY_FIELD_QUALITY]` |
-| 9 | — | `[CORE.SCORE_DESC]` | `[CORE.ORDER_VIOLATION_DISTANCE]` | `[CORE.KEY_ASC]` | `[CORE.ORDER_VIOLATION_DISTANCE]` |
-| 10 | — | `[CORE.INSERTION_VECTOR]` | `[CORE.ORDERED_SPAN.GAP]` | — | `[CORE.ORDERED_SPAN.GAP]` |
-| 11 | — | `[PATH.DEPTH]` | `[CORE.SCORE_DESC]` | — | `[METADATA.TYPO_SEVERITY]` |
-| 12 | — | `[CORE.KEY_ASC]` | `[CORE.KEY_ASC]` | — | `[METADATA.EXACT_PHRASE_OCCURRENCE_RANK]` |
-| 13 | — | — | — | — | `[METADATA.EXACT_TOKEN_OCCURRENCE_RANK]` |
-| 14 | — | — | — | — | `[CORE.DENSITY]` |
-| 15 | — | — | — | — | `[CORE.SCORE_DESC]` |
-| 16 | — | — | — | — | `[RANKING.SEARCH_RANK]` |
-| 17 | — | — | — | — | `[CORE.KEY_ASC]` |
+| 1 | `[PATH.SEGMENT_VECTOR]` | `[CORE.EXACT_PHRASE_PRESENT]` | `[CORE.EXACT_PHRASE_PRESENT]` | `[CORE.EXACT_PHRASE_PRESENT]` | `[CORE.EXACT_PHRASE_PRESENT]` |
+| 2 | `[CORE.POSITION_VECTOR_SIMPLE]` | `[CORE.EXACT_SUBPHRASE_COUNTS_VECTOR]` | `[CORE.EXACT_COVERAGE]` | `[CORE.EXACT_SUBPHRASE_COUNTS_VECTOR]` | `[CORE.EXACT_SUBPHRASE_COUNTS_VECTOR]` |
+| 3 | `[CORE.SCORE_DESC]` | `[CORE.EXACT_COVERAGE]` | `[CORE.EXACT_SUBPHRASE_COUNTS_VECTOR]` | `[CORE.EXACT_COVERAGE_RANK]` | `[CORE.EXACT_COVERAGE_RANK]` |
+| 4 | `[CORE.INSERTION_VECTOR]` | `[CORE.TYPO_COST_VECTOR]` | `[COMMAND.TOTAL_COVERAGE]` | `[CORE.EXACT_FIELD_QUALITY]` | `[CORE.EXACT_FIELD_QUALITY]` |
+| 5 | `[PATH.DEPTH]` | `[CORE.ORDER_VIOLATION_DISTANCE]` | `[COMMAND.FUZZY_SUBPHRASE_COUNTS_VECTOR]` | `[CORE.ORDER_VIOLATION_DISTANCE]` | `[METADATA.FUZZY_WHOLE_PHRASE]` |
+| 6 | `[CORE.KEY_ASC]` | `[PATH.SEGMENT_VECTOR]` | `[CORE.TYPO_COST_VECTOR]` | `[CORE.ORDERED_SPAN.GAP]` | `[METADATA.FUZZY_SUBPHRASE_COUNTS_VECTOR]` |
+| 7 | — | `[CORE.POSITION_VECTOR_SIMPLE]` | `[CORE.INSERTION_VECTOR]` | `[CORE.EXACT_PHRASE_OCCURRENCE_RANK]` | `[METADATA.FUZZY_COVERAGE_RANK]` |
+| 8 | — | `[CORE.SCORE_DESC]` | `[CORE.OPERATIONS]` | `[CORE.EXACT_TOKEN_OCCURRENCE_RANK]` | `[METADATA.FUZZY_FIELD_QUALITY]` |
+| 9 | — | `[CORE.INSERTION_VECTOR]` | `[CORE.ORDER_VIOLATION_DISTANCE]` | `[CORE.DENSITY]` | `[CORE.TYPO_COST_VECTOR]` |
+| 10 | — | `[PATH.DEPTH]` | `[CORE.ORDERED_SPAN.GAP]` | `[CORE.SCORE_DESC]` | `[CORE.INSERTION_VECTOR]` |
+| 11 | — | `[CORE.KEY_ASC]` | `[CORE.SCORE_DESC]` | `[CORE.KEY_ASC]` | `[CORE.ORDER_VIOLATION_DISTANCE]` |
+| 12 | — | — | `[CORE.KEY_ASC]` | — | `[CORE.ORDERED_SPAN.GAP]` |
+| 13 | — | — | — | — | `[CORE.EXACT_PHRASE_OCCURRENCE_RANK]` |
+| 14 | — | — | — | — | `[CORE.EXACT_TOKEN_OCCURRENCE_RANK]` |
+| 15 | — | — | — | — | `[CORE.DENSITY]` |
+| 16 | — | — | — | — | `[CORE.SCORE_DESC]` |
+| 17 | — | — | — | — | `[RANKING.SEARCH_RANK]` |
+| 18 | — | — | — | — | `[CORE.KEY_ASC]` |
+| 19 | — | — | — | — | — |
 
 The matrix exposes both forms of reuse:
 
@@ -323,6 +389,19 @@ for diagnostics and provenance. Ranking sorts a copy from worst to best, giving
 `[2, 1, 0]`, and compares that vector lexicographically ascending. Query-token
 order therefore does not make an otherwise identical typo pattern rank
 differently. Exact coverage is compared before this vector.
+
+For path and fuzzy metadata typo matching, each token cost is:
+
+```text
+keyboard distance + (query-only deletions * 6)
+```
+
+Here `deletion` means a character present in the typed query but absent from the
+candidate, while `insertion` means a character present in the candidate but
+absent from the query. Candidate-side insertions are deliberately excluded from
+`CORE.TYPO_COST_VECTOR`; they are retained in `CORE.INSERTION_VECTOR` and used
+later as a low-priority noise tie-break. The raw Damerau distance still controls
+whether a candidate is admissible, but is not added as a separate sort key.
 
 `CORE.INSERTION_VECTOR` uses the same representation and comparison. For
 example, aligned insertions `[0, 4]` are retained for provenance and compared as
@@ -340,18 +419,22 @@ Shared implementation coverage, with each cell showing its sort position:
 
 | Shared implementation | `path::exact` | `path::typo` | `command_history` | `message` | `metadata` |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| `CORE.EXACT_PHRASE_COUNT` | — | 2 | 1 | 1 | through 1 and 12 |
-| `CORE.EXACT_SUBPHRASE_COUNTS_VECTOR` | — | 4 | 3 | 3 | 2 |
-| `CORE.EXACT_COVERAGE` | — | 3 | 2 | 2 | through 3 |
-| `CORE.SATURATED_EXACT_QUERY_TOKEN_OCCURRENCE_TOTAL` | — | — | — | 6 | — |
-| `CORE.ORDER_VIOLATION_DISTANCE` | — | 6 | 9 | 4 | 9 |
-| `CORE.ORDERED_SPAN.GAP` | — | — | 8 | 5 | 10 |
-| `CORE.DENSITY` | — | — | — | 7 | 14 |
-| `CORE.DISTANCE` | — | through 5 | through 6 | — | through 11 |
-| `CORE.OPERATIONS` | — | through 5 and 9 | 6 | — | through 11 |
+| `CORE.EXACT_PHRASE_PRESENT` | — | 1 | 1 | 1 | 1 |
+| `CORE.EXACT_PHRASE_OCCURRENCE_COUNT` | — | — | — | 7 | 13 |
+| `CORE.EXACT_PHRASE_OCCURRENCE_RANK` | — | — | — | 7 | 13 |
+| `CORE.EXACT_SUBPHRASE_COUNTS_VECTOR` | — | 2 | 3 | 2 | 2 |
+| `CORE.EXACT_COVERAGE_RANK` | — | — | — | 3 | 3 |
+| `CORE.EXACT_FIELD_QUALITY` | — | — | — | 4 | 4 |
+| `CORE.EXACT_TOKEN_OCCURRENCE_RANK` | — | — | — | 8 | 14 |
+| `CORE.ORDER_VIOLATION_DISTANCE` | — | 5 | 9 | 5 | 11 |
+| `CORE.ORDERED_SPAN.GAP` | — | — | 8 | 6 | 12 |
+| `CORE.DENSITY` | — | — | — | 9 | 15 |
+| `CORE.DISTANCE` | — | through 5 | through 6 | — | through 9 |
+| `CORE.OPERATIONS` | — | through 5 and 9 | 6 | — | through 9 and 10 |
+| `CORE.INSERTION_VECTOR` | — | 10 | 7 | — | 10 |
 | `CORE.RATIO` | — | — | — | — | internal `SearchRank` |
-| `CORE.SCORE_DESC` | 3 | 8 | 9 | 8 | 15 |
-| `CORE.KEY_ASC` | 6 | 11 | 10 | 9 | 17 |
+| `CORE.SCORE_DESC` | 3 | 8 | 11 | 10 | 16 |
+| `CORE.KEY_ASC` | 6 | 11 | 12 | 11 | 18 |
 
 `through N` means the shared primitive contributes to the named adaptor stage
 rather than appearing as an independent key. A dash makes an omitted shared
@@ -426,9 +509,9 @@ The exact-path helpers map to the same stage IDs:
 The segment vector is `[basename_count, parent_count, grandparent_count, ...]`. The position
 vector is `[whole_or_prefix_count, suffix_count, middle_substring_count]`. Both are
 compared lexicographically in descending order. Each matched query token increments exactly one
-entry in each vector. `insertions` is the
-contiguous unmatched character count around the matched keyword
-span(s) inside the chosen token/component. That makes `application` rank closer to `applications`
+entry in each vector. `insertions` is the candidate-only contiguous unmatched
+character count around the matched keyword span(s) inside the chosen
+token/component. That makes `application` rank closer to `applications`
 than to `applicationlauncher` after position and score have already been compared.
 
 Only the leading exact-path stages are materialized eagerly:
@@ -470,26 +553,42 @@ substitutions.
 token assignment. It lets an in-order zero-cost match beat an otherwise
 equivalent reversed match without charging token order as typo distance.
 
-All results use one shared twelve-stage `PathTypoSortKey` comparator from
-`ranking.rs`:
+The effective `path::typo` comparator is an eleven-stage pipeline. `PathMatch::compare`
+owns the first three stages, then delegates the remaining stages to the shared
+`PathTypoSortKey` comparator in `ranking.rs`:
 
-1. `[PATH.MATCH_CLASS]` match class: exact before typo
-2. `[CORE.EXACT_PHRASE_COUNT]` exact whole-query phrase presence, preferred, within one component; path saturates the shared count to a boolean
-3. `[CORE.EXACT_COVERAGE]` exact distinct query-token coverage, descending
-4. `[CORE.EXACT_SUBPHRASE_COUNTS_VECTOR]` exact proper contiguous query-token subphrase-count vector, descending and lexicographic
-5. `[CORE.TYPO_COST_VECTOR]` per-query-token weighted typo costs, worst cost first for comparison
-6. `[CORE.ORDER_DISTANCE]` query-to-candidate token assignment inversion count, ascending
-7. `[PATH.SEGMENT_VECTOR]` segment-count vector, descending and lexicographic
-8. `[CORE.POSITION_VECTOR_SIMPLE]` whole-or-prefix/suffix/middle count vector, descending and lexicographic
-9. `[CORE.SCORE_DESC]` descending `CALLER.SCORE`
-10. `[CORE.INSERTION_VECTOR]` per-query-token insertion counts, worst count first
-11. `[PATH.DEPTH]` `path_depth`
-12. `[CORE.KEY_ASC]` `key`
+1. `[CORE.EXACT_PHRASE_PRESENT]` exact whole-query phrase presence, preferred, within one component
+2. `[CORE.EXACT_SUBPHRASE_COUNTS_VECTOR]` exact proper contiguous query-token subphrase-presence vector, descending and lexicographic
+3. `[CORE.EXACT_COVERAGE]` exact distinct query-token coverage, descending; each distinct query token contributes one point regardless of whether it matches as a whole token, prefix, suffix, or arbitrary substring
+4. `[CORE.TYPO_COST_VECTOR]` per-query-token weighted typo costs, worst cost first for comparison
+5. `[CORE.ORDER_VIOLATION_DISTANCE]` query-to-candidate token assignment inversion count, ascending
+6. `[PATH.SEGMENT_VECTOR]` segment-count vector, descending and lexicographic
+7. `[CORE.POSITION_VECTOR_SIMPLE]` whole-or-prefix/suffix/middle count vector, descending and lexicographic
+8. `[CORE.SCORE_DESC]` descending `CALLER.SCORE`
+9. `[CORE.INSERTION_VECTOR]` per-query-token insertion counts, worst count first
+10. `[PATH.DEPTH]` `path_depth`
+11. `[CORE.KEY_ASC]` `key`
 
-Phrase and coverage stages use token-prefix exactness. Phrase windows never cross
-a path separator; distinct coverage may collect matches from multiple components.
+Phrase and subphrase stages use token-prefix exactness. Exact coverage uses
+arbitrary substring exactness, so whole-token, prefix, suffix, and internal
+substring matches each contribute one point. Phrase windows never cross a path
+separator; distinct coverage may collect matches from multiple components.
 Whole-phrase presence is boolean rather than an occurrence count because repeated
 directory names are not stronger path relevance evidence.
+
+Path typo matching does not use `has_query_signal` as a rejection gate. A cheap
+character-bigram heuristic can reject valid short Damerau matches such as
+`fuxxy` -> `fuzzy`, so path typo candidates are filtered by path/token length
+and the bounded edit-distance matcher instead. Command-history retains its
+separate signal prefilter because it searches a much larger history corpus.
+
+Path exact relevance is evaluated lazily. Each candidate first gets one cached
+exact-token signal probe using the same substring predicate as exact coverage.
+When neither side of a comparison has that signal, exact phrase,
+subphrase, and coverage stages are treated as zero and the comparator proceeds
+to typo cost. Candidates with exact-token evidence still use those stages in
+their documented order. This changes only when keys are calculated, not the
+sort order.
 
 Both branches are strict lexicographic pipelines. A subordinate key is compared
 only when all preceding keys are equal; it can never outweigh an earlier key.
@@ -499,23 +598,42 @@ Several typo values are outputs of the same Damerau-Levenshtein alignment. They
 are produced together and then consumed lazily by the comparator; running a new
 alignment for each key would add work without making the sort more selective.
 
-Therefore every exact path match ranks before every typo path match. Exact
-candidates bypass Damerau-Levenshtein and carry `exact = true` in `PathMatch`.
+`PathMatch.exact` is not a comparator stage. It is provenance indicating whether
+the candidate came from the exact path check, and it remains available to callers
+that need to partition exact candidates before requesting typo candidates. Exact
+candidates bypass Damerau-Levenshtein, but the unified `path::typo` comparator
+does not impose a separate exact-before-typo class; it ranks candidates through
+the shared exact-evidence and typo-quality stages above.
 
-Here path typo ranking splits the operation profile into two stages between raw edit count and path-specific position. It is directional:
+The debug CLI includes the inputs used by each stage. For path typo matches,
+`CORE.TYPO_COST_VECTOR` shows the worst-first cost vector, keyboard distance,
+query-only deletions, and its formula. `CORE.INSERTION_VECTOR` separately shows
+candidate-only insertions. Raw Damerau distance and normalized ratio are
+admission/provenance data rather than additional path sort keys. The `PathMatch`
+value in the result summary likewise includes internal/cache fields for
+inspection; it is not a second ordering.
 
-- candidate path token/component = intended text
+Path typo operation accounting is directional:
+
+- candidate path token/component = target text
 - query text = what the user actually typed
 
-So omitted separators/characters are treated as deletions from the intended candidate, while extra typed characters are treated as insertions into the typed query.
+So extra typed characters are reported as deletions from the query, while
+unmatched candidate characters are reported as insertions into the candidate.
+For example, `applaunch` against `applicationlauncher` has zero keyboard/deletion
+typo cost, one internal break, and ten candidate-side insertions. Likewise,
+`applicationlauncher` against `application launcher` has zero core typo cost and
+one candidate-side insertion for the space. The separate insertion vector
+records both cases and is intentionally lower priority than core typo cost.
 
-The path-specific comparator uses:
+The path-specific comparator uses the exact stages above, then:
 
-- weighted core typo cost for substitutions, deletions, and transpositions
-- then the segment vector, descending lexicographically: basename count, parent count, grandparent count, and so on
-- then the position vector, descending lexicographically: whole token or prefix, suffix, then middle substring
-- then descending caller `score`
-- then raw `insertions`, ascending, as a separate noise key
+- weighted core typo cost: keyboard distance plus six per query-only deletion
+- query-to-candidate order violation distance
+- the segment vector, descending lexicographically: basename count, parent count, grandparent count, and so on
+- the position vector, descending lexicographically: whole token or prefix, suffix, then middle substring
+- descending caller `score`
+- raw `insertions`, ascending, as a separate noise key
 
 For single-token contiguous substring matches that satisfy the normal path exact
 rules, `path::typo` takes the exact fast path instead of running
@@ -581,9 +699,9 @@ This is the adapter to use for shell command history search.
 
 The exact command-history sort key order is:
 
-1. `[CORE.EXACT_PHRASE_COUNT]` exact whole-phrase occurrence count
+1. `[CORE.EXACT_PHRASE_PRESENT]` whether the exact whole phrase occurs at least once
 2. `[CORE.EXACT_COVERAGE]` exact distinct query-token coverage
-3. `[CORE.EXACT_SUBPHRASE_COUNTS_VECTOR]` exact proper contiguous subphrase-count vector
+3. `[CORE.EXACT_SUBPHRASE_COUNTS_VECTOR]` exact proper contiguous subphrase-presence vector
 4. `[COMMAND.TOTAL_COVERAGE]` total exact-or-fuzzy query-token coverage
 5. `[COMMAND.FUZZY_SUBPHRASE_COUNTS_VECTOR]` fuzzy proper contiguous subphrase-count vector
 6. `[CORE.TYPO_COST_VECTOR]` per-query-token weighted typo costs, worst cost first for comparison
@@ -599,7 +717,7 @@ Where:
 - exact stages use shared token-prefix semantics
 - commands that do not recover every query token are rejected before sorting
 - fuzzy subphrase counts include only proper subphrases of at least two tokens
-- `operations` is the merged shared intended-to-typed typo-likelihood profile
+- `operations` is the merged shared candidate-to-query typo-likelihood profile
 - `typo_costs.aligned()` retains query order, while sorting uses `typo_costs.worst_first()`
 - order distance and total gap operate on exact-or-fuzzy token matches
 - `recency` is caller-provided and sorts descending
@@ -617,12 +735,15 @@ Purpose:
 - phrase-aware ordering for exact multi-token sequences
 - lightweight precomputation for repeated query evaluation
 
-This adapter is intended for message search where metadata-style exact phrase and
-coverage ranking are needed on a single text field, without typo handling.
+This adapter is intended for message search where metadata-style exact phrase,
+coverage, and field-priority ranking are needed without typo handling. A message
+candidate can expose fields such as chat title/message title at priority `0` and
+message name/body at priority `1` (lower numbers are stronger).
 
 It owns:
 
 - `MessageQuery`
+- `MessageField`
 - `MessageCandidate`
 - `PreparedMessageCandidate`
 - `MessageMatch`
@@ -631,43 +752,51 @@ It owns:
 It uses shared core from:
 
 - `text` for lowercasing and token splitting
+- the shared exact relevance primitives in `core`
 
 What is message-specific here:
 
-- applying the metadata exact-only relevance stack to one text field
+- applying the metadata exact-only relevance stack to prioritized message fields
 - omitting typo/fuzzy stages entirely
-- omitting field-quality stages because message search is single-field
+- retaining field quality and field-priority occurrence stages
 
-Message matching first prepares lowercased search tokens for the query and each candidate.
-Candidates that do not contain any usable query signal are rejected before sorting.
+Message matching first prepares lowercased search tokens for the query and each
+candidate field. Fields are tokenized independently, so phrases and spans cannot
+cross a field boundary. Candidates that do not contain any usable exact query
+signal are rejected before sorting. Exact matching uses arbitrary substring
+matching within a candidate token, just like metadata; it does not calculate
+fuzzy matches, edit distance, keyboard distance, or typo provenance.
 
 Final message result ordering is:
 
-1. `[CORE.EXACT_PHRASE_COUNT]` exact whole-phrase occurrence count
-2. `[CORE.EXACT_COVERAGE]` exact distinct query-token coverage
-3. `[CORE.EXACT_SUBPHRASE_COUNTS_VECTOR]` exact proper contiguous subphrase-count vector, lexicographic
-4. `[CORE.ORDER_VIOLATION_DISTANCE]` out-of-order distance across the query tokens that matched
-5. `[CORE.ORDERED_SPAN.GAP]` total positional gap across the query tokens that matched
-6. `[CORE.SATURATED_EXACT_QUERY_TOKEN_OCCURRENCE_TOTAL]` sum of exact query-token occurrences, capped at three per query token
-7. `[CORE.DENSITY]` density / low clutter
-8. `[CORE.SCORE_DESC]` descending `CALLER.SCORE`
-9. `[CORE.KEY_ASC]` `key`
+1. `[CORE.EXACT_PHRASE_PRESENT]` whether the exact whole phrase occurs at least once
+2. `[CORE.EXACT_SUBPHRASE_COUNTS_VECTOR]` exact proper contiguous subphrase-presence vector, lexicographic
+3. `[CORE.EXACT_COVERAGE_RANK]` weighted whole/prefix/suffix/substring coverage, then distinct coverage, then class counts
+4. `[CORE.EXACT_FIELD_QUALITY]` best field priority supplying literal match evidence
+5. `[CORE.ORDER_VIOLATION_DISTANCE]` out-of-order distance across the query tokens that matched
+6. `[CORE.ORDERED_SPAN.GAP]` total positional gap across the query tokens that matched
+7. `[CORE.EXACT_PHRASE_OCCURRENCE_RANK]` exact whole-phrase occurrence counts, compared by field priority and then count
+8. `[CORE.EXACT_TOKEN_OCCURRENCE_RANK]` exact query-token occurrence counts, compared by field priority and then count
+9. `[CORE.DENSITY]` density / low clutter
+10. `[CORE.SCORE_DESC]` descending `CALLER.SCORE`
+11. `[CORE.KEY_ASC]` `key`
 
 Where:
 
-- exact phrase stages use contiguous query-token windows matched by token-prefix exactness
-- exact distinct coverage counts how many different query tokens are matched exactly
+- exact phrase stages use contiguous query-token windows matched by literal substring exactness
+- exact coverage classifies each distinct query token as whole, prefix, suffix, or substring
+- field quality compares lower field priorities first, before field occurrence counts
 - order distance counts inversions among matched query tokens, including partial matches
 - total gap sums unmatched candidate-token positions between consecutive matched query tokens
-- repeated token bonus saturates at `3`
-- density prefers candidates where matched concepts occupy a larger fraction of a shorter message
+- phrase and token occurrence ranks are uncapped, but a stronger-priority field always wins first
+- density prefers candidates where matched concepts occupy a larger fraction of a shorter matching field
 
 This is the adapter to use for:
 
 - chat messages
 - notes or snippets
 - searchable conversation history
-- other single-text records where phrase continuity matters
+- other structured text records where phrase continuity and field priority matter
 
 ## `metadata.rs`
 
@@ -714,23 +843,24 @@ deterministic tie-breaks.
 
 Final metadata result ordering is:
 
-1. `[CORE.EXACT_WHOLE_PHRASE_PRESENT]` whether the whole exact query phrase occurs at least once
-2. `[CORE.EXACT_SUBPHRASE_COUNTS_VECTOR]` exact proper contiguous subphrase-count vector, descending and lexicographic
-3. `[METADATA.EXACT_COVERAGE_RANK]` weighted exact quality, then distinct coverage, then the whole/prefix/suffix/substring vector
-4. `[METADATA.EXACT_FIELD_QUALITY]` best field priority supplying literal match evidence
+1. `[CORE.EXACT_PHRASE_PRESENT]` whether the whole exact query phrase occurs at least once
+2. `[CORE.EXACT_SUBPHRASE_COUNTS_VECTOR]` exact proper contiguous subphrase-presence vector, descending and lexicographic
+3. `[CORE.EXACT_COVERAGE_RANK]` weighted exact quality, then distinct coverage, then the whole/prefix/suffix/substring vector
+4. `[CORE.EXACT_FIELD_QUALITY]` best field priority supplying literal match evidence
 5. `[METADATA.FUZZY_WHOLE_PHRASE]` whether a contiguous whole-query match containing at least one typo exists
 6. `[METADATA.FUZZY_SUBPHRASE_COUNTS_VECTOR]` fuzzy/typo proper contiguous subphrase-count vector through `TOKEN_MATCH`
 7. `[METADATA.FUZZY_COVERAGE_RANK]` weighted fuzzy quality, then distinct fuzzy coverage, then the whole/prefix/suffix/substring/fragmented vector
 8. `[METADATA.FUZZY_FIELD_QUALITY]` best field priority attached to a winning fuzzy token match
-9. `[CORE.ORDER_VIOLATION_DISTANCE]` out-of-order distance across the exact-or-fuzzy query tokens that matched
-10. `[CORE.ORDERED_SPAN.GAP]` total positional gap across the query tokens that matched
-11. `[METADATA.TYPO_SEVERITY]` `[CORE.TYPO_COST_VECTOR]`, typo position vector, then `[CORE.INSERTION_VECTOR]`
-12. `[METADATA.EXACT_PHRASE_OCCURRENCE_RANK]` exact whole-phrase occurrence counts, compared by field priority and then count
-13. `[METADATA.EXACT_TOKEN_OCCURRENCE_RANK]` exact query-token occurrence counts, compared by field priority and then count
-14. `[CORE.DENSITY]` density / low clutter
-15. `[CORE.SCORE_DESC]` descending `CALLER.SCORE`
-16. `[RANKING.SEARCH_RANK]` `SearchRank`
-17. `[CORE.KEY_ASC]` `key`
+9. `[CORE.TYPO_COST_VECTOR]` per-query-token weighted typo costs, worst cost first
+10. `[CORE.INSERTION_VECTOR]` per-query-token insertion counts, worst count first
+11. `[CORE.ORDER_VIOLATION_DISTANCE]` out-of-order distance across the exact-or-fuzzy query tokens that matched
+12. `[CORE.ORDERED_SPAN.GAP]` total positional gap across the query tokens that matched
+13. `[CORE.EXACT_PHRASE_OCCURRENCE_RANK]` exact whole-phrase occurrence counts, compared by field priority and then count
+14. `[CORE.EXACT_TOKEN_OCCURRENCE_RANK]` exact query-token occurrence counts, compared by field priority and then count
+15. `[CORE.DENSITY]` density / low clutter
+16. `[CORE.SCORE_DESC]` descending `CALLER.SCORE`
+17. `[RANKING.SEARCH_RANK]` `SearchRank`
+18. `[CORE.KEY_ASC]` `key`
 
 Where:
 
@@ -748,7 +878,7 @@ Where:
 - fuzzy whole phrase requires a full contiguous query-length token window and at least one fuzzy token; exact whole phrases remain stage 1
 - non-typo fuzzy matching and typo matching are token-level, not whole-field, and require shared token signal before edit-distance work runs
 - one- and two-character metadata queries only use exact/prefix-style matching; fuzzy and typo token matching start at three characters to keep early interactive search cheap
-- typo severity uses the shared intended-to-typed edit engine from `core.rs` and compares:
+- typo severity uses the shared candidate-to-query edit engine from `core.rs` and compares:
   - worst per-token core typo cost, then the next-worst, independent of query order
   - then summed per-token `position`
   - then the per-token insertion vector, worst count first
@@ -816,7 +946,8 @@ The crate does not currently share every ranking key end-to-end.
 
 What is fully shared:
 
-- predicate-driven exact phrase occurrence counting
+- predicate-driven exact phrase presence detection
+- predicate-driven raw exact phrase occurrence counting for later tie-breaks
 - predicate-driven exact phrase-run vectors
 - exact distinct token coverage
 - exact per-token occurrence counting
