@@ -1,29 +1,17 @@
-use std::cell::OnceCell;
 use std::sync::Arc;
 
 use crate::core::{
     InsertionVector, OperationProfile, TypoCostVector, bounded_damerau_levenshtein,
-    exact_distinct_coverage_by, exact_phrase_present, exact_subphrase_counts_vector,
-    increment_position_vector_simple, max_typos, position_vector_simple,
+    increment_simple_position_vector, max_typos, simple_position_vector,
 };
-use crate::path::Score;
 use crate::path::exact::{exact_match, match_penalties};
+use crate::path::{PathExactRelevance, Score};
 use crate::ranking::{PathTypoSortKey, compare_path_typo_sort_keys, path_typo_keys_are_ambiguous};
 use crate::text::{split_path_tokens, to_lowercase};
 use crate::token_match::{
     PositionedToken, aligned_token_distance, best_token_match, fragmented_token_match,
     partitioned_token_distance,
 };
-
-#[derive(Clone, Debug)]
-struct PathExactRelevance<'a> {
-    path: &'a str,
-    query_tokens: Arc<[String]>,
-    component_tokens: OnceCell<Vec<Vec<String>>>,
-    whole_phrase: OnceCell<bool>,
-    run_vector: OnceCell<Vec<usize>>,
-    distinct_coverage: OnceCell<usize>,
-}
 
 #[derive(Clone, Debug)]
 pub struct PathMatch<'a> {
@@ -480,7 +468,7 @@ fn candidate_for_text<'a>(
                     order_distance: 0,
                     ratio,
                     segment: segment_vector(path_position, 1),
-                    position: position_vector_simple([position_rank]),
+                    position: simple_position_vector([position_rank]),
                     operations: OperationProfile {
                         insertions,
                         ..OperationProfile::default()
@@ -523,7 +511,7 @@ fn candidate_for_text<'a>(
         order_distance: 0,
         ratio,
         segment: segment_vector(path_position, query_token_count),
-        position: position_vector_simple(std::iter::repeat_n(position_rank, query_token_count)),
+        position: simple_position_vector(std::iter::repeat_n(position_rank, query_token_count)),
         operations,
         typo_costs: TypoCostVector::new(vec![operations.core_typo_cost()]),
         insertions: InsertionVector::new(vec![operations.insertions]),
@@ -554,7 +542,7 @@ fn candidate_for_token_sequence<'a>(
         let (cost, penalty, position_rank, _, token_operations) =
             best_token_match(query_token, candidate_token, remaining)?;
         distance += cost;
-        increment_position_vector_simple(&mut position, position_rank, 1);
+        increment_simple_position_vector(&mut position, position_rank, 1);
         let _ = penalty;
         operations = operations.merge(token_operations);
         typo_costs.push(token_operations.core_typo_cost());
@@ -638,7 +626,7 @@ fn candidate_for_partitioned_single_query<'a>(
             order_distance: 0,
             ratio,
             segment: segment_vector(path_position, 1),
-            position: position_vector_simple([matched.position_rank]),
+            position: simple_position_vector([matched.position_rank]),
             operations: matched.operations,
             typo_costs: TypoCostVector::new(vec![matched.operations.core_typo_cost()]),
             insertions: InsertionVector::new(vec![matched.operations.insertions]),
@@ -659,7 +647,7 @@ fn candidate_for_partitioned_single_query<'a>(
         order_distance: 0,
         ratio,
         segment: segment_vector(path_position, 1),
-        position: position_vector_simple([matched.position_rank]),
+        position: simple_position_vector([matched.position_rank]),
         operations: matched.operations,
         typo_costs: TypoCostVector::new(vec![matched.operations.core_typo_cost()]),
         insertions: InsertionVector::new(vec![matched.operations.insertions]),
@@ -731,71 +719,6 @@ fn path_components(path: &str) -> Vec<&str> {
     path.split(['/', '\\'])
         .filter(|component| !component.is_empty())
         .collect()
-}
-
-impl<'a> PathExactRelevance<'a> {
-    fn new(path: &'a str, query_tokens: Arc<[String]>) -> Self {
-        Self {
-            path,
-            query_tokens,
-            component_tokens: OnceCell::new(),
-            whole_phrase: OnceCell::new(),
-            run_vector: OnceCell::new(),
-            distinct_coverage: OnceCell::new(),
-        }
-    }
-
-    fn component_tokens(&self) -> &[Vec<String>] {
-        self.component_tokens.get_or_init(|| {
-            path_components(&to_lowercase(self.path))
-                .into_iter()
-                .map(|component| {
-                    split_path_tokens(component)
-                        .into_iter()
-                        .map(str::to_string)
-                        .collect()
-                })
-                .collect()
-        })
-    }
-
-    fn has_exact_token_signal(&self) -> bool {
-        self.component_tokens().iter().any(|component| {
-            component.iter().any(|candidate| {
-                self.query_tokens
-                    .iter()
-                    .any(|query| candidate.contains(query))
-            })
-        })
-    }
-
-    fn whole_phrase(&self) -> bool {
-        *self.whole_phrase.get_or_init(|| {
-            exact_phrase_present(
-                &self.query_tokens,
-                self.component_tokens().iter().map(Vec::as_slice),
-            )
-        })
-    }
-
-    fn run_vector(&self) -> &[usize] {
-        self.run_vector.get_or_init(|| {
-            exact_subphrase_counts_vector(
-                &self.query_tokens,
-                self.component_tokens().iter().map(Vec::as_slice),
-            )
-        })
-    }
-
-    fn distinct_coverage(&self) -> usize {
-        *self.distinct_coverage.get_or_init(|| {
-            exact_distinct_coverage_by(
-                &self.query_tokens,
-                self.component_tokens().iter().map(Vec::as_slice),
-                |query, candidate| candidate.contains(query),
-            )
-        })
-    }
 }
 
 fn compare_exact_relevance(left: &PathMatch<'_>, right: &PathMatch<'_>) -> std::cmp::Ordering {

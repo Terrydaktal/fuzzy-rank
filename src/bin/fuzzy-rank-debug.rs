@@ -178,7 +178,7 @@ fn run_path(config: &Config, mode: PathMode) -> Result<DebugReport, String> {
             ),
         ),
         DebugStage::new(
-            "CORE.POSITION_VECTOR_SIMPLE",
+            "CORE.SIMPLE_POSITION_VECTOR",
             format!("{:?}\n[whole_or_prefix, suffix, middle]", matched.position),
         ),
         DebugStage::new("CORE.SCORE_DESC", matched.score.to_string()),
@@ -258,8 +258,8 @@ fn run_message(config: &Config) -> Result<DebugReport, String> {
             format!("{:?}", matched.exact_subphrase_counts_vector),
         ),
         DebugStage::new(
-            "CORE.EXACT_COVERAGE_RANK",
-            format_coverage_rank(&matched.exact_coverage_rank),
+            "CORE.EXACT_WEIGHTED_POSITIONAL_COVERAGE_VECTOR",
+            format_coverage_rank(&matched.exact_weighted_positional_coverage_vector),
         ),
         DebugStage::new(
             "CORE.EXACT_FIELD_QUALITY",

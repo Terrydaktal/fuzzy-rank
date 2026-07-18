@@ -46,7 +46,7 @@ pub struct MessageMatch<'a> {
     pub score: Score,
     pub exact_whole_phrase_present: bool,
     pub exact_subphrase_counts_vector: Vec<usize>,
-    pub exact_coverage_rank: CoverageRank,
+    pub exact_weighted_positional_coverage_vector: CoverageRank,
     pub exact_field_quality: u8,
     pub order_distance: usize,
     pub total_gap: usize,
@@ -118,7 +118,7 @@ impl MessageQuery {
         }
 
         let field_tokens = fields.iter().map(|field| field.tokens.as_slice());
-        let exact_coverage_rank = CoverageRank::new(
+        let exact_weighted_positional_coverage_vector = CoverageRank::new(
             position_vector(
                 self.tokens.iter().map(|query| {
                     fields
@@ -131,7 +131,7 @@ impl MessageQuery {
             ),
             &[4, 2, 2, 1],
         );
-        if exact_coverage_rank.distinct_coverage == 0 {
+        if exact_weighted_positional_coverage_vector.distinct_coverage == 0 {
             return None;
         }
 
@@ -184,7 +184,7 @@ impl MessageQuery {
                 )
             }));
         let density = DensityRank::new(
-            exact_coverage_rank.distinct_coverage,
+            exact_weighted_positional_coverage_vector.distinct_coverage,
             fields
                 .iter()
                 .filter(|field| {
@@ -204,7 +204,7 @@ impl MessageQuery {
             score,
             exact_whole_phrase_present,
             exact_subphrase_counts_vector,
-            exact_coverage_rank,
+            exact_weighted_positional_coverage_vector,
             exact_field_quality,
             order_distance,
             total_gap,
@@ -226,7 +226,10 @@ fn compare_matches(left: &MessageMatch<'_>, right: &MessageMatch<'_>) -> Orderin
             Reverse(&left.exact_subphrase_counts_vector)
                 .cmp(&Reverse(&right.exact_subphrase_counts_vector))
         })
-        .then_with(|| Reverse(&left.exact_coverage_rank).cmp(&Reverse(&right.exact_coverage_rank)))
+        .then_with(|| {
+            Reverse(&left.exact_weighted_positional_coverage_vector)
+                .cmp(&Reverse(&right.exact_weighted_positional_coverage_vector))
+        })
         .then_with(|| left.exact_field_quality.cmp(&right.exact_field_quality))
         .then_with(|| left.order_distance.cmp(&right.order_distance))
         .then_with(|| left.total_gap.cmp(&right.total_gap))
@@ -482,7 +485,12 @@ mod tests {
             .unwrap();
 
         assert!(!matched.exact_whole_phrase_present);
-        assert_eq!(matched.exact_coverage_rank.distinct_coverage, 2);
+        assert_eq!(
+            matched
+                .exact_weighted_positional_coverage_vector
+                .distinct_coverage,
+            2
+        );
     }
 
     #[test]

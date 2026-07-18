@@ -168,8 +168,10 @@ impl MetadataQuery {
                 format!("{:?}", relevance.get_exact_subphrase_counts_vector()),
             ),
             DebugStage::new(
-                "CORE.EXACT_COVERAGE_RANK",
-                Self::format_coverage_rank(relevance.get_exact_coverage_rank()),
+                "CORE.EXACT_WEIGHTED_POSITIONAL_COVERAGE_VECTOR",
+                Self::format_coverage_rank(
+                    relevance.get_exact_weighted_positional_coverage_vector(),
+                ),
             ),
             DebugStage::new(
                 "CORE.EXACT_FIELD_QUALITY",
@@ -184,8 +186,11 @@ impl MetadataQuery {
                 format!("{:?}", relevance.get_fuzzy_subphrase_counts_vector()),
             ),
             DebugStage::new(
-                "METADATA.FUZZY_COVERAGE_RANK",
-                format!("{:?}", relevance.get_fuzzy_coverage_rank()),
+                "METADATA.FUZZY_WEIGHTED_POSITIONAL_COVERAGE_VECTOR",
+                format!(
+                    "{:?}",
+                    relevance.get_fuzzy_weighted_positional_coverage_vector()
+                ),
             ),
             DebugStage::new(
                 "METADATA.FUZZY_FIELD_QUALITY",
@@ -428,8 +433,8 @@ struct LazyRelevance<'a> {
 
     exact_whole_phrase_present: OnceCell<bool>,
     exact_subphrase_counts_vector: OnceCell<Vec<usize>>,
-    exact_coverage_rank: OnceCell<CoverageRank>,
-    fuzzy_coverage_rank: OnceCell<CoverageRank>,
+    exact_weighted_positional_coverage_vector: OnceCell<CoverageRank>,
+    fuzzy_weighted_positional_coverage_vector: OnceCell<CoverageRank>,
     fuzzy_whole_phrase: OnceCell<bool>,
     fuzzy_subphrase_counts_vector: OnceCell<Vec<usize>>,
     fuzzy_best_matches: OnceCell<Vec<TokenMatch>>,
@@ -466,8 +471,8 @@ impl<'a> LazyRelevance<'a> {
             fields: normalized_fields,
             exact_whole_phrase_present: OnceCell::new(),
             exact_subphrase_counts_vector: OnceCell::new(),
-            exact_coverage_rank: OnceCell::new(),
-            fuzzy_coverage_rank: OnceCell::new(),
+            exact_weighted_positional_coverage_vector: OnceCell::new(),
+            fuzzy_weighted_positional_coverage_vector: OnceCell::new(),
             fuzzy_whole_phrase: OnceCell::new(),
             fuzzy_subphrase_counts_vector: OnceCell::new(),
             fuzzy_best_matches: OnceCell::new(),
@@ -510,33 +515,35 @@ impl<'a> LazyRelevance<'a> {
         })
     }
 
-    fn get_exact_coverage_rank(&self) -> &CoverageRank {
-        self.exact_coverage_rank.get_or_init(|| {
-            CoverageRank::new(
-                position_vector(
-                    self.query_tokens.iter().map(|query_token| {
-                        best_exact_token_scope(query_token, &self.fields)
-                            .map(|scope| scope as usize)
-                    }),
-                    4,
-                ),
-                &[4, 2, 2, 1],
-            )
-        })
+    fn get_exact_weighted_positional_coverage_vector(&self) -> &CoverageRank {
+        self.exact_weighted_positional_coverage_vector
+            .get_or_init(|| {
+                CoverageRank::new(
+                    position_vector(
+                        self.query_tokens.iter().map(|query_token| {
+                            best_exact_token_scope(query_token, &self.fields)
+                                .map(|scope| scope as usize)
+                        }),
+                        4,
+                    ),
+                    &[4, 2, 2, 1],
+                )
+            })
     }
 
-    fn get_fuzzy_coverage_rank(&self) -> &CoverageRank {
-        self.fuzzy_coverage_rank.get_or_init(|| {
-            let matches = self.fuzzy_best_matches.get_or_init(|| {
-                self.query_tokens
-                    .iter()
-                    .map(|query_token| {
-                        best_fuzzy_token_match(query_token, &self.fields, self.allow_typo)
-                    })
-                    .collect()
-            });
-            CoverageRank::new(metadata_fuzzy_coverage_vector(matches), &[4, 2, 2, 1, 1])
-        })
+    fn get_fuzzy_weighted_positional_coverage_vector(&self) -> &CoverageRank {
+        self.fuzzy_weighted_positional_coverage_vector
+            .get_or_init(|| {
+                let matches = self.fuzzy_best_matches.get_or_init(|| {
+                    self.query_tokens
+                        .iter()
+                        .map(|query_token| {
+                            best_fuzzy_token_match(query_token, &self.fields, self.allow_typo)
+                        })
+                        .collect()
+                });
+                CoverageRank::new(metadata_fuzzy_coverage_vector(matches), &[4, 2, 2, 1, 1])
+            })
     }
 
     fn get_fuzzy_whole_phrase(&self) -> bool {
@@ -694,12 +701,22 @@ impl<'a> LazyRelevance<'a> {
             })
             .then_with(|| {
                 other
-                    .get_exact_coverage_rank()
-                    .cmp(self.get_exact_coverage_rank())
+                    .get_exact_weighted_positional_coverage_vector()
+                    .cmp(self.get_exact_weighted_positional_coverage_vector())
             })
             .then_with(|| {
                 self.get_exact_field_quality()
                     .cmp(&other.get_exact_field_quality())
+            })
+            .then_with(|| {
+                other
+                    .get_exact_phrase_occurrence_rank()
+                    .cmp(self.get_exact_phrase_occurrence_rank())
+            })
+            .then_with(|| {
+                other
+                    .get_exact_token_occurrence_rank()
+                    .cmp(self.get_exact_token_occurrence_rank())
             })
             .then_with(|| {
                 other
@@ -713,8 +730,8 @@ impl<'a> LazyRelevance<'a> {
             })
             .then_with(|| {
                 other
-                    .get_fuzzy_coverage_rank()
-                    .cmp(self.get_fuzzy_coverage_rank())
+                    .get_fuzzy_weighted_positional_coverage_vector()
+                    .cmp(self.get_fuzzy_weighted_positional_coverage_vector())
             })
             .then_with(|| {
                 self.get_fuzzy_field_quality()
@@ -730,16 +747,6 @@ impl<'a> LazyRelevance<'a> {
             })
             .then_with(|| self.get_order_distance().cmp(&other.get_order_distance()))
             .then_with(|| self.get_total_gap().cmp(&other.get_total_gap()))
-            .then_with(|| {
-                other
-                    .get_exact_phrase_occurrence_rank()
-                    .cmp(self.get_exact_phrase_occurrence_rank())
-            })
-            .then_with(|| {
-                other
-                    .get_exact_token_occurrence_rank()
-                    .cmp(self.get_exact_token_occurrence_rank())
-            })
             .then_with(|| self.get_density_rank().cmp(&other.get_density_rank()))
     }
 }
@@ -788,9 +795,9 @@ fn insertion_vector(matches: &[TokenMatch]) -> InsertionVector {
 struct MetadataRelevanceRank {
     exact_whole_phrase_present: bool,
     exact_subphrase_counts_vector: Vec<usize>,
-    exact_coverage_rank: CoverageRank,
+    exact_weighted_positional_coverage_vector: CoverageRank,
     exact_field_quality: u8,
-    fuzzy_coverage_rank: CoverageRank,
+    fuzzy_weighted_positional_coverage_vector: CoverageRank,
     fuzzy_whole_phrase: bool,
     fuzzy_subphrase_counts_vector: Vec<usize>,
     fuzzy_field_quality: u8,
@@ -812,22 +819,10 @@ impl Ord for MetadataRelevanceRank {
                     .cmp(&Reverse(&other.exact_subphrase_counts_vector))
             })
             .then_with(|| {
-                Reverse(&self.exact_coverage_rank).cmp(&Reverse(&other.exact_coverage_rank))
+                Reverse(&self.exact_weighted_positional_coverage_vector)
+                    .cmp(&Reverse(&other.exact_weighted_positional_coverage_vector))
             })
             .then_with(|| self.exact_field_quality.cmp(&other.exact_field_quality))
-            .then_with(|| Reverse(self.fuzzy_whole_phrase).cmp(&Reverse(other.fuzzy_whole_phrase)))
-            .then_with(|| {
-                Reverse(&self.fuzzy_subphrase_counts_vector)
-                    .cmp(&Reverse(&other.fuzzy_subphrase_counts_vector))
-            })
-            .then_with(|| {
-                Reverse(&self.fuzzy_coverage_rank).cmp(&Reverse(&other.fuzzy_coverage_rank))
-            })
-            .then_with(|| self.fuzzy_field_quality.cmp(&other.fuzzy_field_quality))
-            .then_with(|| self.typo_cost_vector.cmp(&other.typo_cost_vector))
-            .then_with(|| self.insertion_vector.cmp(&other.insertion_vector))
-            .then_with(|| self.order_distance.cmp(&other.order_distance))
-            .then_with(|| self.total_gap.cmp(&other.total_gap))
             .then_with(|| {
                 Reverse(&self.exact_phrase_occurrence_rank)
                     .cmp(&Reverse(&other.exact_phrase_occurrence_rank))
@@ -836,6 +831,20 @@ impl Ord for MetadataRelevanceRank {
                 Reverse(&self.exact_token_occurrence_rank)
                     .cmp(&Reverse(&other.exact_token_occurrence_rank))
             })
+            .then_with(|| Reverse(self.fuzzy_whole_phrase).cmp(&Reverse(other.fuzzy_whole_phrase)))
+            .then_with(|| {
+                Reverse(&self.fuzzy_subphrase_counts_vector)
+                    .cmp(&Reverse(&other.fuzzy_subphrase_counts_vector))
+            })
+            .then_with(|| {
+                Reverse(&self.fuzzy_weighted_positional_coverage_vector)
+                    .cmp(&Reverse(&other.fuzzy_weighted_positional_coverage_vector))
+            })
+            .then_with(|| self.fuzzy_field_quality.cmp(&other.fuzzy_field_quality))
+            .then_with(|| self.typo_cost_vector.cmp(&other.typo_cost_vector))
+            .then_with(|| self.insertion_vector.cmp(&other.insertion_vector))
+            .then_with(|| self.order_distance.cmp(&other.order_distance))
+            .then_with(|| self.total_gap.cmp(&other.total_gap))
             .then_with(|| self.density.cmp(&other.density))
     }
 }
@@ -937,9 +946,9 @@ fn metadata_relevance_rank(
         return MetadataRelevanceRank {
             exact_whole_phrase_present: false,
             exact_subphrase_counts_vector: Vec::new(),
-            exact_coverage_rank: CoverageRank::default(),
+            exact_weighted_positional_coverage_vector: CoverageRank::default(),
             exact_field_quality: u8::MAX,
-            fuzzy_coverage_rank: CoverageRank::default(),
+            fuzzy_weighted_positional_coverage_vector: CoverageRank::default(),
             fuzzy_whole_phrase: false,
             fuzzy_subphrase_counts_vector: Vec::new(),
             fuzzy_field_quality: u8::MAX,
@@ -975,7 +984,7 @@ fn metadata_relevance_rank(
     );
     let fuzzy_subphrase_counts_vector =
         fuzzy_subphrase_counts_vector(query_tokens, &normalized_fields);
-    let exact_coverage_rank = CoverageRank::new(
+    let exact_weighted_positional_coverage_vector = CoverageRank::new(
         position_vector(
             query_tokens.iter().map(|query_token| {
                 best_exact_token_scope(query_token, &normalized_fields).map(|scope| scope as usize)
@@ -984,7 +993,7 @@ fn metadata_relevance_rank(
         ),
         &[4, 2, 2, 1],
     );
-    let fuzzy_coverage_rank = CoverageRank::new(
+    let fuzzy_weighted_positional_coverage_vector = CoverageRank::new(
         metadata_fuzzy_coverage_vector(&fuzzy_best_matches),
         &[4, 2, 2, 1, 1],
     );
@@ -1029,9 +1038,9 @@ fn metadata_relevance_rank(
     MetadataRelevanceRank {
         exact_whole_phrase_present,
         exact_subphrase_counts_vector,
-        exact_coverage_rank,
+        exact_weighted_positional_coverage_vector,
         exact_field_quality,
-        fuzzy_coverage_rank,
+        fuzzy_weighted_positional_coverage_vector,
         fuzzy_whole_phrase,
         fuzzy_subphrase_counts_vector,
         fuzzy_field_quality,

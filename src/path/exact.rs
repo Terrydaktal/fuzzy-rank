@@ -1,8 +1,9 @@
 use std::path;
 
 use crate::core::{
-    InsertionVector, compare_key_asc, compare_score_desc, increment_position_vector_simple,
+    InsertionVector, compare_key_asc, compare_score_desc, increment_simple_position_vector,
 };
+use crate::path::PathExactRelevance;
 use crate::text::to_lowercase;
 
 pub type Score = f64;
@@ -22,6 +23,7 @@ pub struct ExactPathMatch<'a> {
     pub segment: Vec<usize>,
     pub position: [usize; 3],
     pub insertions: InsertionVector,
+    exact_relevance: PathExactRelevance<'a>,
 }
 
 pub fn exact_match<'a>(
@@ -35,6 +37,10 @@ pub fn exact_match<'a>(
         segment: match_path_segment(path, keywords)?,
         position: match_path_position(path, keywords)?,
         insertions: InsertionVector::new(match_penalties(path, keywords)?),
+        exact_relevance: PathExactRelevance::new(
+            path,
+            keywords.iter().cloned().collect::<Vec<_>>().into(),
+        ),
     })
 }
 
@@ -44,8 +50,22 @@ pub fn compare_exact_path_matches(
     _keywords: &[String],
 ) -> std::cmp::Ordering {
     right
-        .segment
-        .cmp(&left.segment)
+        .exact_relevance
+        .whole_phrase()
+        .cmp(&left.exact_relevance.whole_phrase())
+        .then_with(|| {
+            right
+                .exact_relevance
+                .run_vector()
+                .cmp(left.exact_relevance.run_vector())
+        })
+        .then_with(|| {
+            right
+                .exact_relevance
+                .distinct_coverage()
+                .cmp(&left.exact_relevance.distinct_coverage())
+        })
+        .then_with(|| right.segment.cmp(&left.segment))
         .then_with(|| right.position.cmp(&left.position))
         .then_with(|| compare_score_desc(left.score, right.score))
         .then_with(|| left.insertions.cmp(&right.insertions))
@@ -124,7 +144,7 @@ pub fn match_path_position(path: &str, keywords: &[String]) -> Option<[usize; 3]
     if search[idx + keywords_last.len()..].contains(path::is_separator) {
         return None;
     }
-    increment_position_vector_simple(
+    increment_simple_position_vector(
         &mut position,
         position_rank(&full_path, idx, keywords_last.len()),
         1,
@@ -133,7 +153,7 @@ pub fn match_path_position(path: &str, keywords: &[String]) -> Option<[usize; 3]
 
     for keyword in keywords.iter().rev() {
         let idx = search.rfind(keyword)?;
-        increment_position_vector_simple(
+        increment_simple_position_vector(
             &mut position,
             position_rank(&full_path, idx, keyword.len()),
             1,
@@ -267,8 +287,26 @@ mod tests {
     }
 
     #[test]
-    fn compare_exact_path_matches_prefers_segment_then_position_then_score_then_insertions_then_path_depth()
-     {
+    fn exact_relevance_precedes_path_specific_ties() {
+        let keywords = ["app", "launch", "target"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let phrase = exact_match("/home/app-launch-target", &keywords, 1.0).unwrap();
+        let compact = exact_match("/home/applaunchtarget", &keywords, 100.0).unwrap();
+
+        assert!(phrase.exact_relevance.whole_phrase());
+        assert_eq!(phrase.exact_relevance.run_vector(), &[2]);
+        assert_eq!(phrase.exact_relevance.distinct_coverage(), 3);
+        assert_eq!(compact.exact_relevance.distinct_coverage(), 3);
+        assert_eq!(
+            compare_exact_path_matches(&phrase, &compact, &keywords),
+            std::cmp::Ordering::Less
+        );
+    }
+
+    #[test]
+    fn compare_exact_path_matches_prefers_exact_relevance_then_path_specific_ties() {
         let keywords = ["tasks", "onfig"];
         let keywords = keywords.into_iter().map(str::to_string).collect::<Vec<_>>();
         let lower_insertions = exact_match("/home/lewis/tasks/config", &keywords, 10.0).unwrap();
@@ -281,6 +319,7 @@ mod tests {
             segment: lower_insertions.segment.clone(),
             position: [0, 0, 2],
             insertions: lower_insertions.insertions.clone(),
+            exact_relevance: lower_insertions.exact_relevance.clone(),
         };
         let worse_segment = ExactPathMatch {
             path: "/home/lewis/tasks/config",
@@ -288,6 +327,7 @@ mod tests {
             segment: vec![0, 2],
             position: lower_insertions.position,
             insertions: lower_insertions.insertions.clone(),
+            exact_relevance: lower_insertions.exact_relevance.clone(),
         };
 
         assert_eq!(

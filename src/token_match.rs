@@ -1,5 +1,5 @@
 use crate::core::{
-    OperationProfile, bounded_damerau_levenshtein, increment_position_vector_simple,
+    OperationProfile, bounded_damerau_levenshtein, increment_simple_position_vector,
     inversion_count, max_typos,
 };
 
@@ -150,7 +150,7 @@ pub fn aligned_token_distance(
                     segment.resize(candidate.segment + 1, 0);
                 }
                 segment[candidate.segment] += 1;
-                increment_position_vector_simple(&mut position, position_rank, 1);
+                increment_simple_position_vector(&mut position, position_rank, 1);
                 internal_breaks += token_internal_breaks;
                 structure += penalty;
                 operations = operations.merge(token_operations);
@@ -326,7 +326,7 @@ fn partitioned_token_distance_impl(
         }
 
         let mut position = [0; 3];
-        increment_position_vector_simple(&mut position, position_rank, 1);
+        increment_simple_position_vector(&mut position, position_rank, 1);
         let total = if last_token {
             (
                 cost,

@@ -100,10 +100,10 @@ pub fn position_vector(
     vector
 }
 
-pub fn position_vector_simple(classes: impl IntoIterator<Item = usize>) -> [usize; 3] {
+pub fn simple_position_vector(classes: impl IntoIterator<Item = usize>) -> [usize; 3] {
     let mut vector = [0; 3];
     for class in classes {
-        increment_position_vector_simple(&mut vector, class, 1);
+        increment_simple_position_vector(&mut vector, class, 1);
     }
     vector
 }
@@ -124,7 +124,7 @@ pub fn exact_token_position(query: &str, candidate: &str) -> Option<usize> {
     }
 }
 
-pub fn increment_position_vector_simple(vector: &mut [usize; 3], class: usize, count: usize) {
+pub fn increment_simple_position_vector(vector: &mut [usize; 3], class: usize, count: usize) {
     vector[class.min(2)] += count;
 }
 
@@ -835,7 +835,7 @@ mod tests {
 
     #[test]
     fn shared_position_vectors_support_simple_and_configurable_class_maps() {
-        assert_eq!(position_vector_simple([0, 0, 1, 2]), [2, 1, 1]);
+        assert_eq!(simple_position_vector([0, 0, 1, 2]), [2, 1, 1]);
         assert_eq!(
             position_vector([Some(0), Some(1), Some(3), None], 4),
             [1, 1, 0, 1]
