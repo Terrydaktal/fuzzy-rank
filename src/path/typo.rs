@@ -4,8 +4,8 @@ use crate::core::{
     InsertionVector, OperationProfile, TypoCostVector, bounded_damerau_levenshtein,
     increment_simple_position_vector, max_typos, simple_position_vector,
 };
-use crate::path::exact::{exact_match, match_penalties};
-use crate::path::{PathExactRelevance, Score};
+use crate::path::exact::exact_match_with_query_tokens;
+use crate::path::{PathExactRelevance, Score, normalize_path};
 use crate::ranking::{PathTypoSortKey, compare_path_typo_sort_keys, path_typo_keys_are_ambiguous};
 use crate::text::{split_path_tokens, to_lowercase};
 use crate::token_match::{
@@ -67,6 +67,12 @@ impl<'a> PathMatch<'a> {
             .map_or(0, PathExactRelevance::distinct_coverage)
     }
 
+    pub fn ordered_compound_coverage(&self) -> usize {
+        self.exact_relevance
+            .as_ref()
+            .map_or(0, PathExactRelevance::ordered_compound_coverage)
+    }
+
     fn has_exact_token_signal(&self) -> bool {
         self.exact_relevance
             .as_ref()
@@ -114,7 +120,6 @@ impl TypoQuery {
     /// Matches only the exact path class without evaluating typo distance.
     pub fn best_exact_match<'a>(&self, path: &'a str, score: Score) -> Option<PathMatch<'a>> {
         exact_path_match(path, score, self)
-            .map(|candidate| with_exact_relevance(candidate, Arc::clone(&self.keywords)))
     }
 
     /// Matches only the typo path class without repeating the exact check.
@@ -171,7 +176,11 @@ fn best_match_with_query<'a>(
         }
         None => return None,
     };
-    Some(with_exact_relevance(candidate, Arc::clone(&query.keywords)))
+    Some(if candidate.exact_relevance.is_some() {
+        candidate
+    } else {
+        with_exact_relevance(candidate, Arc::clone(&query.keywords))
+    })
 }
 
 fn best_basename_match_with_query<'a>(
@@ -191,7 +200,11 @@ fn best_basename_match_with_query<'a>(
         )?,
         None => return None,
     };
-    Some(with_exact_relevance(candidate, Arc::clone(&query.keywords)))
+    Some(if candidate.exact_relevance.is_some() {
+        candidate
+    } else {
+        with_exact_relevance(candidate, Arc::clone(&query.keywords))
+    })
 }
 
 fn with_exact_relevance<'a>(
@@ -203,8 +216,8 @@ fn with_exact_relevance<'a>(
 }
 
 fn exact_path_match<'a>(path: &'a str, score: Score, query: &TypoQuery) -> Option<PathMatch<'a>> {
-    let matched = exact_match(path, &query.keywords, score)?;
-    let insertion_costs = match_penalties(path, &query.keywords)?;
+    let matched = exact_match_with_query_tokens(path, Arc::clone(&query.keywords), score)?;
+    let insertion_costs = matched.insertions.aligned().to_vec();
     let insertions = insertion_costs.iter().sum();
     Some(PathMatch {
         path,
@@ -221,7 +234,7 @@ fn exact_path_match<'a>(path: &'a str, score: Score, query: &TypoQuery) -> Optio
         typo_costs: TypoCostVector::new(vec![0; query.keywords.len()]),
         insertions: InsertionVector::new(insertion_costs),
         score,
-        exact_relevance: None,
+        exact_relevance: Some(matched.exact_relevance),
     })
 }
 
@@ -238,7 +251,7 @@ fn best_match_inner<'a>(
     query_len: usize,
     limit: usize,
 ) -> Option<PathMatch<'a>> {
-    let lower_path = to_lowercase(path);
+    let lower_path = normalize_path(path);
     let components = path_components(&lower_path);
     if components.is_empty() {
         return None;
@@ -313,7 +326,7 @@ fn best_basename_match_inner<'a>(
     limit: usize,
     full_limit: usize,
 ) -> Option<PathMatch<'a>> {
-    let lower_path = to_lowercase(path);
+    let lower_path = normalize_path(path);
     let components = path_components(&lower_path);
     if components.is_empty() {
         return None;
@@ -742,6 +755,11 @@ fn compare_exact_relevance(left: &PathMatch<'_>, right: &PathMatch<'_>) -> std::
                 .exact_distinct_coverage()
                 .cmp(&left.exact_distinct_coverage())
         })
+        .then_with(|| {
+            right
+                .ordered_compound_coverage()
+                .cmp(&left.ordered_compound_coverage())
+        })
 }
 
 fn token_relative_match_shape(
@@ -802,6 +820,34 @@ mod tests {
         let candidate = best_match("/home/lewis/applicationlauncher", 10.0, "applaunch").unwrap();
         assert_eq!(candidate.operations.core_typo_cost(), 0);
         assert_eq!(candidate.operations.insertions, 10);
+    }
+
+    #[test]
+    fn compact_query_token_matches_ordered_path_tokens_without_typo_cost() {
+        let candidate = best_match(
+            "/home/lewis/repos/gemini-cli/packages/core/dist/docs/cli/using-agent-skills.md",
+            10.0,
+            "geminipackages",
+        )
+        .unwrap();
+
+        assert!(candidate.exact);
+        assert_eq!(candidate.exact_distinct_coverage(), 0);
+        assert_eq!(candidate.ordered_compound_coverage(), 1);
+        assert_eq!(candidate.typo_costs.aligned(), [0]);
+        assert_eq!(candidate.insertions.aligned(), [5]);
+    }
+
+    #[test]
+    fn trailing_separator_does_not_demote_an_exact_basename() {
+        let mut matches = [
+            best_match("/home/lewis/Dev/wordelites/.codex", 0.0, "codex").unwrap(),
+            best_match("/home/lewis/.codex/", 0.0, "codex").unwrap(),
+        ];
+        sort_matches(&mut matches);
+
+        assert_eq!(matches[0].path, "/home/lewis/.codex/");
+        assert_eq!(matches[0].segment, [1]);
     }
 
     #[test]

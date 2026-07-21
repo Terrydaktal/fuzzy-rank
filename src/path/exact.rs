@@ -1,10 +1,7 @@
-use std::path;
+use std::sync::Arc;
 
-use crate::core::{
-    InsertionVector, compare_key_asc, compare_score_desc, increment_simple_position_vector,
-};
-use crate::path::PathExactRelevance;
-use crate::text::to_lowercase;
+use crate::core::{InsertionVector, compare_key_asc, compare_score_desc};
+use crate::path::{PathExactRelevance, normalize_path, ordered_path_evidence, path_depth};
 
 pub type Score = f64;
 
@@ -23,7 +20,7 @@ pub struct ExactPathMatch<'a> {
     pub segment: Vec<usize>,
     pub position: [usize; 3],
     pub insertions: InsertionVector,
-    exact_relevance: PathExactRelevance<'a>,
+    pub(crate) exact_relevance: PathExactRelevance<'a>,
 }
 
 pub fn exact_match<'a>(
@@ -31,16 +28,30 @@ pub fn exact_match<'a>(
     keywords: &[String],
     score: Score,
 ) -> Option<ExactPathMatch<'a>> {
+    exact_match_with_query_tokens(
+        path,
+        keywords.iter().cloned().collect::<Vec<_>>().into(),
+        score,
+    )
+}
+
+pub(crate) fn exact_match_with_query_tokens<'a>(
+    path: &'a str,
+    keywords: Arc<[String]>,
+    score: Score,
+) -> Option<ExactPathMatch<'a>> {
+    let normalized_path: Arc<str> = normalize_path(path).into();
+    let evidence = ordered_path_evidence(&normalized_path, &keywords)?;
+    let exact_relevance = PathExactRelevance::with_normalized_path(path, normalized_path, keywords)
+        .with_ordered_compound_coverage(evidence.ordered_compound_coverage);
+
     Some(ExactPathMatch {
         path,
         score,
-        segment: match_path_segment(path, keywords)?,
-        position: match_path_position(path, keywords)?,
-        insertions: InsertionVector::new(match_penalties(path, keywords)?),
-        exact_relevance: PathExactRelevance::new(
-            path,
-            keywords.iter().cloned().collect::<Vec<_>>().into(),
-        ),
+        segment: evidence.segment,
+        position: evidence.position,
+        insertions: InsertionVector::new(evidence.insertions),
+        exact_relevance,
     })
 }
 
@@ -65,6 +76,12 @@ pub fn compare_exact_path_matches(
                 .distinct_coverage()
                 .cmp(&left.exact_relevance.distinct_coverage())
         })
+        .then_with(|| {
+            right
+                .exact_relevance
+                .ordered_compound_coverage()
+                .cmp(&left.exact_relevance.ordered_compound_coverage())
+        })
         .then_with(|| right.segment.cmp(&left.segment))
         .then_with(|| right.position.cmp(&left.position))
         .then_with(|| compare_score_desc(left.score, right.score))
@@ -78,90 +95,18 @@ pub fn match_penalty(path: &str, keywords: &[String]) -> Option<usize> {
 }
 
 pub fn match_penalties(path: &str, keywords: &[String]) -> Option<Vec<usize>> {
-    let (keywords_last, keywords) = match keywords.split_last() {
-        Some(split) => split,
-        None => return Some(Vec::new()),
-    };
-
-    let path = to_lowercase(path);
-    let mut path = path.as_str();
-    let mut penalties = Vec::with_capacity(keywords.len() + 1);
-
-    let idx = path.rfind(keywords_last)?;
-    if path[idx + keywords_last.len()..].contains(path::is_separator) {
-        return None;
-    }
-    penalties.push(match_position_penalty(path, idx, keywords_last.len()));
-    path = &path[..idx];
-
-    for keyword in keywords.iter().rev() {
-        let idx = path.rfind(keyword)?;
-        penalties.push(match_position_penalty(path, idx, keyword.len()));
-        path = &path[..idx];
-    }
-
-    penalties.reverse();
-    Some(penalties)
+    let path = normalize_path(path);
+    Some(ordered_path_evidence(&path, keywords)?.insertions)
 }
 
 pub fn match_path_segment(path: &str, keywords: &[String]) -> Option<Vec<usize>> {
-    let (keywords_last, keywords) = match keywords.split_last() {
-        Some(split) => split,
-        None => return Some(Vec::new()),
-    };
-
-    let full_path = to_lowercase(path);
-    let mut search = full_path.as_str();
-    let mut segment = Vec::new();
-
-    let idx = search.rfind(keywords_last)?;
-    if search[idx + keywords_last.len()..].contains(path::is_separator) {
-        return None;
-    }
-    increment(&mut segment, path_segment_class(&full_path, idx));
-    search = &search[..idx];
-
-    for keyword in keywords.iter().rev() {
-        let idx = search.rfind(keyword)?;
-        increment(&mut segment, path_segment_class(&full_path, idx));
-        search = &search[..idx];
-    }
-
-    Some(segment)
+    let path = normalize_path(path);
+    Some(ordered_path_evidence(&path, keywords)?.segment)
 }
 
 pub fn match_path_position(path: &str, keywords: &[String]) -> Option<[usize; 3]> {
-    let (keywords_last, keywords) = match keywords.split_last() {
-        Some(split) => split,
-        None => return Some([0; 3]),
-    };
-
-    let full_path = to_lowercase(path);
-    let mut search = full_path.as_str();
-    let mut position = [0; 3];
-
-    let idx = search.rfind(keywords_last)?;
-    if search[idx + keywords_last.len()..].contains(path::is_separator) {
-        return None;
-    }
-    increment_simple_position_vector(
-        &mut position,
-        position_rank(&full_path, idx, keywords_last.len()),
-        1,
-    );
-    search = &search[..idx];
-
-    for keyword in keywords.iter().rev() {
-        let idx = search.rfind(keyword)?;
-        increment_simple_position_vector(
-            &mut position,
-            position_rank(&full_path, idx, keyword.len()),
-            1,
-        );
-        search = &search[..idx];
-    }
-
-    Some(position)
+    let path = normalize_path(path);
+    Some(ordered_path_evidence(&path, keywords)?.position)
 }
 
 pub fn match_qualities(path: &str, keywords: &[String]) -> Option<Vec<MatchQuality>> {
@@ -170,14 +115,11 @@ pub fn match_qualities(path: &str, keywords: &[String]) -> Option<Vec<MatchQuali
         None => return Some(Vec::new()),
     };
 
-    let path = to_lowercase(path);
+    let path = normalize_path(path);
     let mut path = path.as_str();
     let mut qualities = Vec::with_capacity(keywords.len() + 1);
 
     let idx = path.rfind(keywords_last)?;
-    if path[idx + keywords_last.len()..].contains(path::is_separator) {
-        return None;
-    }
     qualities.push(match_quality(path, idx, keywords_last.len()));
     path = &path[..idx];
 
@@ -214,43 +156,6 @@ fn match_quality(path: &str, idx: usize, keyword_len: usize) -> MatchQuality {
     }
 }
 
-fn path_depth(path: &str) -> usize {
-    path.chars().filter(|ch| path::is_separator(*ch)).count()
-}
-
-fn match_position_penalty(path: &str, idx: usize, keyword_len: usize) -> usize {
-    let end = idx + keyword_len;
-    let token_start = path[..idx]
-        .rfind(is_path_token_separator)
-        .map_or(0, |position| position + 1);
-    let token_end = path[end..]
-        .find(is_path_token_separator)
-        .map_or(path.len(), |position| end + position);
-    idx - token_start + (token_end - end)
-}
-
-fn path_segment_class(path: &str, idx: usize) -> usize {
-    path[idx..]
-        .chars()
-        .filter(|ch| path::is_separator(*ch))
-        .count()
-}
-
-fn position_rank(path: &str, idx: usize, keyword_len: usize) -> usize {
-    match match_quality(path, idx, keyword_len) {
-        MatchQuality::Exact | MatchQuality::Prefix => 0,
-        MatchQuality::Suffix => 1,
-        MatchQuality::Contains => 2,
-    }
-}
-
-fn increment(vector: &mut Vec<usize>, index: usize) {
-    if vector.len() <= index {
-        vector.resize(index + 1, 0);
-    }
-    vector[index] += 1;
-}
-
 fn is_path_token_separator(c: char) -> bool {
     matches!(c, '/' | '\\' | '-' | '_' | '.') || c.is_whitespace()
 }
@@ -282,7 +187,68 @@ mod tests {
                 "/home/lewis/Dev/applicationlauncher/target/release",
                 &keywords
             ),
-            None
+            Some(vec![0, 0, 2])
+        );
+    }
+
+    #[test]
+    fn exact_terms_can_match_entirely_in_ancestor_components() {
+        let keywords = ["gemini", "packages"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let path = "/home/lewis/repos/gemini-cli/packages/core/dist/docs/cli/using-agent-skills.md";
+        let matched = exact_match(path, &keywords, 0.0).unwrap();
+
+        assert_eq!(matched.segment, vec![0, 0, 0, 0, 0, 1, 1]);
+        assert_eq!(matched.position, [2, 0, 0]);
+        assert_eq!(matched.insertions.aligned(), &[0, 0]);
+    }
+
+    #[test]
+    fn compact_query_token_matches_ordered_path_tokens() {
+        let keywords = vec!["geminipackages".to_string()];
+        let path = "/home/lewis/repos/gemini-cli/packages/core/dist/docs/cli/using-agent-skills.md";
+        let matched = exact_match(path, &keywords, 0.0).unwrap();
+
+        assert_eq!(matched.exact_relevance.distinct_coverage(), 0);
+        assert_eq!(matched.exact_relevance.ordered_compound_coverage(), 1);
+        assert_eq!(matched.segment, vec![0, 0, 0, 0, 0, 1]);
+        assert_eq!(matched.position, [1, 0, 0]);
+        assert_eq!(matched.insertions.aligned(), &[5]);
+    }
+
+    #[test]
+    fn compact_query_may_end_at_a_path_token_prefix() {
+        let keywords = vec!["geminipack".to_string()];
+        let matched = exact_match("/home/gemini-cli/packages", &keywords, 0.0).unwrap();
+
+        assert_eq!(matched.exact_relevance.ordered_compound_coverage(), 1);
+        assert_eq!(matched.insertions.aligned(), &[5]);
+    }
+
+    #[test]
+    fn ordered_compound_matching_preserves_path_and_query_order() {
+        let keywords = vec!["repos".to_string(), "geminipackages".to_string()];
+        let matched = exact_match("/home/repos/gemini-cli/packages", &keywords, 0.0).unwrap();
+
+        assert_eq!(matched.exact_relevance.distinct_coverage(), 1);
+        assert_eq!(matched.exact_relevance.ordered_compound_coverage(), 1);
+        assert!(
+            exact_match("/home/repos/packages/gemini-cli", &keywords, 0.0).is_none(),
+            "reversed path tokens must not satisfy ordered compound matching"
+        );
+    }
+
+    #[test]
+    fn direct_exact_coverage_precedes_ordered_compound_coverage() {
+        let keywords = vec!["geminipackages".to_string()];
+        let direct = exact_match("/home/geminipackages", &keywords, 0.0).unwrap();
+        let compound = exact_match("/home/gemini-cli/packages", &keywords, 100.0).unwrap();
+
+        assert_eq!(
+            compare_exact_path_matches(&direct, &compound, &keywords),
+            std::cmp::Ordering::Less
         );
     }
 

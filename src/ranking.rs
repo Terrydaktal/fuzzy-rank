@@ -243,7 +243,7 @@ pub struct PathTypoSortKey<'a> {
 }
 
 fn path_depth(path: &str) -> usize {
-    path.chars().filter(|ch| matches!(ch, '/' | '\\')).count()
+    crate::path::path_depth(path)
 }
 
 pub fn compare_path_typo_sort_keys(

@@ -1,47 +1,82 @@
-use std::cell::OnceCell;
-use std::sync::Arc;
+use std::{cell::OnceCell, path, sync::Arc};
 
 use crate::core::{
     exact_distinct_coverage_by, exact_phrase_present, exact_subphrase_counts_vector,
+    increment_simple_position_vector,
 };
 use crate::text::{split_path_tokens, to_lowercase};
 
+pub mod bulk;
 pub mod exact;
 pub mod typo;
 
 pub type Score = f64;
 
+pub(crate) fn normalize_path(path: &str) -> String {
+    let mut normalized = to_lowercase(path);
+    let trimmed_len = normalized.trim_end_matches(path::is_separator).len();
+    if trimmed_len > 0 {
+        normalized.truncate(trimmed_len);
+    }
+    normalized
+}
+
+pub(crate) fn path_depth(path: &str) -> usize {
+    let trimmed = path.trim_end_matches(path::is_separator);
+    let path = if trimmed.is_empty() { path } else { trimmed };
+    path.chars().filter(|ch| path::is_separator(*ch)).count()
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct PathExactRelevance<'a> {
     path: &'a str,
     query_tokens: Arc<[String]>,
+    normalized_path: Arc<str>,
     component_tokens: OnceCell<Vec<Vec<String>>>,
     whole_phrase: OnceCell<bool>,
     run_vector: OnceCell<Vec<usize>>,
     distinct_coverage: OnceCell<usize>,
+    ordered_compound_coverage: OnceCell<usize>,
 }
 
 impl<'a> PathExactRelevance<'a> {
     pub(crate) fn new(path: &'a str, query_tokens: Arc<[String]>) -> Self {
+        Self::with_normalized_path(path, normalize_path(path).into(), query_tokens)
+    }
+
+    pub(crate) fn with_normalized_path(
+        path: &'a str,
+        normalized_path: Arc<str>,
+        query_tokens: Arc<[String]>,
+    ) -> Self {
         Self {
             path,
             query_tokens,
+            normalized_path,
             component_tokens: OnceCell::new(),
             whole_phrase: OnceCell::new(),
             run_vector: OnceCell::new(),
             distinct_coverage: OnceCell::new(),
+            ordered_compound_coverage: OnceCell::new(),
         }
+    }
+
+    pub(crate) fn with_ordered_compound_coverage(self, coverage: usize) -> Self {
+        self.ordered_compound_coverage
+            .set(coverage)
+            .expect("new path relevance has no cached compound coverage");
+        self
     }
 
     fn component_tokens(&self) -> &[Vec<String>] {
         self.component_tokens.get_or_init(|| {
-            self.path
+            self.normalized_path
                 .split(['/', '\\'])
                 .filter(|component| !component.is_empty())
                 .map(|component| {
                     split_path_tokens(component)
                         .into_iter()
-                        .map(to_lowercase)
+                        .map(str::to_owned)
                         .collect()
                 })
                 .collect()
@@ -49,13 +84,14 @@ impl<'a> PathExactRelevance<'a> {
     }
 
     pub(crate) fn has_exact_token_signal(&self) -> bool {
-        self.component_tokens().iter().any(|component| {
+        let direct = self.component_tokens().iter().any(|component| {
             component.iter().any(|candidate| {
                 self.query_tokens
                     .iter()
                     .any(|query| candidate.contains(query))
             })
-        })
+        });
+        direct || self.ordered_compound_coverage() > 0
     }
 
     pub(crate) fn whole_phrase(&self) -> bool {
@@ -85,4 +121,372 @@ impl<'a> PathExactRelevance<'a> {
             )
         })
     }
+
+    pub(crate) fn ordered_compound_coverage(&self) -> usize {
+        *self
+            .ordered_compound_coverage
+            .get_or_init(|| ordered_compound_coverage(&self.normalized_path, &self.query_tokens))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct OrderedPathEvidence {
+    pub(crate) segment: Vec<usize>,
+    pub(crate) position: [usize; 3],
+    pub(crate) insertions: Vec<usize>,
+    pub(crate) ordered_compound_coverage: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TermMatch {
+    start: usize,
+    segment: usize,
+    position: usize,
+    insertions: usize,
+    compound: bool,
+}
+
+#[derive(Clone, Copy)]
+struct PathToken<'a> {
+    text: &'a str,
+    start: usize,
+    end: usize,
+    segment: usize,
+}
+
+pub(crate) fn ordered_path_evidence(
+    normalized_path: &str,
+    query_tokens: &[String],
+) -> Option<OrderedPathEvidence> {
+    let matches = select_direct_matches(normalized_path, query_tokens)
+        .or_else(|| select_mixed_matches(normalized_path, query_tokens))?;
+    Some(evidence_from_matches(
+        normalized_path,
+        query_tokens,
+        &matches,
+    ))
+}
+
+pub(crate) fn ordered_compound_coverage(normalized_path: &str, query_tokens: &[String]) -> usize {
+    let path_tokens = path_tokens(normalized_path);
+    query_tokens
+        .iter()
+        .filter(|query| {
+            !query.is_empty()
+                && !path_tokens
+                    .iter()
+                    .any(|candidate| candidate.text.contains(query.as_str()))
+                && compound_options(normalized_path, &path_tokens, query, normalized_path.len())
+                    .next()
+                    .is_some()
+        })
+        .count()
+}
+
+fn select_direct_matches(path: &str, query_tokens: &[String]) -> Option<Vec<TermMatch>> {
+    let (last, previous) = query_tokens.split_last()?;
+    let mut search_end = path.len();
+    let mut matches = Vec::with_capacity(query_tokens.len());
+
+    for query in std::iter::once(last).chain(previous.iter().rev()) {
+        let start = path[..search_end].rfind(query)?;
+        matches.push(direct_term_match(path, start, query.len()));
+        search_end = start;
+    }
+
+    matches.reverse();
+    Some(matches)
+}
+
+fn select_mixed_matches(path: &str, query_tokens: &[String]) -> Option<Vec<TermMatch>> {
+    if query_tokens.is_empty() {
+        return None;
+    }
+    let path_tokens = path_tokens(path);
+    let mut reversed = Vec::with_capacity(query_tokens.len());
+    if !select_mixed_matches_from(
+        path,
+        &path_tokens,
+        query_tokens,
+        query_tokens.len(),
+        path.len(),
+        &mut reversed,
+    ) {
+        return None;
+    }
+    reversed.reverse();
+    Some(reversed)
+}
+
+fn select_mixed_matches_from(
+    path: &str,
+    path_tokens: &[PathToken<'_>],
+    query_tokens: &[String],
+    query_end: usize,
+    search_end: usize,
+    selected: &mut Vec<TermMatch>,
+) -> bool {
+    if query_end == 0 {
+        return true;
+    }
+
+    let query = &query_tokens[query_end - 1];
+    let mut options = direct_options(path, query, search_end);
+    options.extend(compound_options(path, path_tokens, query, search_end));
+    options.sort_unstable_by(|left, right| {
+        left.compound
+            .cmp(&right.compound)
+            .then_with(|| left.segment.cmp(&right.segment))
+            .then_with(|| left.position.cmp(&right.position))
+            .then_with(|| left.insertions.cmp(&right.insertions))
+            .then_with(|| right.start.cmp(&left.start))
+    });
+
+    for option in options {
+        selected.push(option);
+        if select_mixed_matches_from(
+            path,
+            path_tokens,
+            query_tokens,
+            query_end - 1,
+            option.start,
+            selected,
+        ) {
+            return true;
+        }
+        selected.pop();
+    }
+    false
+}
+
+fn direct_options(path: &str, query: &str, search_end: usize) -> Vec<TermMatch> {
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let mut options = Vec::new();
+    let mut offset = 0;
+    while offset < search_end {
+        let Some(relative) = path[offset..search_end].find(query) else {
+            break;
+        };
+        let start = offset + relative;
+        options.push(direct_term_match(path, start, query.len()));
+        offset = start + path[start..].chars().next().map_or(1, char::len_utf8);
+    }
+    options
+}
+
+fn compound_options<'a>(
+    path: &'a str,
+    tokens: &'a [PathToken<'a>],
+    query: &'a str,
+    search_end: usize,
+) -> impl Iterator<Item = TermMatch> + 'a {
+    let mut options = Vec::new();
+    for (index, token) in tokens.iter().enumerate() {
+        if token.end > search_end {
+            break;
+        }
+        let Some(remaining) = query.strip_prefix(token.text) else {
+            continue;
+        };
+        collect_compound_options(
+            path,
+            tokens,
+            query,
+            index + 1,
+            remaining,
+            token.start,
+            token.end,
+            token.segment,
+            1,
+            search_end,
+            &mut options,
+        );
+    }
+    options.into_iter()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_compound_options(
+    path: &str,
+    tokens: &[PathToken<'_>],
+    query: &str,
+    next_index: usize,
+    remaining: &str,
+    start: usize,
+    end: usize,
+    segment: usize,
+    fragments: usize,
+    search_end: usize,
+    options: &mut Vec<TermMatch>,
+) {
+    if remaining.is_empty() {
+        if fragments >= 2 {
+            options.push(TermMatch {
+                start,
+                segment,
+                position: 0,
+                insertions: path[start..end]
+                    .chars()
+                    .count()
+                    .saturating_sub(query.chars().count()),
+                compound: true,
+            });
+        }
+        return;
+    }
+
+    for (index, token) in tokens.iter().enumerate().skip(next_index) {
+        if token.end > search_end {
+            break;
+        }
+        if let Some(next_remaining) = remaining.strip_prefix(token.text) {
+            collect_compound_options(
+                path,
+                tokens,
+                query,
+                index + 1,
+                next_remaining,
+                start,
+                token.end,
+                segment.min(token.segment),
+                fragments + 1,
+                search_end,
+                options,
+            );
+        } else if token.text.starts_with(remaining) {
+            collect_compound_options(
+                path,
+                tokens,
+                query,
+                index + 1,
+                "",
+                start,
+                token.start + remaining.len(),
+                segment.min(token.segment),
+                fragments + 1,
+                search_end,
+                options,
+            );
+        }
+    }
+}
+
+fn evidence_from_matches(
+    path: &str,
+    query_tokens: &[String],
+    matches: &[TermMatch],
+) -> OrderedPathEvidence {
+    let mut segment = Vec::new();
+    let mut position = [0; 3];
+    let mut insertions = Vec::with_capacity(matches.len());
+    for matched in matches {
+        increment(&mut segment, matched.segment);
+        increment_simple_position_vector(&mut position, matched.position, 1);
+        insertions.push(matched.insertions);
+    }
+    let ordered_compound_coverage = if matches.iter().any(|matched| matched.compound) {
+        query_tokens
+            .iter()
+            .zip(matches)
+            .filter(|(query, matched)| matched.compound && !path.contains(query.as_str()))
+            .count()
+    } else {
+        0
+    };
+    OrderedPathEvidence {
+        segment,
+        position,
+        insertions,
+        ordered_compound_coverage,
+    }
+}
+
+fn direct_term_match(path: &str, start: usize, len: usize) -> TermMatch {
+    TermMatch {
+        start,
+        segment: path_segment_class(path, start),
+        position: position_class(path, start, len),
+        insertions: position_penalty(path, start, len),
+        compound: false,
+    }
+}
+
+fn path_tokens(path: &str) -> Vec<PathToken<'_>> {
+    let mut tokens = Vec::new();
+    let mut token_start = None;
+    for (index, character) in path.char_indices() {
+        if is_path_token_separator(character) {
+            if let Some(start) = token_start.take() {
+                tokens.push(PathToken {
+                    text: &path[start..index],
+                    start,
+                    end: index,
+                    segment: path_segment_class(path, start),
+                });
+            }
+        } else if token_start.is_none() {
+            token_start = Some(index);
+        }
+    }
+    if let Some(start) = token_start {
+        tokens.push(PathToken {
+            text: &path[start..],
+            start,
+            end: path.len(),
+            segment: path_segment_class(path, start),
+        });
+    }
+    tokens
+}
+
+fn increment(vector: &mut Vec<usize>, index: usize) {
+    if vector.len() <= index {
+        vector.resize(index + 1, 0);
+    }
+    vector[index] += 1;
+}
+
+fn path_segment_class(path: &str, start: usize) -> usize {
+    path[start..]
+        .chars()
+        .filter(|character| path::is_separator(*character))
+        .count()
+}
+
+fn position_class(path: &str, start: usize, len: usize) -> usize {
+    let end = start + len;
+    let starts_token = start == 0
+        || path[..start]
+            .chars()
+            .next_back()
+            .is_some_and(is_path_token_separator);
+    let ends_token = end == path.len()
+        || path[end..]
+            .chars()
+            .next()
+            .is_some_and(is_path_token_separator);
+    if starts_token {
+        0
+    } else if ends_token {
+        1
+    } else {
+        2
+    }
+}
+
+fn position_penalty(path: &str, start: usize, len: usize) -> usize {
+    let end = start + len;
+    let token_start = path[..start]
+        .rfind(is_path_token_separator)
+        .map_or(0, |position| position + 1);
+    let token_end = path[end..]
+        .find(is_path_token_separator)
+        .map_or(path.len(), |position| end + position);
+    start - token_start + (token_end - end)
+}
+
+fn is_path_token_separator(character: char) -> bool {
+    matches!(character, '/' | '\\' | '-' | '_' | '.') || character.is_whitespace()
 }

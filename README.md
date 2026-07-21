@@ -71,9 +71,10 @@ cargo run --bin fuzzy-rank-debug -- metadata "chrome profile" \
   chrome --field "0:Google Chrome" --field "2:chrome --profile-directory=Default" --typos
 ```
 
-Supported adaptor names are `path`, `path::exact`, `path::typo`, `message`,
-`command-history`, and `metadata`. `path` runs the unified exact-first path
-adapter; the two qualified names force one path class. Metadata treats the
+Supported adaptor names are `path`, `path::bulk`, `path::exact`, `path::typo`,
+`message`, `command-history`, and `metadata`. `path` runs the unified exact-first
+path adapter; `path::bulk` uses the high-throughput exact implementation, while
+the other qualified names force one path class. Metadata treats the
 candidate as one priority-0 field unless one or more repeatable `--field
 PRIORITY:VALUE` options are supplied. Message uses the same rule: its positional
 candidate is a priority-0 field, and repeatable `--field PRIORITY:VALUE`
@@ -361,15 +362,15 @@ that position; it does not by itself mean the adaptor is missing required policy
 | 1 | `[CORE.EXACT_PHRASE_PRESENT]` | `[CORE.EXACT_PHRASE_PRESENT]` | `[CORE.EXACT_PHRASE_PRESENT]` | `[CORE.EXACT_PHRASE_PRESENT]` | `[CORE.EXACT_PHRASE_PRESENT]` |
 | 2 | `[CORE.EXACT_SUBPHRASE_COUNTS_VECTOR]` | `[CORE.EXACT_SUBPHRASE_COUNTS_VECTOR]` | `[CORE.EXACT_COVERAGE]` | `[CORE.EXACT_SUBPHRASE_COUNTS_VECTOR]` | `[CORE.EXACT_SUBPHRASE_COUNTS_VECTOR]` |
 | 3 | `[CORE.EXACT_COVERAGE]` | `[CORE.EXACT_COVERAGE]` | `[CORE.EXACT_SUBPHRASE_COUNTS_VECTOR]` | `[CORE.EXACT_WEIGHTED_POSITIONAL_COVERAGE_VECTOR]` | `[CORE.EXACT_WEIGHTED_POSITIONAL_COVERAGE_VECTOR]` |
-| 4 | `[PATH.SEGMENT_VECTOR]` | `[CORE.TYPO_COST_VECTOR]` | `[COMMAND.TOTAL_COVERAGE]` | `[CORE.EXACT_FIELD_QUALITY]` | `[CORE.EXACT_FIELD_QUALITY]` |
-| 5 | `[CORE.SIMPLE_POSITION_VECTOR]` | `[CORE.ORDER_VIOLATION_DISTANCE]` | `[COMMAND.FUZZY_SUBPHRASE_COUNTS_VECTOR]` | `[CORE.ORDER_VIOLATION_DISTANCE]` | `[CORE.EXACT_PHRASE_OCCURRENCE_RANK]` |
-| 6 | `[CORE.SCORE_DESC]` | `[PATH.SEGMENT_VECTOR]` | `[CORE.TYPO_COST_VECTOR]` | `[CORE.ORDERED_SPAN.GAP]` | `[CORE.EXACT_TOKEN_OCCURRENCE_RANK]` |
-| 7 | `[CORE.INSERTION_VECTOR]` | `[CORE.SIMPLE_POSITION_VECTOR]` | `[CORE.INSERTION_VECTOR]` | `[CORE.EXACT_PHRASE_OCCURRENCE_RANK]` | `[METADATA.FUZZY_WHOLE_PHRASE]` |
-| 8 | `[PATH.DEPTH]` | `[CORE.SCORE_DESC]` | `[CORE.OPERATIONS]` | `[CORE.EXACT_TOKEN_OCCURRENCE_RANK]` | `[METADATA.FUZZY_SUBPHRASE_COUNTS_VECTOR]` |
-| 9 | `[CORE.KEY_ASC]` | `[CORE.INSERTION_VECTOR]` | `[CORE.ORDER_VIOLATION_DISTANCE]` | `[CORE.DENSITY]` | `[METADATA.FUZZY_WEIGHTED_POSITIONAL_COVERAGE_VECTOR]` |
-| 10 | — | `[PATH.DEPTH]` | `[CORE.ORDERED_SPAN.GAP]` | `[CORE.SCORE_DESC]` | `[METADATA.FUZZY_FIELD_QUALITY]` |
-| 11 | — | `[CORE.KEY_ASC]` | `[CORE.SCORE_DESC]` | `[CORE.KEY_ASC]` | `[CORE.TYPO_COST_VECTOR]` |
-| 12 | — | — | `[CORE.KEY_ASC]` | — | `[CORE.INSERTION_VECTOR]` |
+| 4 | `[PATH.ORDERED_COMPOUND_COVERAGE]` | `[PATH.ORDERED_COMPOUND_COVERAGE]` | `[COMMAND.TOTAL_COVERAGE]` | `[CORE.EXACT_FIELD_QUALITY]` | `[CORE.EXACT_FIELD_QUALITY]` |
+| 5 | `[PATH.SEGMENT_VECTOR]` | `[CORE.TYPO_COST_VECTOR]` | `[COMMAND.FUZZY_SUBPHRASE_COUNTS_VECTOR]` | `[CORE.ORDER_VIOLATION_DISTANCE]` | `[CORE.EXACT_PHRASE_OCCURRENCE_RANK]` |
+| 6 | `[CORE.SIMPLE_POSITION_VECTOR]` | `[CORE.ORDER_VIOLATION_DISTANCE]` | `[CORE.TYPO_COST_VECTOR]` | `[CORE.ORDERED_SPAN.GAP]` | `[CORE.EXACT_TOKEN_OCCURRENCE_RANK]` |
+| 7 | `[CORE.SCORE_DESC]` | `[PATH.SEGMENT_VECTOR]` | `[CORE.INSERTION_VECTOR]` | `[CORE.EXACT_PHRASE_OCCURRENCE_RANK]` | `[METADATA.FUZZY_WHOLE_PHRASE]` |
+| 8 | `[CORE.INSERTION_VECTOR]` | `[CORE.SIMPLE_POSITION_VECTOR]` | `[CORE.OPERATIONS]` | `[CORE.EXACT_TOKEN_OCCURRENCE_RANK]` | `[METADATA.FUZZY_SUBPHRASE_COUNTS_VECTOR]` |
+| 9 | `[PATH.DEPTH]` | `[CORE.SCORE_DESC]` | `[CORE.ORDER_VIOLATION_DISTANCE]` | `[CORE.DENSITY]` | `[METADATA.FUZZY_WEIGHTED_POSITIONAL_COVERAGE_VECTOR]` |
+| 10 | `[CORE.KEY_ASC]` | `[CORE.INSERTION_VECTOR]` | `[CORE.ORDERED_SPAN.GAP]` | `[CORE.SCORE_DESC]` | `[METADATA.FUZZY_FIELD_QUALITY]` |
+| 11 | — | `[PATH.DEPTH]` | `[CORE.SCORE_DESC]` | `[CORE.KEY_ASC]` | `[CORE.TYPO_COST_VECTOR]` |
+| 12 | — | `[CORE.KEY_ASC]` | `[CORE.KEY_ASC]` | — | `[CORE.INSERTION_VECTOR]` |
 | 13 | — | — | — | — | `[CORE.ORDER_VIOLATION_DISTANCE]` |
 | 14 | — | — | — | — | `[CORE.ORDERED_SPAN.GAP]` |
 | 15 | — | — | — | — | `[CORE.DENSITY]` |
@@ -424,18 +425,20 @@ Shared implementation coverage, with each cell showing its sort position:
 | `CORE.EXACT_PHRASE_OCCURRENCE_COUNT` | — | — | — | 7 | 5 |
 | `CORE.EXACT_PHRASE_OCCURRENCE_RANK` | — | — | — | 7 | 5 |
 | `CORE.EXACT_SUBPHRASE_COUNTS_VECTOR` | 2 | 2 | 3 | 2 | 2 |
+| `CORE.EXACT_COVERAGE` | 3 | 3 | 2 | — | — |
+| `PATH.ORDERED_COMPOUND_COVERAGE` | 4 | 4 | — | — | — |
 | `CORE.EXACT_WEIGHTED_POSITIONAL_COVERAGE_VECTOR` | — | — | — | 3 | 3 |
 | `CORE.EXACT_FIELD_QUALITY` | — | — | — | 4 | 4 |
 | `CORE.EXACT_TOKEN_OCCURRENCE_RANK` | — | — | — | 8 | 6 |
-| `CORE.ORDER_VIOLATION_DISTANCE` | — | 5 | 9 | 5 | 13 |
+| `CORE.ORDER_VIOLATION_DISTANCE` | — | 6 | 9 | 5 | 13 |
 | `CORE.ORDERED_SPAN.GAP` | — | — | 8 | 6 | 14 |
 | `CORE.DENSITY` | — | — | — | 9 | 15 |
 | `CORE.DISTANCE` | — | through 5 | through 6 | — | through 9 |
-| `CORE.OPERATIONS` | — | through 5 and 9 | 6 | — | through 9 and 10 |
-| `CORE.INSERTION_VECTOR` | — | 10 | 7 | — | 10 |
+| `CORE.OPERATIONS` | — | through 5 and 10 | 6 | — | through 9 and 10 |
+| `CORE.INSERTION_VECTOR` | 8 | 10 | 7 | — | 10 |
 | `CORE.RATIO` | — | — | — | — | internal `SearchRank` |
-| `CORE.SCORE_DESC` | 3 | 8 | 11 | 10 | 16 |
-| `CORE.KEY_ASC` | 6 | 11 | 12 | 11 | 18 |
+| `CORE.SCORE_DESC` | 7 | 9 | 11 | 10 | 16 |
+| `CORE.KEY_ASC` | 10 | 12 | 12 | 11 | 18 |
 
 `through N` means the shared primitive contributes to the named adaptor stage
 rather than appearing as an independent key. A dash makes an omitted shared
@@ -456,6 +459,7 @@ This adapter is intended for zoxide-style search.
 
 It owns:
 
+- `path::bulk`
 - `path::exact`
 - `path::typo`
 
@@ -494,39 +498,74 @@ need exact matching. Its sort-key order is:
 1. `[CORE.EXACT_PHRASE_PRESENT]` exact whole-query phrase presence within one path component
 2. `[CORE.EXACT_SUBPHRASE_COUNTS_VECTOR]` exact proper contiguous query-token subphrase-presence vector
 3. `[CORE.EXACT_COVERAGE]` distinct query-token coverage using whole/prefix/suffix/substring evidence as one point per token
-4. `[PATH.SEGMENT_VECTOR]` segment-count vector
-5. `[CORE.SIMPLE_POSITION_VECTOR]` position-class count vector
-6. `[CORE.SCORE_DESC]` descending `score` from `CALLER.SCORE`
-7. `[CORE.INSERTION_VECTOR]` per-query-token insertion slack, worst count first
-8. `[PATH.DEPTH]` `path_depth`
-9. `[CORE.KEY_ASC]` `path`
+4. `[PATH.ORDERED_COMPOUND_COVERAGE]` compact query tokens reconstructed from two or more ordered path tokens
+5. `[PATH.SEGMENT_VECTOR]` segment-count vector
+6. `[CORE.SIMPLE_POSITION_VECTOR]` position-class count vector
+7. `[CORE.SCORE_DESC]` descending `score` from `CALLER.SCORE`
+8. `[CORE.INSERTION_VECTOR]` per-query-token insertion slack, worst count first
+9. `[PATH.DEPTH]` `path_depth`
+10. `[CORE.KEY_ASC]` `path`
 
 The exact-path match is built from the shared exact-relevance stages and these
 path-specific helpers:
 
 1. `[CORE.EXACT_PHRASE_PRESENT]`, `[CORE.EXACT_SUBPHRASE_COUNTS_VECTOR]`, and `[CORE.EXACT_COVERAGE]` through the shared `PathExactRelevance`
-2. `[PATH.SEGMENT_VECTOR]` path-segment count vector through `match_path_segment`
-3. `[CORE.SIMPLE_POSITION_VECTOR]` within-segment class count vector through `match_path_position`
-4. `[CORE.SCORE_DESC]` caller-provided `CALLER.SCORE`
-5. `[CORE.INSERTION_VECTOR]` candidate-only slack through `match_penalties`
-6. `[PATH.DEPTH]` path depth through `exact_match`
+2. `[PATH.ORDERED_COMPOUND_COVERAGE]` shared ordered path-token reconstruction
+3. `[PATH.SEGMENT_VECTOR]` path-segment count vector through `match_path_segment`
+4. `[CORE.SIMPLE_POSITION_VECTOR]` within-segment class count vector through `match_path_position`
+5. `[CORE.SCORE_DESC]` caller-provided `CALLER.SCORE`
+6. `[CORE.INSERTION_VECTOR]` candidate-only slack through `match_penalties`
+7. `[PATH.DEPTH]` path depth through `exact_match`
 
 The segment vector is `[basename_count, parent_count, grandparent_count, ...]`. The position
 vector is `[whole_or_prefix_count, suffix_count, middle_substring_count]`. Both are
 compared lexicographically in descending order. Each matched query token increments exactly one
-entry in each vector. `insertions` is the candidate-only contiguous unmatched
+entry in each vector. Exact terms may match in any path component; basename
+matches are preferred by the segment vector rather than required for eligibility.
+Trailing `/` and `\\` separators are ignored when determining the basename,
+segment vector, and depth, but remain present in the returned path and final
+alphabetical key.
+Ordered compound coverage is used when a query token that has no direct
+whole/prefix/suffix/substring evidence can be reconstructed from at least two
+path tokens in path order. Every non-final fragment consumes a complete path
+token; the final fragment may consume a token prefix. Intervening path tokens
+may be skipped. The reconstructed query token contributes one segment and one
+position match, while candidate-only text between its first and last fragment
+contributes to that token's insertion slack. Thus `geminipackages` matches
+`gemini-cli/packages` with compound coverage `1` and insertion slack `5` for
+`-cli/`. Direct exact coverage is an earlier stage and therefore always
+outranks this reconstruction.
+`insertions` is the candidate-only contiguous unmatched
 character count around the matched keyword span(s) inside the chosen
 token/component. That makes `application` rank closer to `applications`
 than to `applicationlauncher` after position and score have already been compared.
 
-Only the leading exact-path stages are materialized eagerly:
+Exact-path candidate construction materializes:
 
 - segment vector
 - position vector
+- insertion vector
 - caller `score`
 
-`insertions` and `path_depth` are deferred until an exact-path comparison reaches those tie-break
-levels.
+Exact phrase, subphrase, direct coverage, and ordered compound coverage remain
+cached relevance stages. `path_depth` is evaluated only when comparison reaches
+that tie-break.
+
+### `path::bulk`
+
+`path::bulk` is the high-throughput execution strategy for scanning large path
+collections with the `path::exact` ordering. It normalizes and scans each
+candidate once, materializes an immutable `BulkPathMatch`, and supports both a
+full sort and bounded top-k collection through `BulkTopK`.
+
+It is not a separate relevance policy: `BulkPathMatch::compare` uses the same
+ten exact-path sort stages documented above. The caller may use `BulkTopK`
+inside parallel fold/reduce workers without requiring fuzzy-rank itself to own a
+thread pool.
+
+The direct literal scan remains the fast path. When it fails, bulk uses the
+shared ordered compound matcher, so compact `geminipackages` can match
+`gemini-cli/packages` without invoking typo distance.
 
 ### `path::typo`
 
@@ -558,21 +597,22 @@ substitutions.
 token assignment. It lets an in-order zero-cost match beat an otherwise
 equivalent reversed match without charging token order as typo distance.
 
-The effective `path::typo` comparator is an eleven-stage pipeline. `PathMatch::compare`
-owns the first three stages, then delegates the remaining stages to the shared
+The effective `path::typo` comparator is a twelve-stage pipeline. `PathMatch::compare`
+owns the first four stages, then delegates the remaining stages to the shared
 `PathTypoSortKey` comparator in `ranking.rs`:
 
 1. `[CORE.EXACT_PHRASE_PRESENT]` exact whole-query phrase presence, preferred, within one component
 2. `[CORE.EXACT_SUBPHRASE_COUNTS_VECTOR]` exact proper contiguous query-token subphrase-presence vector, descending and lexicographic
 3. `[CORE.EXACT_COVERAGE]` exact distinct query-token coverage, descending; each distinct query token contributes one point regardless of whether it matches as a whole token, prefix, suffix, or arbitrary substring
-4. `[CORE.TYPO_COST_VECTOR]` per-query-token weighted typo costs, worst cost first for comparison
-5. `[CORE.ORDER_VIOLATION_DISTANCE]` query-to-candidate token assignment inversion count, ascending
-6. `[PATH.SEGMENT_VECTOR]` segment-count vector, descending and lexicographic
-7. `[CORE.SIMPLE_POSITION_VECTOR]` whole-or-prefix/suffix/middle count vector, descending and lexicographic
-8. `[CORE.SCORE_DESC]` descending `CALLER.SCORE`
-9. `[CORE.INSERTION_VECTOR]` per-query-token insertion counts, worst count first
-10. `[PATH.DEPTH]` `path_depth`
-11. `[CORE.KEY_ASC]` `key`
+4. `[PATH.ORDERED_COMPOUND_COVERAGE]` compact query tokens reconstructed from two or more ordered path tokens, descending
+5. `[CORE.TYPO_COST_VECTOR]` per-query-token weighted typo costs, worst cost first for comparison
+6. `[CORE.ORDER_VIOLATION_DISTANCE]` query-to-candidate token assignment inversion count, ascending
+7. `[PATH.SEGMENT_VECTOR]` segment-count vector, descending and lexicographic
+8. `[CORE.SIMPLE_POSITION_VECTOR]` whole-or-prefix/suffix/middle count vector, descending and lexicographic
+9. `[CORE.SCORE_DESC]` descending `CALLER.SCORE`
+10. `[CORE.INSERTION_VECTOR]` per-query-token insertion counts, worst count first
+11. `[PATH.DEPTH]` `path_depth`
+12. `[CORE.KEY_ASC]` `key`
 
 Phrase and subphrase stages use token-prefix exactness. Exact coverage uses
 arbitrary substring exactness, so whole-token, prefix, suffix, and internal

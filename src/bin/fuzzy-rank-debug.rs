@@ -7,8 +7,9 @@ use fuzzy_rank::core::{CoverageRank, RankedTokenVector};
 use fuzzy_rank::debug::{DebugReport, DebugStage};
 use fuzzy_rank::message::{MessageCandidate, MessageField, MessageQuery};
 use fuzzy_rank::metadata::{MetadataCandidate, MetadataQuery, SearchField};
+use fuzzy_rank::path::bulk;
 use fuzzy_rank::path::typo::{PathMatch, TypoQuery};
-use fuzzy_rank::text::split_path_tokens;
+use fuzzy_rank::text::{split_path_tokens, to_lowercase};
 
 #[derive(Clone, Copy)]
 enum ColorMode {
@@ -41,6 +42,7 @@ fn run() -> Result<(), String> {
     let config = parse_args(env::args().skip(1).collect())?;
     let report = match config.adaptor.as_str() {
         "path" => run_path(&config, PathMode::Normal),
+        "path::bulk" | "path-bulk" => run_bulk_path(&config),
         "path::exact" | "path-exact" => run_path(&config, PathMode::Exact),
         "path::typo" | "path-typo" => run_path(&config, PathMode::Typo),
         "message" => run_message(&config),
@@ -48,7 +50,7 @@ fn run() -> Result<(), String> {
         "metadata" => run_metadata(&config),
         adaptor => {
             return Err(format!(
-                "unknown adaptor `{adaptor}`; expected path, path::exact, path::typo, path-exact, message, command-history, or metadata"
+                "unknown adaptor `{adaptor}`; expected path, path::bulk, path::exact, path::typo, message, command-history, or metadata"
             ));
         }
     }?;
@@ -138,7 +140,6 @@ enum PathMode {
 
 fn run_path(config: &Config, mode: PathMode) -> Result<DebugReport, String> {
     let query = TypoQuery::new(&config.query).ok_or("path query has no searchable tokens")?;
-    let query_token_count = split_path_tokens(&config.query).len();
     let matched = match mode {
         PathMode::Normal => query.best_match(&config.candidate, config.score),
         PathMode::Exact => query.best_exact_match(&config.candidate, config.score),
@@ -164,6 +165,10 @@ fn run_path(config: &Config, mode: PathMode) -> Result<DebugReport, String> {
         DebugStage::new(
             "CORE.EXACT_COVERAGE",
             matched.exact_distinct_coverage().to_string(),
+        ),
+        DebugStage::new(
+            "PATH.ORDERED_COMPOUND_COVERAGE",
+            matched.ordered_compound_coverage().to_string(),
         ),
         DebugStage::new("CORE.TYPO_COST_VECTOR", format_path_typo_cost(&matched)),
         DebugStage::new(
@@ -191,17 +196,17 @@ fn run_path(config: &Config, mode: PathMode) -> Result<DebugReport, String> {
     ];
 
     Ok(DebugReport::matched(
-        format_path_match_summary(&matched, query_token_count),
+        format_path_match_summary(&matched),
         stages,
     ))
 }
 
-fn format_path_match_summary(matched: &PathMatch<'_>, query_token_count: usize) -> String {
+fn format_path_match_summary(matched: &PathMatch<'_>) -> String {
     let exact_coverage = matched.exact_distinct_coverage();
-    let match_type = if exact_coverage == 0 {
-        "TYPO"
-    } else if exact_coverage == query_token_count {
+    let match_type = if matched.exact {
         "EXACT"
+    } else if exact_coverage == 0 && matched.ordered_compound_coverage() == 0 {
+        "TYPO"
     } else {
         "MIXED"
     };
@@ -216,6 +221,60 @@ fn format_path_typo_cost(matched: &PathMatch<'_>) -> String {
         matched.operations.keyboard_distance,
         matched.operations.deletions,
     )
+}
+
+fn run_bulk_path(config: &Config) -> Result<DebugReport, String> {
+    let query_tokens = split_path_tokens(&config.query)
+        .into_iter()
+        .map(to_lowercase)
+        .collect::<Vec<_>>();
+    if query_tokens.is_empty() {
+        return Err("path query has no searchable tokens".to_string());
+    }
+    let Some(matched) = bulk::exact_match(&config.candidate, &query_tokens, config.score) else {
+        return Ok(DebugReport::no_match(
+            "no bulk exact path match",
+            Vec::new(),
+        ));
+    };
+
+    let stages = vec![
+        DebugStage::new(
+            "CORE.EXACT_PHRASE_PRESENT",
+            matched.exact_phrase_present.to_string(),
+        ),
+        DebugStage::new(
+            "CORE.EXACT_SUBPHRASE_COUNTS_VECTOR",
+            format!("{:?}", matched.exact_subphrase_counts_vector),
+        ),
+        DebugStage::new("CORE.EXACT_COVERAGE", matched.exact_coverage.to_string()),
+        DebugStage::new(
+            "PATH.ORDERED_COMPOUND_COVERAGE",
+            matched.ordered_compound_coverage.to_string(),
+        ),
+        DebugStage::new(
+            "PATH.SEGMENT_VECTOR",
+            format!(
+                "{:?}\n[basename_matches, parent_matches, grandparent_matches, ...]",
+                matched.segment
+            ),
+        ),
+        DebugStage::new(
+            "CORE.SIMPLE_POSITION_VECTOR",
+            format!("{:?}\n[whole_or_prefix, suffix, middle]", matched.position),
+        ),
+        DebugStage::new("CORE.SCORE_DESC", matched.score.to_string()),
+        DebugStage::new(
+            "CORE.INSERTION_VECTOR",
+            format!("{:?}", matched.insertions.worst_first()),
+        ),
+        DebugStage::new("PATH.DEPTH", matched.path_depth.to_string()),
+        DebugStage::new("CORE.KEY_ASC", matched.path),
+    ];
+    Ok(DebugReport::matched(
+        format!("EXACT MATCH  {}", matched.path),
+        stages,
+    ))
 }
 
 fn run_message(config: &Config) -> Result<DebugReport, String> {
@@ -379,6 +438,8 @@ fn format_coverage_rank(rank: &CoverageRank) -> String {
 }
 
 fn path_depth(path: &str) -> usize {
+    let trimmed = path.trim_end_matches(|character| matches!(character, '/' | '\\'));
+    let path = if trimmed.is_empty() { path } else { trimmed };
     path.chars()
         .filter(|character| matches!(character, '/' | '\\'))
         .count()
@@ -399,7 +460,13 @@ fn print_report(config: &Config, report: DebugReport) {
 
     let is_path_report = matches!(
         config.adaptor.as_str(),
-        "path" | "path::exact" | "path::typo" | "path-exact" | "path-typo"
+        "path"
+            | "path::bulk"
+            | "path::exact"
+            | "path::typo"
+            | "path-bulk"
+            | "path-exact"
+            | "path-typo"
     );
     let result = if report.matched {
         paint(use_color, "1;32", "MATCH")
@@ -460,7 +527,7 @@ fn paint(enabled: bool, code: &str, value: &str) -> String {
 fn print_help() {
     println!(
         "Usage: fuzzy-rank-debug ADAPTOR QUERY CANDIDATE [OPTIONS]\n\n\
-Adaptors:\n  path\n  path::exact\n  path::typo\n  message\n  command-history\n  metadata\n\n\
+Adaptors:\n  path\n  path::bulk\n  path::exact\n  path::typo\n  message\n  command-history\n  metadata\n\n\
 Options:\n  --score VALUE       Caller score for path, message, and metadata\n  --recency VALUE     Caller recency for command-history\n  --field P:VALUE     Metadata field with priority P; repeatable\n  --typos             Enable metadata typo fallback\n  --color             Force ANSI colors\n  --no-color          Disable ANSI colors\n  -h, --help          Show this help\n\n\
 Queries and candidates containing spaces must be quoted. Metadata without\n\
 --field treats CANDIDATE as one field with priority 0."
