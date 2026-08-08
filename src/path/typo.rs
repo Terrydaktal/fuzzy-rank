@@ -460,38 +460,38 @@ fn candidate_for_text<'a>(
     let candidate_len = candidate.chars().count();
     let query_token_count = split_path_tokens(ctx.query).len();
 
-    if query_token_count == 1 {
-        if let Some(start) = candidate.find(ctx.query) {
-            let start_chars = candidate[..start].chars().count();
-            let end_chars = start_chars + ctx.query_len;
-            let insertions = candidate_len.saturating_sub(ctx.query_len);
-            let ratio = insertions as f64 / ctx.query_len.max(candidate_len) as f64;
-            if ratio <= 0.5 {
-                let position_rank = if start_chars == 0 {
-                    0
-                } else if end_chars == candidate_len {
-                    1
-                } else {
-                    2
-                };
-                return Some(PathMatch {
-                    path: ctx.path,
-                    exact: false,
-                    distance: insertions,
-                    order_distance: 0,
-                    ratio,
-                    segment: segment_vector(path_position, 1),
-                    position: simple_position_vector([position_rank]),
-                    operations: OperationProfile {
-                        insertions,
-                        ..OperationProfile::default()
-                    },
-                    typo_costs: TypoCostVector::new(vec![0]),
-                    insertions: InsertionVector::new(vec![insertions]),
-                    score: ctx.score,
-                    exact_relevance: None,
-                });
-            }
+    if query_token_count == 1
+        && let Some(start) = candidate.find(ctx.query)
+    {
+        let start_chars = candidate[..start].chars().count();
+        let end_chars = start_chars + ctx.query_len;
+        let insertions = candidate_len.saturating_sub(ctx.query_len);
+        let ratio = insertions as f64 / ctx.query_len.max(candidate_len) as f64;
+        if ratio <= 0.5 {
+            let position_rank = if start_chars == 0 {
+                0
+            } else if end_chars == candidate_len {
+                1
+            } else {
+                2
+            };
+            return Some(PathMatch {
+                path: ctx.path,
+                exact: false,
+                distance: insertions,
+                order_distance: 0,
+                ratio,
+                segment: segment_vector(path_position, 1),
+                position: simple_position_vector([position_rank]),
+                operations: OperationProfile {
+                    insertions,
+                    ..OperationProfile::default()
+                },
+                typo_costs: TypoCostVector::new(vec![0]),
+                insertions: InsertionVector::new(vec![insertions]),
+                score: ctx.score,
+                exact_relevance: None,
+            });
         }
     }
 
@@ -931,7 +931,19 @@ mod tests {
     #[test]
     fn long_queries_use_half_length_typo_limit() {
         let candidate = best_match("/home/lewis/xfce4-terminal", 10.0, "xgce4-tremriianl").unwrap();
-        assert_eq!(candidate.distance, 6);
+        assert_eq!(candidate.distance, 5);
+    }
+
+    #[test]
+    fn reversed_nine_token_paths_are_aligned_without_a_permutation_cutoff() {
+        let candidate = best_match(
+            "/ii/hh/gg/ff/ee/dd/cc/bb/aa",
+            10.0,
+            "aa bb cc dd ee ff gg hh ii",
+        )
+        .unwrap();
+        assert_eq!(candidate.distance, 0);
+        assert_eq!(candidate.order_distance, 36);
     }
 
     #[test]

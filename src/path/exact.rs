@@ -28,11 +28,7 @@ pub fn exact_match<'a>(
     keywords: &[String],
     score: Score,
 ) -> Option<ExactPathMatch<'a>> {
-    exact_match_with_query_tokens(
-        path,
-        keywords.iter().cloned().collect::<Vec<_>>().into(),
-        score,
-    )
+    exact_match_with_query_tokens(path, keywords.to_vec().into(), score)
 }
 
 pub(crate) fn exact_match_with_query_tokens<'a>(

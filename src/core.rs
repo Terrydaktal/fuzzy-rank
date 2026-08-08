@@ -33,34 +33,45 @@ impl FieldOccurrenceRank {
 
 impl Ord for FieldOccurrenceRank {
     fn cmp(&self, other: &Self) -> Ordering {
-        let mut priorities = self
-            .0
-            .iter()
-            .map(|(priority, _)| *priority)
-            .chain(other.0.iter().map(|(priority, _)| *priority))
-            .collect::<Vec<_>>();
-        priorities.sort_unstable();
-        priorities.dedup();
+        let mut left = self.0.iter().peekable();
+        let mut right = other.0.iter().peekable();
+        loop {
+            let Some(left_entry) = left.peek() else {
+                return right
+                    .map(|(_, count)| 0usize.cmp(count))
+                    .find(|ordering| *ordering != Ordering::Equal)
+                    .unwrap_or(Ordering::Equal);
+            };
+            let Some(right_entry) = right.peek() else {
+                return left
+                    .map(|(_, count)| count.cmp(&0))
+                    .find(|ordering| *ordering != Ordering::Equal)
+                    .unwrap_or(Ordering::Equal);
+            };
 
-        priorities
-            .into_iter()
-            .map(|priority| {
-                let left = self
-                    .0
-                    .iter()
-                    .find(|(candidate_priority, _)| *candidate_priority == priority)
-                    .map(|(_, count)| *count)
-                    .unwrap_or(0);
-                let right = other
-                    .0
-                    .iter()
-                    .find(|(candidate_priority, _)| *candidate_priority == priority)
-                    .map(|(_, count)| *count)
-                    .unwrap_or(0);
-                left.cmp(&right)
-            })
-            .find(|ordering| *ordering != Ordering::Equal)
-            .unwrap_or(Ordering::Equal)
+            match left_entry.0.cmp(&right_entry.0) {
+                Ordering::Less => {
+                    if let ordering @ Ordering::Greater = left_entry.1.cmp(&0) {
+                        return ordering;
+                    }
+                    left.next();
+                }
+                Ordering::Greater => {
+                    if let ordering @ Ordering::Less = 0usize.cmp(&right_entry.1) {
+                        return ordering;
+                    }
+                    right.next();
+                }
+                Ordering::Equal => {
+                    let ordering = left_entry.1.cmp(&right_entry.1);
+                    if ordering != Ordering::Equal {
+                        return ordering;
+                    }
+                    left.next();
+                    right.next();
+                }
+            }
+        }
     }
 }
 
@@ -469,6 +480,9 @@ pub struct OperationProfile {
     pub insertion_penalty: usize,
 }
 
+const DELETION_TYPO_COST: usize = 6;
+const TRANSPOSITION_TYPO_COST: usize = 5;
+
 impl Ord for OperationProfile {
     fn cmp(&self, other: &Self) -> Ordering {
         (
@@ -553,7 +567,9 @@ impl OperationProfile {
     }
 
     pub fn core_typo_cost(&self) -> usize {
-        self.keyboard_distance + self.deletions * 6
+        self.keyboard_distance
+            + self.deletions * DELETION_TYPO_COST
+            + self.transpositions * TRANSPOSITION_TYPO_COST
     }
 }
 
@@ -670,14 +686,36 @@ pub fn bounded_damerau_levenshtein(
 ) -> Option<(usize, OperationProfile)> {
     let candidate: Vec<_> = candidate.chars().collect();
     let query: Vec<_> = query.chars().collect();
+    let mut scratch = DamerauScratch::default();
+    bounded_damerau_levenshtein_chars_with_scratch(&candidate, &query, limit, &mut scratch)
+}
+
+#[derive(Default)]
+pub(crate) struct DamerauScratch {
+    prev_prev: Vec<EditCost>,
+    prev: Vec<EditCost>,
+    curr: Vec<EditCost>,
+}
+
+pub(crate) fn bounded_damerau_levenshtein_chars_with_scratch(
+    candidate: &[char],
+    query: &[char],
+    limit: usize,
+    scratch: &mut DamerauScratch,
+) -> Option<(usize, OperationProfile)> {
     if candidate.len().abs_diff(query.len()) > limit {
         return None;
     }
 
     let inf = EditCost::infinite(limit);
-    let mut prev_prev = vec![inf; query.len() + 1];
-    let mut prev = vec![EditCost::default(); query.len() + 1];
-    for (idx, cell) in prev.iter_mut().enumerate() {
+    let row_len = query.len() + 1;
+    scratch.prev_prev.resize(row_len, inf);
+    scratch.prev.resize(row_len, EditCost::default());
+    scratch.curr.resize(row_len, inf);
+    scratch.prev_prev.fill(inf);
+    scratch.prev.fill(EditCost::default());
+    scratch.curr.fill(inf);
+    for (idx, cell) in scratch.prev.iter_mut().enumerate() {
         *cell = EditCost {
             distance: idx,
             operations: OperationProfile {
@@ -691,11 +729,10 @@ pub fn bounded_damerau_levenshtein(
             },
         };
     }
-    let mut curr = vec![inf; query.len() + 1];
 
     for i in 1..=candidate.len() {
-        curr.fill(inf);
-        curr[0] = EditCost {
+        scratch.curr.fill(inf);
+        scratch.curr[0] = EditCost {
             distance: i,
             operations: OperationProfile {
                 substitutions: 0,
@@ -716,20 +753,20 @@ pub fn bounded_damerau_levenshtein(
 
         let mut row_min = inf;
         for j in start..=end {
-            let insertion = prev[j].with_insertion(
+            let insertion = scratch.prev[j].with_insertion(
                 candidate[i - 1],
                 i.checked_sub(2).map(|idx| candidate[idx]),
                 candidate.get(i).copied(),
             );
-            let deletion = curr[j - 1].with_deletion(
+            let deletion = scratch.curr[j - 1].with_deletion(
                 query[j - 1],
                 i.checked_sub(1).map(|idx| candidate[idx]),
                 candidate.get(i).copied(),
             );
             let substitution = if candidate[i - 1] == query[j - 1] {
-                prev[j - 1]
+                scratch.prev[j - 1]
             } else {
-                prev[j - 1].with_substitution(candidate[i - 1], query[j - 1])
+                scratch.prev[j - 1].with_substitution(candidate[i - 1], query[j - 1])
             };
             let mut cell = deletion.min(insertion).min(substitution);
 
@@ -738,10 +775,10 @@ pub fn bounded_damerau_levenshtein(
                 && candidate[i - 1] == query[j - 2]
                 && candidate[i - 2] == query[j - 1]
             {
-                cell = cell.min(prev_prev[j - 2].with_transposition());
+                cell = cell.min(scratch.prev_prev[j - 2].with_transposition());
             }
 
-            curr[j] = cell;
+            scratch.curr[j] = cell;
             row_min = row_min.min(cell);
         }
 
@@ -749,11 +786,11 @@ pub fn bounded_damerau_levenshtein(
             return None;
         }
 
-        std::mem::swap(&mut prev_prev, &mut prev);
-        std::mem::swap(&mut prev, &mut curr);
+        std::mem::swap(&mut scratch.prev_prev, &mut scratch.prev);
+        std::mem::swap(&mut scratch.prev, &mut scratch.curr);
     }
 
-    let cost = prev[query.len()];
+    let cost = scratch.prev[query.len()];
     (cost.distance <= limit).then_some((cost.distance, cost.operations))
 }
 
@@ -936,6 +973,18 @@ mod tests {
         assert_eq!(candidate_insertion.1.deletions, 0);
         assert_eq!(candidate_insertion.1.insertions, 1);
         assert_eq!(candidate_insertion.1.core_typo_cost(), 0);
+    }
+
+    #[test]
+    fn transposition_cost_is_below_query_deletion_cost() {
+        let transposition = bounded_damerau_levenshtein("edb", "deb", 1).unwrap();
+        assert_eq!(transposition.1.transpositions, 1);
+        assert_eq!(transposition.1.core_typo_cost(), 5);
+
+        let deletion = bounded_damerau_levenshtein("db", "deb", 1).unwrap();
+        assert_eq!(deletion.1.deletions, 1);
+        assert_eq!(deletion.1.core_typo_cost(), 6);
+        assert!(transposition.1.core_typo_cost() < deletion.1.core_typo_cost());
     }
 }
 #[derive(Clone, Debug, Default, Eq, PartialEq)]

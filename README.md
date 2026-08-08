@@ -395,15 +395,19 @@ differently. Exact coverage is compared before this vector.
 For path and fuzzy metadata typo matching, each token cost is:
 
 ```text
-keyboard distance + (query-only deletions * 6)
+keyboard distance
++ (query-only deletions * 6)
++ (transpositions * 5)
 ```
 
 Here `deletion` means a character present in the typed query but absent from the
 candidate, while `insertion` means a character present in the candidate but
 absent from the query. Candidate-side insertions are deliberately excluded from
 `CORE.TYPO_COST_VECTOR`; they are retained in `CORE.INSERTION_VECTOR` and used
-later as a low-priority noise tie-break. The raw Damerau distance still controls
-whether a candidate is admissible, but is not added as a separate sort key.
+later as a low-priority noise tie-break. Each adjacent transposition contributes
+`5` to the core cost. Its fixed operation-likelihood penalty remains a separate
+lower-level comparator input. The raw Damerau distance still controls whether a
+candidate is admissible, but is not added as a separate sort key.
 
 `CORE.INSERTION_VECTOR` uses the same representation and comparison. For
 example, aligned insertions `[0, 4]` are retained for provenance and compared as
@@ -673,7 +677,8 @@ records both cases and is intentionally lower priority than core typo cost.
 
 The path-specific comparator uses the exact stages above, then:
 
-- weighted core typo cost: keyboard distance plus six per query-only deletion
+- weighted core typo cost: keyboard distance plus six per query-only deletion and
+  five per transposition
 - query-to-candidate order violation distance
 - the segment vector, descending lexicographically: basename count, parent count, grandparent count, and so on
 - the position vector, descending lexicographically: whole token or prefix, suffix, then middle substring

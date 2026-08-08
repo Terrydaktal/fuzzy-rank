@@ -1,6 +1,7 @@
 use crate::core::{
-    CoverageRank, DensityRank, FieldOccurrenceRank, InsertionVector, RankedTokenVector,
-    TypoCostVector, bounded_damerau_levenshtein, compare_key_asc, compare_score_desc,
+    CoverageRank, DamerauScratch, DensityRank, FieldOccurrenceRank, InsertionVector,
+    RankedTokenVector, TypoCostVector, bounded_damerau_levenshtein,
+    bounded_damerau_levenshtein_chars_with_scratch, compare_key_asc, compare_score_desc,
     exact_phrase_occurrence_count_by, exact_phrase_present_by, exact_subphrase_counts_vector_by,
     exact_token_position, keyboard_substitution_cost, max_typos, ordered_token_span,
     position_vector, ratio_milli,
@@ -76,32 +77,31 @@ impl MetadataQuery {
     }
 
     pub fn search_rank(&self, candidate: MetadataCandidate<'_>) -> Option<SearchRank> {
-        let queries = if self.query_tokens.len() <= 1 {
-            vec![self.query.as_str()]
-        } else {
-            self.query_tokens.iter().map(String::as_str).collect()
-        };
-
-        let mut best_rank = None;
-        for query in queries {
-            let rank = if self.allow_typo {
-                best_typo_rank(query, candidate.fields).map(SearchRank::Typo)
-            } else {
-                best_structural_rank(query, candidate.fields)
-                    .map(SearchRank::Structural)
-                    .or_else(|| {
-                        best_abbreviation_rank(query, candidate.fields)
-                            .map(SearchRank::Abbreviation)
-                    })
-                    .or_else(|| best_fuzzy_rank(query, candidate.fields).map(SearchRank::Fuzzy))
-            };
-            if let Some(rank) = rank
-                && best_rank.as_ref().is_none_or(|current| rank < *current)
-            {
-                best_rank = Some(rank);
-            }
+        if self.query_tokens.len() <= 1 {
+            return self.rank_single_query(self.query.as_str(), candidate);
         }
-        best_rank
+
+        self.query_tokens
+            .iter()
+            .filter_map(|query| self.rank_single_query(query, candidate))
+            .min()
+    }
+
+    fn rank_single_query(
+        &self,
+        query: &str,
+        candidate: MetadataCandidate<'_>,
+    ) -> Option<SearchRank> {
+        if self.allow_typo {
+            best_typo_rank(query, candidate.fields).map(SearchRank::Typo)
+        } else {
+            best_structural_rank(query, candidate.fields)
+                .map(SearchRank::Structural)
+                .or_else(|| {
+                    best_abbreviation_rank(query, candidate.fields).map(SearchRank::Abbreviation)
+                })
+                .or_else(|| best_fuzzy_rank(query, candidate.fields).map(SearchRank::Fuzzy))
+        }
     }
 
     pub fn compare_candidates(
@@ -269,10 +269,8 @@ impl MetadataQuery {
                     let end_byte_abs = start_byte_abs + normalized_query.len();
                     let start_char = value[..start_byte_abs].chars().count();
                     let end_char = value[..end_byte_abs].chars().count();
-                    for idx in start_char..end_char {
-                        if idx < char_count {
-                            char_status[idx] = (Some(true), 0);
-                        }
+                    for status in char_status.iter_mut().take(end_char).skip(start_char) {
+                        *status = (Some(true), 0);
                     }
                     search_idx = start_byte_abs + 1.max(normalized_query.len());
                 }
@@ -289,26 +287,18 @@ impl MetadataQuery {
                     let token_end = token.start + token_len;
                     if literal_token_match(&query_token_lower, &token.value) {
                         // Exact literal match: highlight the containing token.
-                        for idx in token.start..token_end {
-                            if idx < char_count {
-                                char_status[idx] = (Some(true), 0);
-                            }
+                        for status in char_status.iter_mut().take(token_end).skip(token.start) {
+                            *status = (Some(true), 0);
                         }
-                    } else {
-                        if let Some((_s_char, _e_char, severity)) =
-                            typo_match_token_slice(&token.value, &query_token_lower)
-                        {
-                            // Typo match — highlight whole token
-                            for idx in token.start..token_end {
-                                if idx < char_count {
-                                    let current_status = char_status[idx];
-                                    if current_status.0.is_none()
-                                        || (current_status.0 == Some(false)
-                                            && severity.core_cost < current_status.1)
-                                    {
-                                        char_status[idx] = (Some(false), severity.core_cost);
-                                    }
-                                }
+                    } else if let Some((_s_char, _e_char, severity)) =
+                        typo_match_token_slice(&token.value, &query_token_lower)
+                    {
+                        // Typo match — highlight whole token
+                        for status in char_status.iter_mut().take(token_end).skip(token.start) {
+                            if status.0.is_none()
+                                || (status.0 == Some(false) && severity.core_cost < status.1)
+                            {
+                                *status = (Some(false), severity.core_cost);
                             }
                         }
                     }
@@ -319,8 +309,7 @@ impl MetadataQuery {
             let mut ranges = Vec::new();
             let mut current_segment: Option<(usize, bool, usize)> = None;
 
-            for char_idx in 0..char_count {
-                let status = char_status[char_idx];
+            for (char_idx, status) in char_status.iter().copied().enumerate() {
                 if let Some(is_exact) = status.0 {
                     if let Some((start_char, seg_exact, min_cost)) = current_segment {
                         if seg_exact == is_exact {
@@ -334,13 +323,11 @@ impl MetadataQuery {
                     } else {
                         current_segment = Some((char_idx, is_exact, status.1));
                     }
-                } else {
-                    if let Some((start_char, seg_exact, min_cost)) = current_segment {
-                        let (byte_start, byte_end) =
-                            char_indices_to_byte_range(value, start_char, char_idx);
-                        ranges.push((byte_start, byte_end, seg_exact, min_cost));
-                        current_segment = None;
-                    }
+                } else if let Some((start_char, seg_exact, min_cost)) = current_segment {
+                    let (byte_start, byte_end) =
+                        char_indices_to_byte_range(value, start_char, char_idx);
+                    ranges.push((byte_start, byte_end, seg_exact, min_cost));
+                    current_segment = None;
                 }
             }
             if let Some((start_char, seg_exact, min_cost)) = current_segment {
@@ -437,6 +424,7 @@ struct LazyRelevance<'a> {
     fuzzy_weighted_positional_coverage_vector: OnceCell<CoverageRank>,
     fuzzy_whole_phrase: OnceCell<bool>,
     fuzzy_subphrase_counts_vector: OnceCell<Vec<usize>>,
+    fuzzy_token_matches: OnceCell<TokenMatchMatrix>,
     fuzzy_best_matches: OnceCell<Vec<TokenMatch>>,
     exact_field_quality: OnceCell<u8>,
     fuzzy_field_quality: OnceCell<u8>,
@@ -475,6 +463,7 @@ impl<'a> LazyRelevance<'a> {
             fuzzy_weighted_positional_coverage_vector: OnceCell::new(),
             fuzzy_whole_phrase: OnceCell::new(),
             fuzzy_subphrase_counts_vector: OnceCell::new(),
+            fuzzy_token_matches: OnceCell::new(),
             fuzzy_best_matches: OnceCell::new(),
             exact_field_quality: OnceCell::new(),
             fuzzy_field_quality: OnceCell::new(),
@@ -534,21 +523,23 @@ impl<'a> LazyRelevance<'a> {
     fn get_fuzzy_weighted_positional_coverage_vector(&self) -> &CoverageRank {
         self.fuzzy_weighted_positional_coverage_vector
             .get_or_init(|| {
-                let matches = self.fuzzy_best_matches.get_or_init(|| {
-                    self.query_tokens
-                        .iter()
-                        .map(|query_token| {
-                            best_fuzzy_token_match(query_token, &self.fields, self.allow_typo)
-                        })
-                        .collect()
-                });
+                let matches = self.get_fuzzy_best_matches();
                 CoverageRank::new(metadata_fuzzy_coverage_vector(matches), &[4, 2, 2, 1, 1])
             })
     }
 
     fn get_fuzzy_whole_phrase(&self) -> bool {
         *self.fuzzy_whole_phrase.get_or_init(|| {
-            fuzzy_whole_phrase_present(self.query_tokens, &self.fields, self.allow_typo)
+            if !self.allow_typo {
+                false
+            } else {
+                fuzzy_whole_phrase_present_cached(
+                    self.query_tokens,
+                    &self.fields,
+                    true,
+                    self.get_fuzzy_token_matches(),
+                )
+            }
         })
     }
 
@@ -556,8 +547,13 @@ impl<'a> LazyRelevance<'a> {
         if self.query_tokens.is_empty() || self.fields.is_empty() {
             return &[];
         }
-        self.fuzzy_subphrase_counts_vector
-            .get_or_init(|| fuzzy_subphrase_counts_vector(self.query_tokens, &self.fields))
+        self.fuzzy_subphrase_counts_vector.get_or_init(|| {
+            fuzzy_subphrase_counts_vector_cached(
+                self.query_tokens,
+                &self.fields,
+                self.get_fuzzy_token_matches(),
+            )
+        })
     }
 
     fn get_typo_cost_vector(&self) -> &TypoCostVector {
@@ -565,14 +561,7 @@ impl<'a> LazyRelevance<'a> {
             if self.query_tokens.is_empty() || self.fields.is_empty() {
                 TypoCostVector::default()
             } else {
-                let matches = self.fuzzy_best_matches.get_or_init(|| {
-                    self.query_tokens
-                        .iter()
-                        .map(|query_token| {
-                            best_fuzzy_token_match(query_token, &self.fields, self.allow_typo)
-                        })
-                        .collect()
-                });
+                let matches = self.get_fuzzy_best_matches();
                 typo_cost_vector(matches)
             }
         })
@@ -583,14 +572,7 @@ impl<'a> LazyRelevance<'a> {
             if self.query_tokens.is_empty() || self.fields.is_empty() {
                 InsertionVector::default()
             } else {
-                let matches = self.fuzzy_best_matches.get_or_init(|| {
-                    self.query_tokens
-                        .iter()
-                        .map(|query_token| {
-                            best_fuzzy_token_match(query_token, &self.fields, self.allow_typo)
-                        })
-                        .collect()
-                });
+                let matches = self.get_fuzzy_best_matches();
                 insertion_vector(matches)
             }
         })
@@ -608,15 +590,7 @@ impl<'a> LazyRelevance<'a> {
 
     fn get_fuzzy_field_quality(&self) -> u8 {
         *self.fuzzy_field_quality.get_or_init(|| {
-            self.fuzzy_best_matches
-                .get_or_init(|| {
-                    self.query_tokens
-                        .iter()
-                        .map(|query_token| {
-                            best_fuzzy_token_match(query_token, &self.fields, self.allow_typo)
-                        })
-                        .collect()
-                })
+            self.get_fuzzy_best_matches()
                 .iter()
                 .filter(|matched| matched.fuzzy && !matched.exact)
                 .map(|matched| matched.field_priority)
@@ -677,16 +651,61 @@ impl<'a> LazyRelevance<'a> {
             if self.query_tokens.is_empty() || self.fields.is_empty() {
                 DensityRank::new(0, usize::MAX)
             } else {
-                let matches = self.fuzzy_best_matches.get_or_init(|| {
-                    self.query_tokens
-                        .iter()
-                        .map(|query_token| {
-                            best_fuzzy_token_match(query_token, &self.fields, self.allow_typo)
-                        })
-                        .collect()
-                });
+                let matches = self.get_fuzzy_best_matches();
                 density_stats(self.query_tokens, &self.fields, matches)
             }
+        })
+    }
+
+    fn get_fuzzy_token_matches(&self) -> &TokenMatchMatrix {
+        self.fuzzy_token_matches.get_or_init(|| {
+            self.query_tokens
+                .iter()
+                .map(|query_token| {
+                    self.fields
+                        .iter()
+                        .map(|field| {
+                            field
+                                .tokens
+                                .iter()
+                                .map(|candidate_token| {
+                                    if let Some(scope) =
+                                        literal_token_scope(query_token, candidate_token)
+                                    {
+                                        TokenMatch {
+                                            exact: true,
+                                            fuzzy: true,
+                                            severity: TokenTypoSeverity::default(),
+                                            scope: Some(scope),
+                                            field_priority: field.priority,
+                                        }
+                                    } else {
+                                        fuzzy_or_exact_token_match(candidate_token, query_token)
+                                            .map_or_else(TokenMatch::default, |detail| TokenMatch {
+                                                exact: false,
+                                                fuzzy: true,
+                                                severity: detail.severity,
+                                                scope: Some(detail.scope),
+                                                field_priority: field.priority,
+                                            })
+                                    }
+                                })
+                                .collect()
+                        })
+                        .collect()
+                })
+                .collect()
+        })
+    }
+
+    fn get_fuzzy_best_matches(&self) -> &Vec<TokenMatch> {
+        self.fuzzy_best_matches.get_or_init(|| {
+            self.get_fuzzy_token_matches()
+                .iter()
+                .map(|field_matches| {
+                    best_fuzzy_token_match_from_matrix(field_matches, self.allow_typo)
+                })
+                .collect()
         })
     }
 
@@ -773,9 +792,11 @@ fn typo_cost_vector(matches: &[TokenMatch]) -> TypoCostVector {
         matches
             .iter()
             .map(|matched| {
-                (matched.fuzzy && !matched.exact)
-                    .then_some(matched.severity.core_cost)
-                    .unwrap_or(0)
+                if matched.fuzzy && !matched.exact {
+                    matched.severity.core_cost
+                } else {
+                    0
+                }
             })
             .collect(),
     )
@@ -905,6 +926,8 @@ struct TokenMatch {
     scope: Option<TokenMatchScope>,
     field_priority: u8,
 }
+
+type TokenMatchMatrix = Vec<Vec<Vec<TokenMatch>>>;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum TokenMatchScope {
@@ -1155,6 +1178,69 @@ fn fuzzy_subphrase_counts_vector(
         .collect()
 }
 
+fn fuzzy_whole_phrase_present_cached(
+    query_tokens: &[String],
+    fields: &[NormalizedMetadataField],
+    allow_typo: bool,
+    matches: &TokenMatchMatrix,
+) -> bool {
+    if !allow_typo || query_tokens.is_empty() {
+        return false;
+    }
+
+    fields.iter().enumerate().any(|(field_idx, field)| {
+        field
+            .tokens
+            .windows(query_tokens.len())
+            .enumerate()
+            .any(|(candidate_start, window)| {
+                let mut contains_fuzzy = false;
+                for (query_idx, _) in window.iter().enumerate() {
+                    let matched = matches[query_idx][field_idx][candidate_start + query_idx];
+                    if matched.exact {
+                        continue;
+                    }
+                    if !matched.fuzzy {
+                        return false;
+                    }
+                    contains_fuzzy = true;
+                }
+                contains_fuzzy
+            })
+    })
+}
+
+fn fuzzy_subphrase_counts_vector_cached(
+    query_tokens: &[String],
+    fields: &[NormalizedMetadataField],
+    matches: &TokenMatchMatrix,
+) -> Vec<usize> {
+    if query_tokens.len() < 3 {
+        return Vec::new();
+    }
+    (2..query_tokens.len())
+        .rev()
+        .map(|window_len| {
+            let mut count = 0;
+            for (field_idx, field) in fields.iter().enumerate() {
+                if field.tokens.len() < window_len {
+                    continue;
+                }
+                for query_start in 0..=query_tokens.len() - window_len {
+                    for candidate_start in 0..=field.tokens.len() - window_len {
+                        if (0..window_len).all(|offset| {
+                            matches[query_start + offset][field_idx][candidate_start + offset].fuzzy
+                        }) {
+                            count += 1;
+                        }
+                    }
+                }
+            }
+            count
+        })
+        .collect()
+}
+
 fn best_fuzzy_token_match(
     query_token: &str,
     fields: &[NormalizedMetadataField],
@@ -1207,6 +1293,37 @@ fn best_fuzzy_token_match(
     best
 }
 
+fn best_fuzzy_token_match_from_matrix(
+    field_matches: &[Vec<TokenMatch>],
+    allow_typo: bool,
+) -> TokenMatch {
+    let mut best = TokenMatch::default();
+    for field_matches in field_matches {
+        for candidate in field_matches {
+            if candidate.exact {
+                if !best.exact
+                    || (candidate.scope, candidate.field_priority)
+                        < (best.scope, best.field_priority)
+                {
+                    best = *candidate;
+                }
+            } else if allow_typo
+                && candidate.fuzzy
+                && (!best.fuzzy
+                    || (!best.exact
+                        && (
+                            candidate.scope,
+                            candidate.severity,
+                            candidate.field_priority,
+                        ) < (best.scope, best.severity, best.field_priority)))
+            {
+                best = *candidate;
+            }
+        }
+    }
+    best
+}
+
 fn fuzzy_or_exact_token_match(
     candidate_token: &str,
     query_token: &str,
@@ -1217,7 +1334,8 @@ fn fuzzy_or_exact_token_match(
             scope,
         });
     }
-    let query_len = query_token.chars().count();
+    let query_chars: Vec<char> = query_token.chars().collect();
+    let query_len = query_chars.len();
     if query_len < 3 || !token_has_signal(query_token, candidate_token) {
         return None;
     }
@@ -1227,18 +1345,22 @@ fn fuzzy_or_exact_token_match(
         fuzzy_match_details(query_token, candidate_token)
     {
         let candidate_chars: Vec<char> = candidate_token.chars().collect();
-        let end = end_idx.min(candidate_chars.len());
+        let candidate_len = candidate_chars.len();
+        let end = end_idx.min(candidate_len);
         let start_min = start_idx.saturating_sub(limit).min(end);
         let start_max = (start_idx + limit).min(end);
         let mut best_match: Option<TokenMatchDetail> = None;
+        let mut scratch = DamerauScratch::default();
         for s in start_min..=start_max {
-            let sliced: String = candidate_chars[s..end].iter().collect();
-            if let Some((_distance, operations)) =
-                bounded_damerau_levenshtein(&sliced, query_token, limit)
-            {
+            if let Some((_distance, operations)) = bounded_damerau_levenshtein_chars_with_scratch(
+                &candidate_chars[s..end],
+                &query_chars,
+                limit,
+                &mut scratch,
+            ) {
                 let position = if s == 0 {
                     0
-                } else if end == candidate_chars.len() {
+                } else if end == candidate_len {
                     1
                 } else {
                     2
@@ -1249,11 +1371,11 @@ fn fuzzy_or_exact_token_match(
                         position,
                         operations.insertions,
                     ),
-                    scope: if s == 0 && end == candidate_chars.len() {
+                    scope: if s == 0 && end == candidate_len {
                         TokenMatchScope::WholeToken
                     } else if s == 0 {
                         TokenMatchScope::Prefix
-                    } else if end == candidate_chars.len() {
+                    } else if end == candidate_len {
                         TokenMatchScope::Suffix
                     } else {
                         TokenMatchScope::Substring
@@ -1271,18 +1393,10 @@ fn fuzzy_or_exact_token_match(
         None
     };
 
-    let fragmented = if candidate_token
-        .chars()
-        .count()
-        .saturating_sub(query_token.chars().count())
-        > limit
-    {
+    let fragmented = if candidate_token.chars().count().saturating_sub(query_len) > limit {
         fragmented_token_match(query_token, candidate_token, limit).and_then(|matched| {
-            let ratio = matched.distance as f64
-                / query_token
-                    .chars()
-                    .count()
-                    .max(candidate_token.chars().count()) as f64;
+            let ratio =
+                matched.distance as f64 / query_len.max(candidate_token.chars().count()) as f64;
             if ratio > 0.5 || matched.internal_breaks == 0 {
                 return None;
             }

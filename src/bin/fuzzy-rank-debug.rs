@@ -216,10 +216,11 @@ fn format_path_match_summary(matched: &PathMatch<'_>) -> String {
 
 fn format_path_typo_cost(matched: &PathMatch<'_>) -> String {
     format!(
-        "{:?}\nkeyboard distance: {}\ndeletions: {}\nformula: keyboard distance + (deletions * 6)",
+        "{:?}\nkeyboard distance: {}\ndeletions: {}\ntranspositions: {}\nformula: keyboard distance + (deletions * 6) + (transpositions * 5)",
         matched.typo_costs.worst_first(),
         matched.operations.keyboard_distance,
         matched.operations.deletions,
+        matched.operations.transpositions,
     )
 }
 
@@ -438,7 +439,7 @@ fn format_coverage_rank(rank: &CoverageRank) -> String {
 }
 
 fn path_depth(path: &str) -> usize {
-    let trimmed = path.trim_end_matches(|character| matches!(character, '/' | '\\'));
+    let trimmed = path.trim_end_matches(['/', '\\']);
     let path = if trimmed.is_empty() { path } else { trimmed };
     path.chars()
         .filter(|character| matches!(character, '/' | '\\'))
