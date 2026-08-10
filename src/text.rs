@@ -8,6 +8,31 @@ pub fn to_lowercase(s: impl AsRef<str>) -> String {
 }
 
 pub fn token_has_signal(token: &str, candidate: &str) -> bool {
+    if token.is_ascii() && candidate.is_ascii() {
+        let token = token.as_bytes();
+        let candidate = candidate.as_bytes();
+        return match token {
+            [] => false,
+            [single] => candidate.contains(single),
+            token if token.len() <= 4 => {
+                token
+                    .iter()
+                    .filter(|ch| candidate.contains(ch))
+                    .take(2)
+                    .count()
+                    >= 2
+            }
+            token => {
+                token
+                    .windows(2)
+                    .filter(|pair| candidate.windows(2).any(|window| window == *pair))
+                    .take(2)
+                    .count()
+                    >= 2
+            }
+        };
+    }
+
     let chars = token.chars().collect::<Vec<_>>();
     match chars.as_slice() {
         [] => false,

@@ -170,7 +170,10 @@ fn run_path(config: &Config, mode: PathMode) -> Result<DebugReport, String> {
             "PATH.ORDERED_COMPOUND_COVERAGE",
             matched.ordered_compound_coverage().to_string(),
         ),
-        DebugStage::new("CORE.TYPO_COST_VECTOR", format_path_typo_cost(&matched)),
+        DebugStage::new(
+            "CORE.ALIGNMENT_COST_VECTOR",
+            format_alignment_cost(&matched),
+        ),
         DebugStage::new(
             "CORE.ORDER_VIOLATION_DISTANCE",
             matched.order_distance.to_string(),
@@ -187,6 +190,7 @@ fn run_path(config: &Config, mode: PathMode) -> Result<DebugReport, String> {
             format!("{:?}\n[whole_or_prefix, suffix, middle]", matched.position),
         ),
         DebugStage::new("CORE.SCORE_DESC", matched.score.to_string()),
+        DebugStage::new("CORE.TYPO_COST_VECTOR", format_path_typo_cost(&matched)),
         DebugStage::new(
             "CORE.INSERTION_VECTOR",
             format!("{:?}", matched.insertions.worst_first()),
@@ -221,6 +225,13 @@ fn format_path_typo_cost(matched: &PathMatch<'_>) -> String {
         matched.operations.keyboard_distance,
         matched.operations.deletions,
         matched.operations.transpositions,
+    )
+}
+
+fn format_alignment_cost(matched: &PathMatch<'_>) -> String {
+    format!(
+        "{:?}\nformula: (substitutions + deletions + transpositions + fragmented + internal breaks) * 1000",
+        matched.alignment_costs.worst_first(),
     )
 }
 

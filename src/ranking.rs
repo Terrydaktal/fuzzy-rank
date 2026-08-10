@@ -1,7 +1,8 @@
 use std::cmp::Ordering;
 
 use crate::core::{
-    InsertionVector, OperationProfile, TypoCostVector, compare_key_asc, compare_score_desc,
+    AlignmentCostVector, InsertionVector, OperationProfile, TypoCostVector, compare_key_asc,
+    compare_score_desc,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -234,6 +235,7 @@ pub struct PathTypoSortKey<'a> {
     pub distance: usize,
     pub order_distance: usize,
     pub operations: OperationProfile,
+    pub alignment_costs: &'a AlignmentCostVector,
     pub typo_costs: &'a TypoCostVector,
     pub insertions: &'a InsertionVector,
     pub segment: &'a [usize],
@@ -250,18 +252,13 @@ pub fn compare_path_typo_sort_keys(
     left: &PathTypoSortKey<'_>,
     right: &PathTypoSortKey<'_>,
 ) -> Ordering {
-    left.typo_costs
-        .cmp(right.typo_costs)
+    left.alignment_costs
+        .cmp(right.alignment_costs)
         .then_with(|| left.order_distance.cmp(&right.order_distance))
-        .then_with(|| compare_path_tail(left, right))
-}
-
-fn compare_path_tail(left: &PathTypoSortKey<'_>, right: &PathTypoSortKey<'_>) -> Ordering {
-    right
-        .segment
-        .cmp(left.segment)
+        .then_with(|| right.segment.cmp(left.segment))
         .then_with(|| right.position.cmp(left.position))
         .then_with(|| compare_score_desc(left.score, right.score))
+        .then_with(|| left.typo_costs.cmp(right.typo_costs))
         .then_with(|| left.insertions.cmp(right.insertions))
         .then_with(|| path_depth(left.key).cmp(&path_depth(right.key)))
         .then_with(|| compare_key_asc(left.key, right.key))
@@ -271,7 +268,8 @@ pub fn path_typo_keys_are_ambiguous(
     left: &PathTypoSortKey<'_>,
     right: &PathTypoSortKey<'_>,
 ) -> bool {
-    left.typo_costs == right.typo_costs
+    left.alignment_costs == right.alignment_costs
+        && left.typo_costs == right.typo_costs
         && left.order_distance == right.order_distance
         && left.segment == right.segment
         && left.position == right.position
@@ -286,6 +284,7 @@ mod tests {
     fn path_key<'a>(
         segment: &'a [usize],
         position: &'a [usize; 3],
+        alignment_costs: &'a AlignmentCostVector,
         typo_costs: &'a TypoCostVector,
         insertions: &'a InsertionVector,
     ) -> PathTypoSortKey<'a> {
@@ -293,6 +292,7 @@ mod tests {
             distance: 1,
             order_distance: 0,
             operations: OperationProfile::default(),
+            alignment_costs,
             typo_costs,
             insertions,
             segment,
@@ -306,14 +306,28 @@ mod tests {
     fn path_vectors_prefer_stronger_segment_then_position_counts() {
         let typo_costs = TypoCostVector::default();
         let insertions = InsertionVector::default();
-        let basename_and_grandparent = path_key(&[1, 0, 1], &[0, 2, 0], &typo_costs, &insertions);
-        let two_parent_matches = path_key(&[0, 2], &[2, 0, 0], &typo_costs, &insertions);
+        let alignment_costs = AlignmentCostVector::default();
+        let basename_and_grandparent = path_key(
+            &[1, 0, 1],
+            &[0, 2, 0],
+            &alignment_costs,
+            &typo_costs,
+            &insertions,
+        );
+        let two_parent_matches = path_key(
+            &[0, 2],
+            &[2, 0, 0],
+            &alignment_costs,
+            &typo_costs,
+            &insertions,
+        );
         assert!(
             compare_path_typo_sort_keys(&basename_and_grandparent, &two_parent_matches).is_lt()
         );
 
-        let whole_or_prefix = path_key(&[2], &[2, 0, 0], &typo_costs, &insertions);
-        let suffixes = path_key(&[2], &[0, 2, 0], &typo_costs, &insertions);
+        let whole_or_prefix =
+            path_key(&[2], &[2, 0, 0], &alignment_costs, &typo_costs, &insertions);
+        let suffixes = path_key(&[2], &[0, 2, 0], &alignment_costs, &typo_costs, &insertions);
         assert!(compare_path_typo_sort_keys(&whole_or_prefix, &suffixes).is_lt());
     }
 }

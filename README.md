@@ -316,6 +316,7 @@ Shared implementation cross-reference:
 | `CORE.DISTANCE` | command history; indirectly path and metadata typo stages | bounded Damerau-Levenshtein engine in `core.rs` |
 | `CORE.OPERATIONS` | path, command history, metadata | `OperationProfile` in `core.rs` |
 | `CORE.TYPO_COST_VECTOR` | path, command history, metadata | query-aligned and worst-first weighted typo-cost vectors in `core.rs` |
+| `CORE.ALIGNMENT_COST_VECTOR` | path | query-aligned and worst-first coarse edit-and-fragmentation vectors using `alignment_cost_milli` and `RankedTokenVector` in `core.rs` |
 | `CORE.INSERTION_VECTOR` | path, command history, metadata | query-aligned and worst-first insertion-count vectors in `core.rs` |
 | `CORE.SIMPLE_POSITION_VECTOR` | path | shared three-class counter from `simple_position_vector` and `increment_simple_position_vector` in `core.rs` |
 | `CORE.POSITION_VECTOR` | metadata | shared configurable class counter from `position_vector` in `core.rs` |
@@ -363,15 +364,15 @@ that position; it does not by itself mean the adaptor is missing required policy
 | 2 | `[CORE.EXACT_SUBPHRASE_COUNTS_VECTOR]` | `[CORE.EXACT_SUBPHRASE_COUNTS_VECTOR]` | `[CORE.EXACT_COVERAGE]` | `[CORE.EXACT_SUBPHRASE_COUNTS_VECTOR]` | `[CORE.EXACT_SUBPHRASE_COUNTS_VECTOR]` |
 | 3 | `[CORE.EXACT_COVERAGE]` | `[CORE.EXACT_COVERAGE]` | `[CORE.EXACT_SUBPHRASE_COUNTS_VECTOR]` | `[CORE.EXACT_WEIGHTED_POSITIONAL_COVERAGE_VECTOR]` | `[CORE.EXACT_WEIGHTED_POSITIONAL_COVERAGE_VECTOR]` |
 | 4 | `[PATH.ORDERED_COMPOUND_COVERAGE]` | `[PATH.ORDERED_COMPOUND_COVERAGE]` | `[COMMAND.TOTAL_COVERAGE]` | `[CORE.EXACT_FIELD_QUALITY]` | `[CORE.EXACT_FIELD_QUALITY]` |
-| 5 | `[PATH.SEGMENT_VECTOR]` | `[CORE.TYPO_COST_VECTOR]` | `[COMMAND.FUZZY_SUBPHRASE_COUNTS_VECTOR]` | `[CORE.ORDER_VIOLATION_DISTANCE]` | `[CORE.EXACT_PHRASE_OCCURRENCE_RANK]` |
+| 5 | `[PATH.SEGMENT_VECTOR]` | `[CORE.ALIGNMENT_COST_VECTOR]` | `[COMMAND.FUZZY_SUBPHRASE_COUNTS_VECTOR]` | `[CORE.ORDER_VIOLATION_DISTANCE]` | `[CORE.EXACT_PHRASE_OCCURRENCE_RANK]` |
 | 6 | `[CORE.SIMPLE_POSITION_VECTOR]` | `[CORE.ORDER_VIOLATION_DISTANCE]` | `[CORE.TYPO_COST_VECTOR]` | `[CORE.ORDERED_SPAN.GAP]` | `[CORE.EXACT_TOKEN_OCCURRENCE_RANK]` |
 | 7 | `[CORE.SCORE_DESC]` | `[PATH.SEGMENT_VECTOR]` | `[CORE.INSERTION_VECTOR]` | `[CORE.EXACT_PHRASE_OCCURRENCE_RANK]` | `[METADATA.FUZZY_WHOLE_PHRASE]` |
 | 8 | `[CORE.INSERTION_VECTOR]` | `[CORE.SIMPLE_POSITION_VECTOR]` | `[CORE.OPERATIONS]` | `[CORE.EXACT_TOKEN_OCCURRENCE_RANK]` | `[METADATA.FUZZY_SUBPHRASE_COUNTS_VECTOR]` |
 | 9 | `[PATH.DEPTH]` | `[CORE.SCORE_DESC]` | `[CORE.ORDER_VIOLATION_DISTANCE]` | `[CORE.DENSITY]` | `[METADATA.FUZZY_WEIGHTED_POSITIONAL_COVERAGE_VECTOR]` |
-| 10 | `[CORE.KEY_ASC]` | `[CORE.INSERTION_VECTOR]` | `[CORE.ORDERED_SPAN.GAP]` | `[CORE.SCORE_DESC]` | `[METADATA.FUZZY_FIELD_QUALITY]` |
-| 11 | — | `[PATH.DEPTH]` | `[CORE.SCORE_DESC]` | `[CORE.KEY_ASC]` | `[CORE.TYPO_COST_VECTOR]` |
-| 12 | — | `[CORE.KEY_ASC]` | `[CORE.KEY_ASC]` | — | `[CORE.INSERTION_VECTOR]` |
-| 13 | — | — | — | — | `[CORE.ORDER_VIOLATION_DISTANCE]` |
+| 10 | `[CORE.KEY_ASC]` | `[CORE.TYPO_COST_VECTOR]` | `[CORE.ORDERED_SPAN.GAP]` | `[CORE.SCORE_DESC]` | `[METADATA.FUZZY_FIELD_QUALITY]` |
+| 11 | — | `[CORE.INSERTION_VECTOR]` | `[CORE.SCORE_DESC]` | `[CORE.KEY_ASC]` | `[CORE.TYPO_COST_VECTOR]` |
+| 12 | — | `[PATH.DEPTH]` | `[CORE.KEY_ASC]` | — | `[CORE.INSERTION_VECTOR]` |
+| 13 | — | `[CORE.KEY_ASC]` | — | — | `[CORE.ORDER_VIOLATION_DISTANCE]` |
 | 14 | — | — | — | — | `[CORE.ORDERED_SPAN.GAP]` |
 | 15 | — | — | — | — | `[CORE.DENSITY]` |
 | 16 | — | — | — | — | `[CORE.SCORE_DESC]` |
@@ -383,6 +384,38 @@ The matrix exposes both forms of reuse:
 
 - the same implementation at different orders or behind adapter policy, as shown by the shared implementation table
 - the same implementation at different orders, such as `CORE.SCORE_DESC` and `CORE.KEY_ASC`
+
+`CORE.ALIGNMENT_COST_VECTOR` stores one stable coarse cost for every aligned
+query token:
+
+```text
+(substitutions + query-only deletions + transpositions
+ + fragmented_alignment + internal_breaks)
+* 1000
+```
+
+Each substitution, query-only deletion, and transposition counts as one coarse
+edit at this stage. A fragmented alignment adds one class unit, and every gap
+between its matched runs adds one more. Candidate-only character count and gap
+length do not otherwise contribute. The vector is compared worst-first and
+ascending for every path candidate.
+
+The fragmented matcher already counts matched-run boundaries during its dynamic-
+programming pass, so this key does not run another edit-distance search, divide,
+or rescan the candidate. Leading, trailing, and within-gap candidate characters
+remain in `CORE.INSERTION_VECTOR` as low-priority structural slack. This prevents
+short queries such as `dav` from preferring many scattered runs inside
+`aimodeinteract`, while preserving intentional two-run compounds such as
+`applaunch` -> `applicationlauncher` regardless of the inserted middle's length.
+
+This stage intentionally does not distinguish nearby-key substitutions from
+far-key substitutions or apply the deletion and transposition likelihood
+weights. Candidates with the same coarse number of plausible edits proceed to
+order, path segment, within-segment position, and caller score. The detailed
+`CORE.TYPO_COST_VECTOR` then resolves any remaining tie. This allows frecency to
+choose between equally plausible one-edit paths without allowing fragmented
+matches with large internal gaps to win merely because their raw edit script is
+cheap.
 
 `CORE.TYPO_COST_VECTOR` stores two views of the same per-token evidence. For a
 three-token query, aligned costs `[1, 2, 0]` mean that the first token has cost
@@ -403,11 +436,13 @@ keyboard distance
 Here `deletion` means a character present in the typed query but absent from the
 candidate, while `insertion` means a character present in the candidate but
 absent from the query. Candidate-side insertions are deliberately excluded from
-`CORE.TYPO_COST_VECTOR`; they are retained in `CORE.INSERTION_VECTOR` and used
-later as a low-priority noise tie-break. Each adjacent transposition contributes
-`5` to the core cost. Its fixed operation-likelihood penalty remains a separate
-lower-level comparator input. The raw Damerau distance still controls whether a
-candidate is admissible, but is not added as a separate sort key.
+`CORE.TYPO_COST_VECTOR`; they are retained in `CORE.INSERTION_VECTOR`. Only the
+subset lying between fragmented matched runs contributes to the alignment cost
+stage described above. Each adjacent
+transposition contributes `5` to the core cost. Its fixed operation-likelihood
+penalty remains a separate lower-level comparator input. The raw Damerau distance
+still controls whether a candidate is admissible, but is not added as a separate
+sort key.
 
 `CORE.INSERTION_VECTOR` uses the same representation and comparison. For
 example, aligned insertions `[0, 4]` are retained for provenance and compared as
@@ -434,15 +469,16 @@ Shared implementation coverage, with each cell showing its sort position:
 | `CORE.EXACT_WEIGHTED_POSITIONAL_COVERAGE_VECTOR` | — | — | — | 3 | 3 |
 | `CORE.EXACT_FIELD_QUALITY` | — | — | — | 4 | 4 |
 | `CORE.EXACT_TOKEN_OCCURRENCE_RANK` | — | — | — | 8 | 6 |
+| `CORE.ALIGNMENT_COST_VECTOR` | — | 5 | — | — | — |
 | `CORE.ORDER_VIOLATION_DISTANCE` | — | 6 | 9 | 5 | 13 |
 | `CORE.ORDERED_SPAN.GAP` | — | — | 8 | 6 | 14 |
 | `CORE.DENSITY` | — | — | — | 9 | 15 |
-| `CORE.DISTANCE` | — | through 5 | through 6 | — | through 9 |
-| `CORE.OPERATIONS` | — | through 5 and 10 | 6 | — | through 9 and 10 |
-| `CORE.INSERTION_VECTOR` | 8 | 10 | 7 | — | 10 |
-| `CORE.RATIO` | — | — | — | — | internal `SearchRank` |
+| `CORE.DISTANCE` | — | through 5 and 10 | through 6 | — | through 9 |
+| `CORE.OPERATIONS` | — | through 5, 10, and 11 | 6 | — | through 9 and 10 |
+| `CORE.INSERTION_VECTOR` | 8 | 11 | 7 | — | 12 |
+| `CORE.RATIO` | — | admission only | — | — | internal `SearchRank` |
 | `CORE.SCORE_DESC` | 7 | 9 | 11 | 10 | 16 |
-| `CORE.KEY_ASC` | 10 | 12 | 12 | 11 | 18 |
+| `CORE.KEY_ASC` | 10 | 13 | 12 | 11 | 18 |
 
 `through N` means the shared primitive contributes to the named adaptor stage
 rather than appearing as an independent key. A dash makes an omitted shared
@@ -558,9 +594,12 @@ that tie-break.
 ### `path::bulk`
 
 `path::bulk` is the high-throughput execution strategy for scanning large path
-collections with the `path::exact` ordering. It normalizes and scans each
-candidate once, materializes an immutable `BulkPathMatch`, and supports both a
-full sort and bounded top-k collection through `BulkTopK`.
+collections with the `path::exact` ordering. `BulkQuery` owns the normalized
+query terms, while `PreparedBulkPath` owns query-independent normalized path
+data and depth. Callers can prepare each source path once and reuse it across
+keystrokes, then materialize an immutable `BulkPathMatch` only for candidates
+that survive the cheap gate. Bulk supports both a full sort and bounded top-k
+collection through `BulkTopK`.
 
 It is not a separate relevance policy: `BulkPathMatch::compare` uses the same
 ten exact-path sort stages documented above. The caller may use `BulkTopK`
@@ -569,7 +608,15 @@ thread pool.
 
 The direct literal scan remains the fast path. When it fails, bulk uses the
 shared ordered compound matcher, so compact `geminipackages` can match
-`gemini-cli/packages` without invoking typo distance.
+`gemini-cli/packages` without invoking typo distance. The gate is deliberately
+conservative: it may retain extra candidates, but it never rejects a candidate
+that the full ordered exact matcher would accept.
+
+Single-term bulk queries use a dedicated equivalent path that derives phrase
+presence, coverage, segment, position, insertions, and depth without building
+temporary component trees. Segment vectors remain inline for ordinary path
+depths, avoiding per-match heap allocation for extremely broad queries such as
+one-character filters.
 
 ### `path::typo`
 
@@ -601,7 +648,7 @@ substitutions.
 token assignment. It lets an in-order zero-cost match beat an otherwise
 equivalent reversed match without charging token order as typo distance.
 
-The effective `path::typo` comparator is a twelve-stage pipeline. `PathMatch::compare`
+The effective `path::typo` comparator is a thirteen-stage pipeline. `PathMatch::compare`
 owns the first four stages, then delegates the remaining stages to the shared
 `PathTypoSortKey` comparator in `ranking.rs`:
 
@@ -609,14 +656,15 @@ owns the first four stages, then delegates the remaining stages to the shared
 2. `[CORE.EXACT_SUBPHRASE_COUNTS_VECTOR]` exact proper contiguous query-token subphrase-presence vector, descending and lexicographic
 3. `[CORE.EXACT_COVERAGE]` exact distinct query-token coverage, descending; each distinct query token contributes one point regardless of whether it matches as a whole token, prefix, suffix, or arbitrary substring
 4. `[PATH.ORDERED_COMPOUND_COVERAGE]` compact query tokens reconstructed from two or more ordered path tokens, descending
-5. `[CORE.TYPO_COST_VECTOR]` per-query-token weighted typo costs, worst cost first for comparison
+5. `[CORE.ALIGNMENT_COST_VECTOR]` per-query-token coarse edit-and-fragmentation cost, worst value first and ascending
 6. `[CORE.ORDER_VIOLATION_DISTANCE]` query-to-candidate token assignment inversion count, ascending
 7. `[PATH.SEGMENT_VECTOR]` segment-count vector, descending and lexicographic
 8. `[CORE.SIMPLE_POSITION_VECTOR]` whole-or-prefix/suffix/middle count vector, descending and lexicographic
 9. `[CORE.SCORE_DESC]` descending `CALLER.SCORE`
-10. `[CORE.INSERTION_VECTOR]` per-query-token insertion counts, worst count first
-11. `[PATH.DEPTH]` `path_depth`
-12. `[CORE.KEY_ASC]` `key`
+10. `[CORE.TYPO_COST_VECTOR]` per-query-token detailed weighted typo costs, worst cost first for comparison
+11. `[CORE.INSERTION_VECTOR]` per-query-token insertion counts, worst count first
+12. `[PATH.DEPTH]` `path_depth`
+13. `[CORE.KEY_ASC]` `key`
 
 Phrase and subphrase stages use token-prefix exactness. Exact coverage uses
 arbitrary substring exactness, so whole-token, prefix, suffix, and internal
@@ -635,9 +683,9 @@ Path exact relevance is evaluated lazily. Each candidate first gets one cached
 exact-token signal probe using the same substring predicate as exact coverage.
 When neither side of a comparison has that signal, exact phrase,
 subphrase, and coverage stages are treated as zero and the comparator proceeds
-to typo cost. Candidates with exact-token evidence still use those stages in
-their documented order. This changes only when keys are calculated, not the
-sort order.
+to coarse alignment cost. Candidates with exact-token evidence still
+use those stages in their documented order. This changes only when keys are
+calculated, not the sort order.
 
 Both branches are strict lexicographic pipelines. A subordinate key is compared
 only when all preceding keys are equal; it can never outweigh an earlier key.
@@ -655,10 +703,16 @@ does not impose a separate exact-before-typo class; it ranks candidates through
 the shared exact-evidence and typo-quality stages above.
 
 The debug CLI includes the inputs used by each stage. For path typo matches,
-`CORE.TYPO_COST_VECTOR` shows the worst-first cost vector, keyboard distance,
+`CORE.ALIGNMENT_COST_VECTOR` shows the worst-first fixed-point cost in
+thousandths. It counts substitutions, query-only deletions, transpositions, one
+unit for using fragmented alignment, and one unit per internal matched-run
+break. It excludes candidate-only character counts.
+`CORE.TYPO_COST_VECTOR` shows the worst-first cost vector, keyboard
+distance,
 query-only deletions, and its formula. `CORE.INSERTION_VECTOR` separately shows
-candidate-only insertions. Raw Damerau distance and normalized ratio are
-admission/provenance data rather than additional path sort keys. The `PathMatch`
+candidate-only insertions. The existing `PathMatch.ratio` and raw Damerau
+distance remain admission/provenance data; `CORE.ALIGNMENT_COST_VECTOR`
+is the separate fuzzy sort key described above. The `PathMatch`
 value in the result summary likewise includes internal/cache fields for
 inspection; it is not a second ordering.
 
@@ -677,12 +731,15 @@ records both cases and is intentionally lower priority than core typo cost.
 
 The path-specific comparator uses the exact stages above, then:
 
-- weighted core typo cost: keyboard distance plus six per query-only deletion and
-  five per transposition
+- coarse alignment cost: one unit per substitution, query-only deletion, or
+  transposition, plus one for fragmented alignment and one per internal matched-
+  run break; compared worst-first and ascending
 - query-to-candidate order violation distance
 - the segment vector, descending lexicographically: basename count, parent count, grandparent count, and so on
 - the position vector, descending lexicographically: whole token or prefix, suffix, then middle substring
 - descending caller `score`
+- detailed weighted core typo cost: keyboard distance plus six per query-only
+  deletion and five per transposition
 - raw `insertions`, ascending, as a separate noise key
 
 For single-token contiguous substring matches that satisfy the normal path exact

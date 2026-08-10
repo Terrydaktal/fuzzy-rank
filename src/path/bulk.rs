@@ -3,22 +3,77 @@
 //! This keeps the `path::exact` ordering while preparing all rank inputs once
 //! per candidate instead of recalculating them lazily during comparison.
 
-use std::{cmp::Ordering, collections::BinaryHeap};
+use std::{cmp::Ordering, collections::BinaryHeap, sync::Arc};
+
+use smallvec::SmallVec;
 
 use crate::core::{
     InsertionVector, compare_key_asc, compare_score_desc, exact_distinct_coverage,
     exact_phrase_present, exact_subphrase_counts_vector,
 };
-use crate::path::{normalize_path, ordered_path_evidence, path_depth};
+use crate::path::{
+    compound_term_may_match, normalize_path, ordered_path_evidence, path_depth,
+    single_term_path_evidence,
+};
 use crate::text::split_path_tokens;
 
 pub type Score = f64;
+pub type BulkSegmentVector = SmallVec<[usize; 8]>;
+
+#[derive(Clone, Debug)]
+pub struct BulkQuery {
+    keywords: Arc<[String]>,
+}
+
+impl BulkQuery {
+    pub fn new(keywords: &[String]) -> Self {
+        Self {
+            keywords: keywords.to_vec().into(),
+        }
+    }
+
+    pub fn keywords(&self) -> &[String] {
+        &self.keywords
+    }
+
+    fn may_match_normalized(&self, normalized_path: &str) -> bool {
+        self.keywords.iter().all(|keyword| {
+            normalized_path.contains(keyword) || compound_term_may_match(normalized_path, keyword)
+        })
+    }
+}
+
+/// Candidate preparation shared by repeated searches over the same source.
+/// The original path remains owned by the caller; this stores only derived
+/// data that is independent of the query.
+#[derive(Clone, Debug)]
+pub struct PreparedBulkPath {
+    normalized: String,
+    depth: usize,
+}
+
+impl PreparedBulkPath {
+    pub fn new(path: &str) -> Self {
+        let normalized = normalize_path(path);
+        let depth = path_depth(&normalized);
+        Self { normalized, depth }
+    }
+
+    pub fn exact_match<'a>(
+        &self,
+        path: &'a str,
+        query: &BulkQuery,
+        score: Score,
+    ) -> Option<BulkPathMatch<'a>> {
+        exact_match_prepared(path, self, query, score)
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct BulkPathMatch<'a> {
     pub path: &'a str,
     pub score: Score,
-    pub segment: Vec<usize>,
+    pub segment: BulkSegmentVector,
     pub position: [usize; 3],
     pub insertions: InsertionVector,
     pub exact_phrase_present: bool,
@@ -58,8 +113,36 @@ pub fn exact_match<'a>(
     keywords: &[String],
     score: Score,
 ) -> Option<BulkPathMatch<'a>> {
-    let normalized_path = normalize_path(path);
-    let evidence = ordered_path_evidence(&normalized_path, keywords)?;
+    let query = BulkQuery::new(keywords);
+    exact_match_with_query(path, &query, score)
+}
+
+pub fn exact_match_with_query<'a>(
+    path: &'a str,
+    query: &BulkQuery,
+    score: Score,
+) -> Option<BulkPathMatch<'a>> {
+    let prepared = PreparedBulkPath::new(path);
+    exact_match_prepared(path, &prepared, query, score)
+}
+
+pub fn exact_match_prepared<'a>(
+    path: &'a str,
+    prepared: &PreparedBulkPath,
+    query: &BulkQuery,
+    score: Score,
+) -> Option<BulkPathMatch<'a>> {
+    if !query.may_match_normalized(&prepared.normalized) {
+        return None;
+    }
+
+    let normalized_path = &prepared.normalized;
+    let keywords = query.keywords();
+    if let [keyword] = keywords {
+        return exact_match_single_term(path, prepared, keyword, score);
+    }
+
+    let evidence = ordered_path_evidence(normalized_path, keywords)?;
     let components = normalized_path
         .split(['/', '\\'])
         .filter(|component| !component.is_empty())
@@ -71,7 +154,7 @@ pub fn exact_match<'a>(
     Some(BulkPathMatch {
         path,
         score,
-        segment: evidence.segment,
+        segment: evidence.segment.into_iter().collect(),
         position: evidence.position,
         insertions: InsertionVector::new(evidence.insertions),
         exact_phrase_present: exact_phrase_present(keywords, components.iter().map(Vec::as_slice)),
@@ -81,7 +164,43 @@ pub fn exact_match<'a>(
         ),
         exact_coverage,
         ordered_compound_coverage,
-        path_depth: path_depth(&normalized_path),
+        path_depth: prepared.depth,
+    })
+}
+
+fn exact_match_single_term<'a>(
+    path: &'a str,
+    prepared: &PreparedBulkPath,
+    keyword: &str,
+    score: Score,
+) -> Option<BulkPathMatch<'a>> {
+    let evidence = single_term_path_evidence(&prepared.normalized, keyword)?;
+    let exact_token_prefix = prepared
+        .normalized
+        .split(|character: char| {
+            matches!(character, '/' | '\\' | '-' | '_' | '.') || character.is_whitespace()
+        })
+        .filter(|token| !token.is_empty())
+        .any(|token| token.starts_with(keyword));
+
+    let mut segment = BulkSegmentVector::new();
+    segment.resize(evidence.segment + 1, 0);
+    segment[evidence.segment] = 1;
+
+    let mut position = [0; 3];
+    position[evidence.position.min(2)] = 1;
+
+    Some(BulkPathMatch {
+        path,
+        score,
+        segment,
+        position,
+        insertions: InsertionVector::from_slice(&[evidence.insertions]),
+        exact_phrase_present: exact_token_prefix,
+        exact_subphrase_counts_vector: Vec::new(),
+        exact_coverage: usize::from(exact_token_prefix),
+        ordered_compound_coverage: usize::from(evidence.compound),
+        path_depth: prepared.depth,
     })
 }
 
@@ -223,6 +342,39 @@ mod tests {
     }
 
     #[test]
+    fn single_term_fast_path_preserves_path_exact_ordering() {
+        let keywords = vec!["a".to_string()];
+        let paths = [
+            "/home/lewis/a.out",
+            "/home/lewis/.android",
+            "/home/lewis/.nv/ComputeCache/a",
+            "/home/lewis/.aspera/connect/bin/ascp",
+        ];
+
+        let mut exact = paths
+            .iter()
+            .filter_map(|path| regular_exact_match(path, &keywords, 1.0))
+            .collect::<Vec<_>>();
+        exact.sort_unstable_by(|left, right| compare_exact_path_matches(left, right, &keywords));
+
+        let mut fast = paths
+            .iter()
+            .filter_map(|path| super::exact_match(path, &keywords, 1.0))
+            .collect::<Vec<_>>();
+        fast.sort_unstable_by(BulkPathMatch::compare);
+
+        assert_eq!(
+            fast.iter()
+                .map(|candidate| candidate.path)
+                .collect::<Vec<_>>(),
+            exact
+                .iter()
+                .map(|candidate| candidate.path)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn streaming_top_k_matches_the_fully_sorted_prefix() {
         let keywords = ["app", "launch"]
             .into_iter()
@@ -271,7 +423,7 @@ mod tests {
         let path = "/home/lewis/repos/gemini-cli/packages/core/dist/docs/cli/using-agent-skills.md";
         let matched = super::exact_match(path, &keywords, 0.0).unwrap();
 
-        assert_eq!(matched.segment, vec![0, 0, 0, 0, 0, 1, 1]);
+        assert_eq!(matched.segment.as_slice(), &[0, 0, 0, 0, 0, 1, 1]);
         assert_eq!(matched.position, [2, 0, 0]);
         assert_eq!(matched.insertions.aligned(), &[0, 0]);
     }
@@ -284,7 +436,7 @@ mod tests {
 
         assert_eq!(matched.exact_coverage, 0);
         assert_eq!(matched.ordered_compound_coverage, 1);
-        assert_eq!(matched.segment, vec![0, 0, 0, 0, 0, 1]);
+        assert_eq!(matched.segment.as_slice(), &[0, 0, 0, 0, 0, 1]);
         assert_eq!(matched.position, [1, 0, 0]);
         assert_eq!(matched.insertions.aligned(), &[5]);
     }
@@ -296,7 +448,7 @@ mod tests {
         let nested =
             super::exact_match("/home/lewis/Dev/wordelites/.codex", &keywords, 0.0).unwrap();
 
-        assert_eq!(shallow.segment, vec![1]);
+        assert_eq!(shallow.segment.as_slice(), &[1]);
         assert_eq!(shallow.path_depth, 3);
         assert!(shallow.compare(&nested).is_lt());
     }

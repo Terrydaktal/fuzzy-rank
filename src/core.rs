@@ -151,6 +151,17 @@ pub fn ratio_milli(distance: usize, compared_len: usize) -> usize {
     distance * 1000 / compared_len.max(1)
 }
 
+pub fn alignment_cost_milli(
+    operations: OperationProfile,
+    fragmented: bool,
+    internal_breaks: usize,
+) -> usize {
+    let true_typo_operations =
+        operations.substitutions + operations.deletions + operations.transpositions;
+    let fragmentation_cost = usize::from(fragmented) + internal_breaks;
+    (true_typo_operations + fragmentation_cost) * 1000
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DensityRank {
     pub matched_tokens: usize,
@@ -587,19 +598,45 @@ pub fn keyboard_substitution_cost(left: char, right: char) -> usize {
 }
 
 fn qwerty_position(ch: char) -> Option<(usize, usize)> {
-    let ch = ch.to_ascii_lowercase();
-    let rows = [
-        ("1234567890", 0usize, 0usize),
-        ("qwertyuiop", 1usize, 0usize),
-        ("asdfghjkl", 2usize, 1usize),
-        ("zxcvbnm", 3usize, 3usize),
-    ];
-    for (row_idx, (row, x_offset, y_scale)) in rows.iter().enumerate() {
-        if let Some(col_idx) = row.chars().position(|candidate| candidate == ch) {
-            return Some((x_offset + col_idx * 2, row_idx * 2 + y_scale));
-        }
+    match ch.to_ascii_lowercase() {
+        '1' => Some((0, 0)),
+        '2' => Some((2, 0)),
+        '3' => Some((4, 0)),
+        '4' => Some((6, 0)),
+        '5' => Some((8, 0)),
+        '6' => Some((10, 0)),
+        '7' => Some((12, 0)),
+        '8' => Some((14, 0)),
+        '9' => Some((16, 0)),
+        '0' => Some((18, 0)),
+        'q' => Some((1, 2)),
+        'w' => Some((3, 2)),
+        'e' => Some((5, 2)),
+        'r' => Some((7, 2)),
+        't' => Some((9, 2)),
+        'y' => Some((11, 2)),
+        'u' => Some((13, 2)),
+        'i' => Some((15, 2)),
+        'o' => Some((17, 2)),
+        'p' => Some((19, 2)),
+        'a' => Some((2, 5)),
+        's' => Some((4, 5)),
+        'd' => Some((6, 5)),
+        'f' => Some((8, 5)),
+        'g' => Some((10, 5)),
+        'h' => Some((12, 5)),
+        'j' => Some((14, 5)),
+        'k' => Some((16, 5)),
+        'l' => Some((18, 5)),
+        'z' => Some((3, 9)),
+        'x' => Some((5, 9)),
+        'c' => Some((7, 9)),
+        'v' => Some((9, 9)),
+        'b' => Some((11, 9)),
+        'n' => Some((13, 9)),
+        'm' => Some((15, 9)),
+        _ => None,
     }
-    None
 }
 
 fn substitution_likelihood_penalty(keyboard_distance: usize) -> usize {
@@ -976,6 +1013,51 @@ mod tests {
     }
 
     #[test]
+    fn alignment_cost_counts_edits_and_fragmented_run_structure() {
+        let compact_typo = OperationProfile {
+            substitutions: 1,
+            keyboard_distance: 6,
+            ..OperationProfile::default()
+        };
+        let fragmented = OperationProfile {
+            substitutions: 1,
+            insertions: 11,
+            keyboard_distance: 2,
+            ..OperationProfile::default()
+        };
+
+        assert_eq!(alignment_cost_milli(compact_typo, false, 0), 1000);
+        assert_eq!(alignment_cost_milli(fragmented, true, 2), 4000);
+        assert_eq!(alignment_cost_milli(fragmented, true, 0), 2000);
+
+        let compact_short_typo = OperationProfile {
+            substitutions: 2,
+            keyboard_distance: 4,
+            ..OperationProfile::default()
+        };
+        let exact_short_fragment = OperationProfile {
+            insertions: 4,
+            ..OperationProfile::default()
+        };
+        assert_eq!(alignment_cost_milli(compact_short_typo, false, 0), 2000);
+        assert_eq!(alignment_cost_milli(exact_short_fragment, true, 1), 2000);
+
+        let compact_long_typo = OperationProfile {
+            substitutions: 1,
+            keyboard_distance: 4,
+            ..OperationProfile::default()
+        };
+        let plausible_long_fragment = OperationProfile {
+            substitutions: 1,
+            insertions: 5,
+            keyboard_distance: 2,
+            ..OperationProfile::default()
+        };
+        assert_eq!(alignment_cost_milli(plausible_long_fragment, true, 1), 3000);
+        assert_eq!(alignment_cost_milli(compact_long_typo, false, 0), 1000);
+    }
+
+    #[test]
     fn transposition_cost_is_below_query_deletion_cost() {
         let transposition = bounded_damerau_levenshtein("edb", "deb", 1).unwrap();
         assert_eq!(transposition.1.transpositions, 1);
@@ -987,10 +1069,60 @@ mod tests {
         assert!(transposition.1.core_typo_cost() < deletion.1.core_typo_cost());
     }
 }
+const INLINE_TOKEN_VECTOR_CAPACITY: usize = 4;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum TokenVectorStorage {
+    Inline {
+        values: [usize; INLINE_TOKEN_VECTOR_CAPACITY],
+        len: usize,
+    },
+    Heap(Vec<usize>),
+}
+
+impl Default for TokenVectorStorage {
+    fn default() -> Self {
+        Self::Inline {
+            values: [0; INLINE_TOKEN_VECTOR_CAPACITY],
+            len: 0,
+        }
+    }
+}
+
+impl TokenVectorStorage {
+    fn from_slice(values: &[usize]) -> Self {
+        if values.len() <= INLINE_TOKEN_VECTOR_CAPACITY {
+            let mut inline = [0; INLINE_TOKEN_VECTOR_CAPACITY];
+            inline[..values.len()].copy_from_slice(values);
+            Self::Inline {
+                values: inline,
+                len: values.len(),
+            }
+        } else {
+            Self::Heap(values.to_vec())
+        }
+    }
+
+    fn from_vec(values: Vec<usize>) -> Self {
+        if values.len() <= INLINE_TOKEN_VECTOR_CAPACITY {
+            Self::from_slice(&values)
+        } else {
+            Self::Heap(values)
+        }
+    }
+
+    fn as_slice(&self) -> &[usize] {
+        match self {
+            Self::Inline { values, len } => &values[..*len],
+            Self::Heap(values) => values,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RankedTokenVector {
-    aligned: Vec<usize>,
-    worst_first: Vec<usize>,
+    aligned: TokenVectorStorage,
+    worst_first: TokenVectorStorage,
 }
 
 impl RankedTokenVector {
@@ -998,23 +1130,42 @@ impl RankedTokenVector {
         let mut worst_first = aligned.clone();
         worst_first.sort_unstable_by(|left, right| right.cmp(left));
         Self {
-            aligned,
-            worst_first,
+            aligned: TokenVectorStorage::from_vec(aligned),
+            worst_first: TokenVectorStorage::from_vec(worst_first),
+        }
+    }
+
+    pub fn from_slice(aligned: &[usize]) -> Self {
+        if aligned.len() <= INLINE_TOKEN_VECTOR_CAPACITY {
+            let mut worst_first = [0; INLINE_TOKEN_VECTOR_CAPACITY];
+            worst_first[..aligned.len()].copy_from_slice(aligned);
+            worst_first[..aligned.len()].sort_unstable_by(|left, right| right.cmp(left));
+            return Self {
+                aligned: TokenVectorStorage::from_slice(aligned),
+                worst_first: TokenVectorStorage::from_slice(&worst_first[..aligned.len()]),
+            };
+        }
+
+        let mut worst_first = aligned.to_vec();
+        worst_first.sort_unstable_by(|left, right| right.cmp(left));
+        Self {
+            aligned: TokenVectorStorage::Heap(aligned.to_vec()),
+            worst_first: TokenVectorStorage::Heap(worst_first),
         }
     }
 
     pub fn aligned(&self) -> &[usize] {
-        &self.aligned
+        self.aligned.as_slice()
     }
 
     pub fn worst_first(&self) -> &[usize] {
-        &self.worst_first
+        self.worst_first.as_slice()
     }
 }
 
 impl Ord for RankedTokenVector {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.worst_first.cmp(&other.worst_first)
+        self.worst_first().cmp(other.worst_first())
     }
 }
 
@@ -1026,3 +1177,4 @@ impl PartialOrd for RankedTokenVector {
 
 pub type TypoCostVector = RankedTokenVector;
 pub type InsertionVector = RankedTokenVector;
+pub type AlignmentCostVector = RankedTokenVector;

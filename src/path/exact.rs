@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
 use crate::core::{InsertionVector, compare_key_asc, compare_score_desc};
-use crate::path::{PathExactRelevance, normalize_path, ordered_path_evidence, path_depth};
+use crate::path::{
+    PathExactRelevance, PreparedPath, normalize_path, ordered_path_evidence, path_depth,
+};
 
 pub type Score = f64;
 
@@ -36,13 +38,25 @@ pub(crate) fn exact_match_with_query_tokens<'a>(
     keywords: Arc<[String]>,
     score: Score,
 ) -> Option<ExactPathMatch<'a>> {
-    let normalized_path: Arc<str> = normalize_path(path).into();
-    let evidence = ordered_path_evidence(&normalized_path, &keywords)?;
-    let exact_relevance = PathExactRelevance::with_normalized_path(path, normalized_path, keywords)
-        .with_ordered_compound_coverage(evidence.ordered_compound_coverage);
+    let prepared = PreparedPath::new(path);
+    exact_match_prepared(&prepared, keywords, score)
+}
+
+pub(crate) fn exact_match_prepared<'a>(
+    prepared: &PreparedPath<'a>,
+    keywords: Arc<[String]>,
+    score: Score,
+) -> Option<ExactPathMatch<'a>> {
+    let evidence = ordered_path_evidence(prepared.normalized(), &keywords)?;
+    let exact_relevance = PathExactRelevance::with_normalized_path(
+        prepared.path(),
+        prepared.normalized_arc(),
+        keywords,
+    )
+    .with_ordered_compound_coverage(evidence.ordered_compound_coverage);
 
     Some(ExactPathMatch {
-        path,
+        path: prepared.path(),
         score,
         segment: evidence.segment,
         position: evidence.position,

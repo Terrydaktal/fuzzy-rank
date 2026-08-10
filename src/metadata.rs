@@ -12,6 +12,7 @@ use crate::ranking::{
 };
 use crate::text::{normalize_compact_alnum, split_search_tokens, to_lowercase, token_has_signal};
 use crate::token_match::fragmented_token_match;
+use std::borrow::Cow;
 use std::cell::OnceCell;
 use std::cmp::{Ordering, Reverse};
 
@@ -28,6 +29,46 @@ pub struct MetadataCandidate<'a> {
     pub key: &'a str,
     pub fields: &'a [SearchField<'a>],
     pub score: Score,
+}
+
+/// A metadata field prepared once for repeated searches.  The value is
+/// lower-cased and tokenised at construction time so ranking and sorting do
+/// not redo that work for every candidate.
+#[derive(Clone, Debug)]
+pub struct PreparedMetadataField {
+    pub priority: u8,
+    pub value: String,
+    pub tokens: Vec<String>,
+}
+
+impl PreparedMetadataField {
+    pub fn new(priority: u8, value: &str) -> Option<Self> {
+        let value = value.trim();
+        let lowered = to_lowercase(value);
+        let tokens = split_search_tokens(&lowered)
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        (!tokens.is_empty()).then_some(Self {
+            priority,
+            value: lowered,
+            tokens,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct PreparedMetadataCandidate<'a> {
+    pub key: &'a str,
+    pub fields: &'a [PreparedMetadataField],
+    pub score: Score,
+}
+
+pub fn prepare_fields(fields: &[SearchField<'_>]) -> Vec<PreparedMetadataField> {
+    fields
+        .iter()
+        .filter_map(|field| PreparedMetadataField::new(field.priority, field.value))
+        .collect()
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -57,6 +98,31 @@ pub struct MetadataQuery {
     allow_typo: bool,
 }
 
+trait MetadataFieldView {
+    fn priority(&self) -> u8;
+    fn lowered_value(&self) -> Cow<'_, str>;
+}
+
+impl MetadataFieldView for SearchField<'_> {
+    fn priority(&self) -> u8 {
+        self.priority
+    }
+
+    fn lowered_value(&self) -> Cow<'_, str> {
+        Cow::Owned(to_lowercase(self.value.trim()))
+    }
+}
+
+impl MetadataFieldView for PreparedMetadataField {
+    fn priority(&self) -> u8 {
+        self.priority
+    }
+
+    fn lowered_value(&self) -> Cow<'_, str> {
+        Cow::Borrowed(&self.value)
+    }
+}
+
 impl MetadataQuery {
     pub fn new(query: &str) -> Option<Self> {
         let query = normalize_metadata_query(query)?;
@@ -77,30 +143,41 @@ impl MetadataQuery {
     }
 
     pub fn search_rank(&self, candidate: MetadataCandidate<'_>) -> Option<SearchRank> {
+        self.search_rank_fields(candidate.fields)
+    }
+
+    pub fn search_rank_prepared(
+        &self,
+        candidate: PreparedMetadataCandidate<'_>,
+    ) -> Option<SearchRank> {
+        self.search_rank_fields(candidate.fields)
+    }
+
+    fn search_rank_fields<F: MetadataFieldView>(&self, fields: &[F]) -> Option<SearchRank> {
         if self.query_tokens.len() <= 1 {
-            return self.rank_single_query(self.query.as_str(), candidate);
+            return self.rank_single_query(self.query.as_str(), fields);
         }
 
         self.query_tokens
             .iter()
-            .filter_map(|query| self.rank_single_query(query, candidate))
+            .filter_map(|query| self.rank_single_query(query, fields))
             .min()
     }
 
-    fn rank_single_query(
+    fn rank_single_query<F: MetadataFieldView>(
         &self,
         query: &str,
-        candidate: MetadataCandidate<'_>,
+        fields: &[F],
     ) -> Option<SearchRank> {
         if self.allow_typo {
-            best_typo_rank(query, candidate.fields).map(SearchRank::Typo)
-        } else {
-            best_structural_rank(query, candidate.fields)
+            best_structural_rank(query, fields)
                 .map(SearchRank::Structural)
-                .or_else(|| {
-                    best_abbreviation_rank(query, candidate.fields).map(SearchRank::Abbreviation)
-                })
-                .or_else(|| best_fuzzy_rank(query, candidate.fields).map(SearchRank::Fuzzy))
+                .or_else(|| best_typo_rank(query, fields).map(SearchRank::Typo))
+        } else {
+            best_structural_rank(query, fields)
+                .map(SearchRank::Structural)
+                .or_else(|| best_abbreviation_rank(query, fields).map(SearchRank::Abbreviation))
+                .or_else(|| best_fuzzy_rank(query, fields).map(SearchRank::Fuzzy))
         }
     }
 
@@ -147,6 +224,76 @@ impl MetadataQuery {
 
         for (i, (cand, rank, _)) in lazy_matches.into_iter().enumerate() {
             matches[i] = (cand, rank);
+        }
+    }
+
+    pub fn sort_matches_prepared(
+        &self,
+        matches: &mut [(PreparedMetadataCandidate<'_>, SearchRank)],
+    ) {
+        let mut lazy_matches: Vec<_> = matches
+            .iter()
+            .map(|(cand, rank)| {
+                (
+                    *cand,
+                    rank.clone(),
+                    LazyRelevance::from_prepared(&self.query_tokens, self.allow_typo, cand.fields),
+                )
+            })
+            .collect();
+
+        lazy_matches.sort_unstable_by(
+            |(left_cand, left_rank, left_rel), (right_cand, right_rank, right_rel)| {
+                left_rel.compare(right_rel).then_with(|| {
+                    compare_score_desc(left_cand.score, right_cand.score)
+                        .then_with(|| left_rank.cmp(right_rank))
+                        .then_with(|| compare_key_asc(left_cand.key, right_cand.key))
+                })
+            },
+        );
+
+        for (i, (cand, rank, _)) in lazy_matches.into_iter().enumerate() {
+            matches[i] = (cand, rank);
+        }
+    }
+
+    /// Sort prepared candidates while retaining caller-owned payloads.
+    ///
+    /// The payload is cloned only once per candidate; relevance itself is
+    /// still prepared once and reused for the complete sort.
+    pub fn sort_matches_prepared_with<T: Clone>(
+        &self,
+        matches: &mut [(PreparedMetadataCandidate<'_>, SearchRank, T)],
+    ) {
+        let mut lazy_matches: Vec<_> = matches
+            .iter()
+            .map(|(candidate, rank, payload)| {
+                (
+                    *candidate,
+                    rank.clone(),
+                    payload.clone(),
+                    LazyRelevance::from_prepared(
+                        &self.query_tokens,
+                        self.allow_typo,
+                        candidate.fields,
+                    ),
+                )
+            })
+            .collect();
+
+        lazy_matches.sort_unstable_by(
+            |(left_candidate, left_rank, _, left_relevance),
+             (right_candidate, right_rank, _, right_relevance)| {
+                left_relevance.compare(right_relevance).then_with(|| {
+                    compare_score_desc(left_candidate.score, right_candidate.score)
+                        .then_with(|| left_rank.cmp(right_rank))
+                        .then_with(|| compare_key_asc(left_candidate.key, right_candidate.key))
+                })
+            },
+        );
+
+        for (index, (candidate, rank, payload, _)) in lazy_matches.into_iter().enumerate() {
+            matches[index] = (candidate, rank, payload);
         }
     }
 
@@ -247,6 +394,18 @@ impl MetadataQuery {
         candidate: MetadataCandidate<'_>,
     ) -> Option<(SearchRank, Vec<MatchedFieldHighlight>)> {
         let rank = self.search_rank(candidate)?;
+        let highlights = self.highlights_for_rank(candidate, &rank);
+        Some((rank, highlights))
+    }
+
+    /// Compute visual match ranges for a rank that has already been found.
+    /// This avoids running metadata ranking a second time when callers first
+    /// rank/sort a complete result set and only then render highlights.
+    pub fn highlights_for_rank(
+        &self,
+        candidate: MetadataCandidate<'_>,
+        _rank: &SearchRank,
+    ) -> Vec<MatchedFieldHighlight> {
         let mut field_highlights = Vec::new();
 
         for (field_index, field) in candidate.fields.iter().enumerate() {
@@ -364,7 +523,7 @@ impl MetadataQuery {
             }
         }
 
-        Some((rank, field_highlights))
+        field_highlights
     }
 
     pub fn explain_candidate<'a>(
@@ -416,7 +575,7 @@ fn format_ranked_vector(vector: &RankedTokenVector) -> String {
 struct LazyRelevance<'a> {
     query_tokens: &'a [String],
     allow_typo: bool,
-    fields: Vec<NormalizedMetadataField>,
+    fields: Cow<'a, [PreparedMetadataField]>,
 
     exact_whole_phrase_present: OnceCell<bool>,
     exact_subphrase_counts_vector: OnceCell<Vec<usize>>,
@@ -438,25 +597,46 @@ struct LazyRelevance<'a> {
 
 impl<'a> LazyRelevance<'a> {
     fn new(query_tokens: &'a [String], allow_typo: bool, fields: &[SearchField<'_>]) -> Self {
-        let normalized_fields = fields
-            .iter()
-            .filter_map(|field| {
-                let lowered = to_lowercase(field.value.trim());
-                let tokens = split_search_tokens(&lowered)
-                    .into_iter()
-                    .map(str::to_string)
-                    .collect::<Vec<_>>();
-                (!tokens.is_empty()).then_some(NormalizedMetadataField {
-                    priority: field.priority,
-                    tokens,
-                })
-            })
-            .collect::<Vec<_>>();
+        Self::from_owned_fields(query_tokens, allow_typo, prepare_fields(fields))
+    }
 
+    fn from_prepared(
+        query_tokens: &'a [String],
+        allow_typo: bool,
+        fields: &'a [PreparedMetadataField],
+    ) -> Self {
         Self {
             query_tokens,
             allow_typo,
-            fields: normalized_fields,
+            fields: Cow::Borrowed(fields),
+            exact_whole_phrase_present: OnceCell::new(),
+            exact_subphrase_counts_vector: OnceCell::new(),
+            exact_weighted_positional_coverage_vector: OnceCell::new(),
+            fuzzy_weighted_positional_coverage_vector: OnceCell::new(),
+            fuzzy_whole_phrase: OnceCell::new(),
+            fuzzy_subphrase_counts_vector: OnceCell::new(),
+            fuzzy_token_matches: OnceCell::new(),
+            fuzzy_best_matches: OnceCell::new(),
+            exact_field_quality: OnceCell::new(),
+            fuzzy_field_quality: OnceCell::new(),
+            exact_phrase_occurrence_rank: OnceCell::new(),
+            exact_token_occurrence_rank: OnceCell::new(),
+            scattered_stats: OnceCell::new(),
+            typo_cost_vector: OnceCell::new(),
+            insertion_vector: OnceCell::new(),
+            density_rank: OnceCell::new(),
+        }
+    }
+
+    fn from_owned_fields(
+        query_tokens: &'a [String],
+        allow_typo: bool,
+        fields: Vec<PreparedMetadataField>,
+    ) -> Self {
+        Self {
+            query_tokens,
+            allow_typo,
+            fields: Cow::Owned(fields),
             exact_whole_phrase_present: OnceCell::new(),
             exact_subphrase_counts_vector: OnceCell::new(),
             exact_weighted_positional_coverage_vector: OnceCell::new(),
@@ -905,15 +1085,9 @@ pub fn sort_matches(matches: &mut [(MetadataCandidate<'_>, SearchRank)]) {
     );
 }
 
-#[derive(Clone, Debug)]
-struct NormalizedMetadataField {
-    priority: u8,
-    tokens: Vec<String>,
-}
-
 fn field_occurrence_rank(
-    fields: &[NormalizedMetadataField],
-    count: impl Fn(&NormalizedMetadataField) -> usize,
+    fields: &[PreparedMetadataField],
+    count: impl Fn(&PreparedMetadataField) -> usize,
 ) -> FieldOccurrenceRank {
     FieldOccurrenceRank::from_entries(fields.iter().map(|field| (field.priority, count(field))))
 }
@@ -958,8 +1132,9 @@ fn metadata_relevance_rank(
                 .into_iter()
                 .map(str::to_string)
                 .collect::<Vec<_>>();
-            (!tokens.is_empty()).then_some(NormalizedMetadataField {
+            (!tokens.is_empty()).then_some(PreparedMetadataField {
                 priority: field.priority,
+                value: lowered,
                 tokens,
             })
         })
@@ -1092,7 +1267,7 @@ fn literal_token_scope(query: &str, candidate: &str) -> Option<TokenMatchScope> 
 
 fn best_exact_token_scope(
     query: &str,
-    fields: &[NormalizedMetadataField],
+    fields: &[PreparedMetadataField],
 ) -> Option<TokenMatchScope> {
     fields
         .iter()
@@ -1119,7 +1294,7 @@ fn metadata_fuzzy_coverage_vector(matches: &[TokenMatch]) -> Vec<usize> {
 
 fn fuzzy_whole_phrase_present(
     query_tokens: &[String],
-    fields: &[NormalizedMetadataField],
+    fields: &[PreparedMetadataField],
     allow_typo: bool,
 ) -> bool {
     if !allow_typo || query_tokens.is_empty() {
@@ -1145,7 +1320,7 @@ fn fuzzy_whole_phrase_present(
 
 fn fuzzy_subphrase_counts_vector(
     query_tokens: &[String],
-    fields: &[NormalizedMetadataField],
+    fields: &[PreparedMetadataField],
 ) -> Vec<usize> {
     if query_tokens.len() < 3 {
         return Vec::new();
@@ -1180,7 +1355,7 @@ fn fuzzy_subphrase_counts_vector(
 
 fn fuzzy_whole_phrase_present_cached(
     query_tokens: &[String],
-    fields: &[NormalizedMetadataField],
+    fields: &[PreparedMetadataField],
     allow_typo: bool,
     matches: &TokenMatchMatrix,
 ) -> bool {
@@ -1212,7 +1387,7 @@ fn fuzzy_whole_phrase_present_cached(
 
 fn fuzzy_subphrase_counts_vector_cached(
     query_tokens: &[String],
-    fields: &[NormalizedMetadataField],
+    fields: &[PreparedMetadataField],
     matches: &TokenMatchMatrix,
 ) -> Vec<usize> {
     if query_tokens.len() < 3 {
@@ -1243,7 +1418,7 @@ fn fuzzy_subphrase_counts_vector_cached(
 
 fn best_fuzzy_token_match(
     query_token: &str,
-    fields: &[NormalizedMetadataField],
+    fields: &[PreparedMetadataField],
     allow_typo: bool,
 ) -> TokenMatch {
     let mut best = TokenMatch::default();
@@ -1426,7 +1601,7 @@ fn fuzzy_or_exact_token_match(
     }
 }
 
-fn best_exact_field_priority(query_tokens: &[String], fields: &[NormalizedMetadataField]) -> u8 {
+fn best_exact_field_priority(query_tokens: &[String], fields: &[PreparedMetadataField]) -> u8 {
     fields
         .iter()
         .filter(|field| {
@@ -1443,7 +1618,7 @@ fn best_exact_field_priority(query_tokens: &[String], fields: &[NormalizedMetada
 
 fn ordered_span_stats(
     query_tokens: &[String],
-    fields: &[NormalizedMetadataField],
+    fields: &[PreparedMetadataField],
     allow_typo: bool,
 ) -> (usize, usize) {
     ordered_token_span(
@@ -1458,7 +1633,7 @@ fn ordered_span_stats(
 
 fn density_stats(
     query_tokens: &[String],
-    fields: &[NormalizedMetadataField],
+    fields: &[PreparedMetadataField],
     fuzzy_matches: &[TokenMatch],
 ) -> DensityRank {
     let matched_count = fuzzy_matches
@@ -1539,9 +1714,26 @@ impl PartialOrd for MetadataEditCost {
     }
 }
 
+#[derive(Default)]
+struct MetadataFuzzyScratch {
+    query_chars: Vec<char>,
+    target_chars: Vec<char>,
+    prev_prev: Vec<MetadataEditCost>,
+    prev: Vec<MetadataEditCost>,
+    curr: Vec<MetadataEditCost>,
+}
+
 fn fuzzy_match_details(query: &str, target: &str) -> Option<(usize, usize, usize, usize)> {
-    let query_lower = to_lowercase(query);
-    let target_lower = to_lowercase(target);
+    fuzzy_match_details_with_scratch(query, target, &mut MetadataFuzzyScratch::default())
+}
+
+fn fuzzy_match_details_with_scratch(
+    query: &str,
+    target: &str,
+    scratch: &mut MetadataFuzzyScratch,
+) -> Option<(usize, usize, usize, usize)> {
+    let query_lower = lowercase_cow(query);
+    let target_lower = lowercase_cow(target);
 
     let q_len = query_lower.chars().count();
     if q_len == 0 {
@@ -1555,23 +1747,29 @@ fn fuzzy_match_details(query: &str, target: &str) -> Option<(usize, usize, usize
         return None;
     }
 
-    let query_chars: Vec<char> = query_lower.chars().collect();
-    let target_chars: Vec<char> = target_lower.chars().collect();
+    scratch.query_chars.clear();
+    scratch.query_chars.extend(query_lower.chars());
+    scratch.target_chars.clear();
+    scratch.target_chars.extend(target_lower.chars());
+    let query_chars = &scratch.query_chars;
+    let target_chars = &scratch.target_chars;
 
     let inf = MetadataEditCost::infinite(limit);
-    let mut prev_prev = vec![inf; t_len + 1];
-    let mut prev = vec![MetadataEditCost::default(); t_len + 1];
-    for cell in prev.iter_mut() {
+    scratch.prev_prev.resize(t_len + 1, inf);
+    scratch.prev.resize(t_len + 1, MetadataEditCost::default());
+    scratch.curr.resize(t_len + 1, inf);
+    scratch.prev_prev.fill(inf);
+    for cell in scratch.prev.iter_mut() {
         *cell = MetadataEditCost {
             distance: 0,
             keyboard_distance: 0,
         };
     }
-    let mut curr = vec![inf; t_len + 1];
+    scratch.curr.fill(inf);
 
     for i in 1..=q_len {
-        curr.fill(inf);
-        curr[0] = MetadataEditCost {
+        scratch.curr.fill(inf);
+        scratch.curr[0] = MetadataEditCost {
             distance: i,
             keyboard_distance: i,
         };
@@ -1579,19 +1777,19 @@ fn fuzzy_match_details(query: &str, target: &str) -> Option<(usize, usize, usize
         let mut row_min = inf;
         for j in 1..=t_len {
             let deletion = MetadataEditCost {
-                distance: prev[j].distance + 1,
-                keyboard_distance: prev[j].keyboard_distance + 1,
+                distance: scratch.prev[j].distance + 1,
+                keyboard_distance: scratch.prev[j].keyboard_distance + 1,
             };
             let insertion = MetadataEditCost {
-                distance: curr[j - 1].distance + 1,
-                keyboard_distance: curr[j - 1].keyboard_distance + 1,
+                distance: scratch.curr[j - 1].distance + 1,
+                keyboard_distance: scratch.curr[j - 1].keyboard_distance + 1,
             };
             let substitution = if query_chars[i - 1] == target_chars[j - 1] {
-                prev[j - 1]
+                scratch.prev[j - 1]
             } else {
                 MetadataEditCost {
-                    distance: prev[j - 1].distance + 1,
-                    keyboard_distance: prev[j - 1].keyboard_distance
+                    distance: scratch.prev[j - 1].distance + 1,
+                    keyboard_distance: scratch.prev[j - 1].keyboard_distance
                         + keyboard_substitution_cost(query_chars[i - 1], target_chars[j - 1]),
                 }
             };
@@ -1603,12 +1801,12 @@ fn fuzzy_match_details(query: &str, target: &str) -> Option<(usize, usize, usize
                 && query_chars[i - 2] == target_chars[j - 1]
             {
                 cell = cell.min(MetadataEditCost {
-                    distance: prev_prev[j - 2].distance + 1,
-                    keyboard_distance: prev_prev[j - 2].keyboard_distance,
+                    distance: scratch.prev_prev[j - 2].distance + 1,
+                    keyboard_distance: scratch.prev_prev[j - 2].keyboard_distance,
                 });
             }
 
-            curr[j] = cell;
+            scratch.curr[j] = cell;
             row_min = row_min.min(cell);
         }
 
@@ -1616,14 +1814,20 @@ fn fuzzy_match_details(query: &str, target: &str) -> Option<(usize, usize, usize
             return None;
         }
 
-        std::mem::swap(&mut prev_prev, &mut prev);
-        std::mem::swap(&mut prev, &mut curr);
+        std::mem::swap(&mut scratch.prev_prev, &mut scratch.prev);
+        std::mem::swap(&mut scratch.prev, &mut scratch.curr);
     }
 
     let mut min_cost = inf;
     let mut best_end_idx = 0;
     let search_start = q_len.saturating_sub(limit).max(1);
-    for (j, value) in prev.iter().enumerate().take(t_len + 1).skip(search_start) {
+    for (j, value) in scratch
+        .prev
+        .iter()
+        .enumerate()
+        .take(t_len + 1)
+        .skip(search_start)
+    {
         if *value < min_cost {
             min_cost = *value;
             best_end_idx = j;
@@ -1636,6 +1840,14 @@ fn fuzzy_match_details(query: &str, target: &str) -> Option<(usize, usize, usize
         best_end_idx.saturating_sub(q_len),
         best_end_idx,
     ))
+}
+
+fn lowercase_cow(value: &str) -> Cow<'_, str> {
+    if value.chars().all(|ch| !ch.is_uppercase()) {
+        Cow::Borrowed(value)
+    } else {
+        Cow::Owned(to_lowercase(value))
+    }
 }
 
 fn is_search_token_separator(c: char) -> bool {
@@ -1708,7 +1920,7 @@ fn structural_match_details(
     )
 }
 
-fn best_structural_rank(query: &str, fields: &[SearchField<'_>]) -> Option<StructuralRank> {
+fn best_structural_rank<F: MetadataFieldView>(query: &str, fields: &[F]) -> Option<StructuralRank> {
     let query_lower = to_lowercase(query.trim());
     if query_lower.is_empty() {
         return None;
@@ -1718,19 +1930,19 @@ fn best_structural_rank(query: &str, fields: &[SearchField<'_>]) -> Option<Struc
     let mut best_rank = None;
 
     for (field_index, field) in fields.iter().enumerate() {
-        let target = field.value.trim();
+        let target_lower = field.lowered_value();
+        let target = target_lower.as_ref();
         if target.is_empty() {
             continue;
         }
 
-        let target_lower = to_lowercase(target);
-        for (start_byte_idx, _) in target_lower.match_indices(&query_lower) {
-            let start_idx = target_lower[..start_byte_idx].chars().count();
+        for (start_byte_idx, _) in target.match_indices(&query_lower) {
+            let start_idx = target[..start_byte_idx].chars().count();
             let (position_class, token_index, token_span_delta, start_idx, field_len) =
-                structural_match_details(&target_lower, start_idx, query_len);
+                structural_match_details(target, start_idx, query_len);
             let rank = StructuralRank {
                 field_index,
-                field_priority: field.priority,
+                field_priority: field.priority(),
                 position_class,
                 token_index,
                 token_span_delta,
@@ -1786,7 +1998,10 @@ fn subsequence_match_details(query: &str, target: &str) -> Option<(usize, usize,
     None
 }
 
-fn best_abbreviation_rank(query: &str, fields: &[SearchField<'_>]) -> Option<AbbreviationRank> {
+fn best_abbreviation_rank<F: MetadataFieldView>(
+    query: &str,
+    fields: &[F],
+) -> Option<AbbreviationRank> {
     let query_lower = to_lowercase(query.trim());
     if query_lower.is_empty() {
         return None;
@@ -1800,15 +2015,14 @@ fn best_abbreviation_rank(query: &str, fields: &[SearchField<'_>]) -> Option<Abb
     let mut best_rank = None;
 
     for (field_index, field) in fields.iter().enumerate() {
-        if field.priority > 2 {
+        if field.priority() > 2 {
             continue;
         }
-        let target = field.value.trim();
+        let target_lower = field.lowered_value();
+        let target = target_lower.as_ref();
         if target.is_empty() {
             continue;
         }
-
-        let target_lower = to_lowercase(target);
 
         // Fast path: check if target contains all characters of query in order
         let mut target_chars_iter = target_lower.chars();
@@ -1823,13 +2037,13 @@ fn best_abbreviation_rank(query: &str, fields: &[SearchField<'_>]) -> Option<Abb
             continue;
         }
 
-        let tokens = split_search_tokens(&target_lower);
+        let tokens = split_search_tokens(target);
         let mut candidates: Vec<(u8, String)> = Vec::new();
 
         for token in &tokens {
             candidates.push((0, (*token).to_string()));
         }
-        candidates.push((1, target_lower.clone()));
+        candidates.push((1, target.to_string()));
         if tokens.len() > 1 {
             let collapsed = tokens.concat();
             if !collapsed.is_empty() {
@@ -1851,7 +2065,7 @@ fn best_abbreviation_rank(query: &str, fields: &[SearchField<'_>]) -> Option<Abb
                 structural_match_details(&candidate_target, start_idx, matched_span);
             let rank = AbbreviationRank {
                 field_index,
-                field_priority: field.priority,
+                field_priority: field.priority(),
                 variant_scope,
                 position_class,
                 token_index,
@@ -1870,7 +2084,7 @@ fn best_abbreviation_rank(query: &str, fields: &[SearchField<'_>]) -> Option<Abb
     best_rank
 }
 
-fn best_fuzzy_rank(query: &str, fields: &[SearchField<'_>]) -> Option<DistanceRank> {
+fn best_fuzzy_rank<F: MetadataFieldView>(query: &str, fields: &[F]) -> Option<DistanceRank> {
     let query_lower = to_lowercase(query.trim());
     if query_lower.is_empty() || query_lower.chars().count() < 3 {
         return None;
@@ -1880,18 +2094,18 @@ fn best_fuzzy_rank(query: &str, fields: &[SearchField<'_>]) -> Option<DistanceRa
     let allow_collapsed =
         !query_collapsed.is_empty() && !query_lower.chars().any(is_search_token_separator);
     let mut best_rank = None;
+    let mut scratch = MetadataFuzzyScratch::default();
 
     for (field_index, field) in fields.iter().enumerate() {
-        let target = field.value.trim();
+        let target_lower = field.lowered_value();
+        let target = target_lower.as_ref();
         if target.is_empty() {
             continue;
         }
-
-        let target_lower = to_lowercase(target);
-        if !token_has_signal(&query_lower, &target_lower) {
+        if !token_has_signal(&query_lower, target) {
             continue;
         }
-        let tokens = split_search_tokens(&target_lower);
+        let tokens = split_search_tokens(target);
         let mut candidates: Vec<(u8, String, String)> = Vec::new();
 
         for token in &tokens {
@@ -1910,7 +2124,7 @@ fn best_fuzzy_rank(query: &str, fields: &[SearchField<'_>]) -> Option<DistanceRa
                 continue;
             }
             let Some((distance, keyboard_distance, start_idx, _)) =
-                fuzzy_match_details(&candidate_query, &candidate_target)
+                fuzzy_match_details_with_scratch(&candidate_query, &candidate_target, &mut scratch)
             else {
                 continue;
             };
@@ -1928,7 +2142,7 @@ fn best_fuzzy_rank(query: &str, fields: &[SearchField<'_>]) -> Option<DistanceRa
                 ratio_milli,
                 keyboard_distance,
                 field_index,
-                field_priority: field.priority,
+                field_priority: field.priority(),
                 variant_scope,
                 position_class,
                 token_index,
@@ -1946,7 +2160,7 @@ fn best_fuzzy_rank(query: &str, fields: &[SearchField<'_>]) -> Option<DistanceRa
     best_rank
 }
 
-fn best_typo_rank(query: &str, fields: &[SearchField<'_>]) -> Option<DistanceRank> {
+fn best_typo_rank<F: MetadataFieldView>(query: &str, fields: &[F]) -> Option<DistanceRank> {
     let query_lower = to_lowercase(query.trim());
     if query_lower.is_empty() || query_lower.chars().count() < 3 {
         return None;
@@ -1956,20 +2170,20 @@ fn best_typo_rank(query: &str, fields: &[SearchField<'_>]) -> Option<DistanceRan
     let allow_collapsed =
         !query_collapsed.is_empty() && !query_lower.chars().any(is_search_token_separator);
     let mut best_rank = None;
+    let mut scratch = MetadataFuzzyScratch::default();
 
     for (field_index, field) in fields.iter().enumerate() {
-        let target = field.value.trim();
+        let target_lower = field.lowered_value();
+        let target = target_lower.as_ref();
         if target.is_empty() {
             continue;
         }
-
-        let target_lower = to_lowercase(target);
-        if !token_has_signal(&query_lower, &target_lower) {
+        if !token_has_signal(&query_lower, target) {
             continue;
         }
-        let tokens = split_search_tokens(&target_lower);
+        let tokens = split_search_tokens(target);
         let mut candidates: Vec<(u8, String, String, usize)> =
-            vec![(0, query_lower.clone(), target_lower.clone(), 0)];
+            vec![(0, query_lower.clone(), target.to_string(), 0)];
 
         for (idx, token) in tokens.iter().enumerate() {
             candidates.push((1, query_lower.clone(), (*token).to_string(), idx));
@@ -1984,7 +2198,7 @@ fn best_typo_rank(query: &str, fields: &[SearchField<'_>]) -> Option<DistanceRan
 
         for (variant_scope, candidate_query, candidate_target, token_idx) in candidates {
             let Some((distance, keyboard_distance, start_idx, _)) =
-                fuzzy_match_details(&candidate_query, &candidate_target)
+                fuzzy_match_details_with_scratch(&candidate_query, &candidate_target, &mut scratch)
             else {
                 continue;
             };
@@ -2005,7 +2219,7 @@ fn best_typo_rank(query: &str, fields: &[SearchField<'_>]) -> Option<DistanceRan
                 ratio_milli,
                 keyboard_distance,
                 field_index,
-                field_priority: field.priority,
+                field_priority: field.priority(),
                 variant_scope,
                 position_class,
                 token_index,
@@ -2052,6 +2266,39 @@ mod tests {
             SearchRank::Structural(rank) => assert_eq!(rank.field_priority, 0),
             _ => panic!("expected structural rank"),
         }
+    }
+
+    #[test]
+    fn prepared_candidates_match_unprepared_candidates() {
+        let fields = [
+            SearchField {
+                priority: 0,
+                value: "Plasma Meta",
+            },
+            SearchField {
+                priority: 1,
+                value: "plasma-desktop",
+            },
+        ];
+        let candidate = MetadataCandidate {
+            key: "plasma-meta",
+            fields: &fields,
+            score: 0.0,
+        };
+        let prepared_fields = prepare_fields(&fields);
+        let prepared = PreparedMetadataCandidate {
+            key: candidate.key,
+            fields: &prepared_fields,
+            score: candidate.score,
+        };
+        let query = MetadataQuery::new("plasma")
+            .unwrap()
+            .with_typo_fallback(true);
+
+        assert_eq!(
+            query.search_rank(candidate),
+            query.search_rank_prepared(prepared)
+        );
     }
 
     #[test]
@@ -3008,10 +3255,12 @@ mod tests {
             score: 0.0,
         };
         let (rank, highlights) = query.search_rank_with_highlights(cand).unwrap();
+        let prepared_highlights = query.highlights_for_rank(cand, &rank);
         println!("rank: {:?}", rank);
         println!("highlights: {:?}", highlights);
         assert_eq!(highlights.len(), 1);
         assert_eq!(highlights[0].ranges, vec![(0, 4, false)]);
+        assert_eq!(prepared_highlights, highlights);
     }
 }
 

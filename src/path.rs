@@ -1,4 +1,4 @@
-use std::{cell::OnceCell, path, sync::Arc};
+use std::{cell::OnceCell, ops::Range, path, sync::Arc};
 
 use crate::core::{
     exact_distinct_coverage_by, exact_phrase_present, exact_subphrase_counts_vector,
@@ -27,6 +27,100 @@ pub(crate) fn path_depth(path: &str) -> usize {
     path.chars().filter(|ch| path::is_separator(*ch)).count()
 }
 
+#[derive(Clone, Debug)]
+pub struct PreparedPath<'a> {
+    path: &'a str,
+    normalized: Arc<str>,
+    components: Vec<PreparedComponent>,
+}
+
+#[derive(Clone, Debug)]
+struct PreparedComponent {
+    range: Range<usize>,
+    tokens: Vec<Range<usize>>,
+}
+
+impl<'a> PreparedPath<'a> {
+    pub fn new(path: &'a str) -> Self {
+        let normalized: Arc<str> = normalize_path(path).into();
+        let components = prepared_components(&normalized);
+        Self {
+            path,
+            normalized,
+            components,
+        }
+    }
+
+    pub fn path(&self) -> &'a str {
+        self.path
+    }
+
+    pub(crate) fn normalized(&self) -> &str {
+        &self.normalized
+    }
+
+    pub(crate) fn normalized_arc(&self) -> Arc<str> {
+        Arc::clone(&self.normalized)
+    }
+
+    pub(crate) fn component_count(&self) -> usize {
+        self.components.len()
+    }
+
+    pub(crate) fn component(&self, index: usize) -> &str {
+        &self.normalized[self.components[index].range.clone()]
+    }
+
+    pub(crate) fn tokens(&self, component: usize) -> impl Iterator<Item = &str> + '_ {
+        self.components[component]
+            .tokens
+            .iter()
+            .map(|range| &self.normalized[range.clone()])
+    }
+}
+
+fn prepared_components(normalized: &str) -> Vec<PreparedComponent> {
+    let mut components = Vec::new();
+    let mut component_start = None;
+
+    for (index, character) in normalized
+        .char_indices()
+        .chain(std::iter::once((normalized.len(), '/')))
+    {
+        if path::is_separator(character) {
+            if let Some(start) = component_start.take() {
+                let range = start..index;
+                let tokens = prepared_token_ranges(&normalized[range.clone()], start);
+                components.push(PreparedComponent { range, tokens });
+            }
+        } else if component_start.is_none() {
+            component_start = Some(index);
+        }
+    }
+
+    components
+}
+
+fn prepared_token_ranges(component: &str, offset: usize) -> Vec<Range<usize>> {
+    let mut ranges = Vec::new();
+    let mut token_start = None;
+
+    for (index, character) in component
+        .char_indices()
+        .chain(std::iter::once((component.len(), ' ')))
+    {
+        if is_path_token_separator(character) {
+            if let Some(start) = token_start.take() {
+                ranges.push(offset + start..offset + index);
+            }
+        } else if token_start.is_none() {
+            token_start = Some(index);
+        }
+    }
+
+    ranges
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct PathExactRelevance<'a> {
     path: &'a str,
@@ -40,10 +134,6 @@ pub(crate) struct PathExactRelevance<'a> {
 }
 
 impl<'a> PathExactRelevance<'a> {
-    pub(crate) fn new(path: &'a str, query_tokens: Arc<[String]>) -> Self {
-        Self::with_normalized_path(path, normalize_path(path).into(), query_tokens)
-    }
-
     pub(crate) fn with_normalized_path(
         path: &'a str,
         normalized_path: Arc<str>,
@@ -146,6 +236,14 @@ struct TermMatch {
     compound: bool,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SingleTermPathEvidence {
+    pub(crate) segment: usize,
+    pub(crate) position: usize,
+    pub(crate) insertions: usize,
+    pub(crate) compound: bool,
+}
+
 #[derive(Clone, Copy)]
 struct PathToken<'a> {
     text: &'a str,
@@ -167,6 +265,39 @@ pub(crate) fn ordered_path_evidence(
     ))
 }
 
+pub(crate) fn single_term_path_evidence(
+    normalized_path: &str,
+    query: &str,
+) -> Option<SingleTermPathEvidence> {
+    if query.is_empty() {
+        return None;
+    }
+
+    let matched = if let Some(start) = normalized_path.rfind(query) {
+        direct_term_match(normalized_path, start, query.len())
+    } else {
+        let tokens = path_tokens(normalized_path);
+        let mut options = compound_options(normalized_path, &tokens, query, normalized_path.len())
+            .collect::<Vec<_>>();
+        options.sort_unstable_by(|left, right| {
+            left.compound
+                .cmp(&right.compound)
+                .then_with(|| left.segment.cmp(&right.segment))
+                .then_with(|| left.position.cmp(&right.position))
+                .then_with(|| left.insertions.cmp(&right.insertions))
+                .then_with(|| right.start.cmp(&left.start))
+        });
+        options.into_iter().next()?
+    };
+
+    Some(SingleTermPathEvidence {
+        segment: matched.segment,
+        position: matched.position,
+        insertions: matched.insertions,
+        compound: matched.compound,
+    })
+}
+
 pub(crate) fn ordered_compound_coverage(normalized_path: &str, query_tokens: &[String]) -> usize {
     let path_tokens = path_tokens(normalized_path);
     query_tokens
@@ -181,6 +312,37 @@ pub(crate) fn ordered_compound_coverage(normalized_path: &str, query_tokens: &[S
                     .is_some()
         })
         .count()
+}
+
+/// Returns whether a query can be formed from ordered path-token prefixes.
+///
+/// This is deliberately only a rejection gate. The full evidence calculation
+/// remains authoritative, so this function may retain extra candidates but
+/// must never reject a valid compound match.
+pub(crate) fn compound_term_may_match(normalized_path: &str, query: &str) -> bool {
+    if query.is_empty() {
+        return false;
+    }
+
+    let mut remaining = query;
+    let mut fragments = 0;
+    for token in path_tokens(normalized_path) {
+        if remaining.is_empty() {
+            break;
+        }
+        if let Some(next) = remaining.strip_prefix(token.text) {
+            remaining = next;
+            fragments += 1;
+            continue;
+        }
+        if token.text.starts_with(remaining) {
+            remaining = "";
+            fragments += 1;
+            break;
+        }
+    }
+
+    remaining.is_empty() && fragments >= 2
 }
 
 fn select_direct_matches(path: &str, query_tokens: &[String]) -> Option<Vec<TermMatch>> {

@@ -1,15 +1,17 @@
 use std::sync::Arc;
 
 use crate::core::{
-    InsertionVector, OperationProfile, TypoCostVector, bounded_damerau_levenshtein,
-    increment_simple_position_vector, max_typos, simple_position_vector,
+    AlignmentCostVector, InsertionVector, OperationProfile, TypoCostVector, alignment_cost_milli,
+    bounded_damerau_levenshtein, increment_simple_position_vector, max_typos,
+    simple_position_vector,
 };
-use crate::path::exact::exact_match_with_query_tokens;
-use crate::path::{PathExactRelevance, Score, normalize_path};
+use crate::path::exact::exact_match_prepared;
+use crate::path::{PathExactRelevance, PreparedPath, Score};
 use crate::ranking::{PathTypoSortKey, compare_path_typo_sort_keys, path_typo_keys_are_ambiguous};
 use crate::text::{split_path_tokens, to_lowercase};
 use crate::token_match::{
-    PositionedToken, aligned_token_distance, best_token_match, fragmented_token_match,
+    PositionedToken, TokenMatchScratch, aligned_token_distance, best_token_match,
+    best_token_match_chars_with_scratch, choose_path_token_match_with_scratch,
     partitioned_token_distance,
 };
 
@@ -23,6 +25,7 @@ pub struct PathMatch<'a> {
     pub segment: Vec<usize>,
     pub position: [usize; 3],
     pub operations: OperationProfile,
+    pub alignment_costs: AlignmentCostVector,
     pub typo_costs: TypoCostVector,
     pub insertions: InsertionVector,
     pub score: Score,
@@ -35,6 +38,7 @@ impl<'a> PathMatch<'a> {
             distance: self.distance,
             order_distance: self.order_distance,
             operations: self.operations,
+            alignment_costs: &self.alignment_costs,
             typo_costs: &self.typo_costs,
             insertions: &self.insertions,
             segment: &self.segment,
@@ -83,27 +87,51 @@ impl<'a> PathMatch<'a> {
 pub struct TypoQuery {
     text: String,
     keywords: Arc<[String]>,
+    query_chars: Arc<[char]>,
     len: usize,
     limit: usize,
+    token_count: usize,
     allow_typos: bool,
 }
 
 impl TypoQuery {
     pub fn new(query: &str) -> Option<Self> {
+        Self::from_lowered_text(to_lowercase(query))
+    }
+
+    pub fn from_keywords(keywords: &[String]) -> Option<Self> {
+        if keywords.is_empty() || keywords.iter().any(String::is_empty) {
+            return None;
+        }
+
+        let mut query = String::new();
+        for (index, keyword) in keywords.iter().enumerate() {
+            if index > 0 {
+                query.push(' ');
+            }
+            query.push_str(&to_lowercase(keyword));
+        }
+        Self::from_lowered_text(query)
+    }
+
+    fn from_lowered_text(query: String) -> Option<Self> {
         let len = query.chars().count();
-        let keywords = split_path_tokens(query)
+        let keywords = split_path_tokens(&query)
             .into_iter()
-            .map(to_lowercase)
+            .map(str::to_owned)
             .collect::<Vec<_>>();
         if keywords.is_empty() {
             return None;
         }
 
+        let token_count = keywords.len();
         Some(Self {
-            text: to_lowercase(query),
+            query_chars: query.chars().collect::<Vec<_>>().into(),
+            text: query,
             keywords: keywords.into(),
             len,
             limit: max_typos(len),
+            token_count,
             allow_typos: true,
         })
     }
@@ -113,32 +141,116 @@ impl TypoQuery {
         self
     }
 
+    pub fn token_count(&self) -> usize {
+        self.token_count
+    }
+
     pub fn best_match<'a>(&self, path: &'a str, score: Score) -> Option<PathMatch<'a>> {
-        best_match_with_query(path, score, self)
+        let prepared = PreparedPath::new(path);
+        self.best_match_prepared(&prepared, score)
+    }
+
+    pub fn prepare_path<'a>(&self, path: &'a str) -> PreparedPath<'a> {
+        PreparedPath::new(path)
+    }
+
+    pub fn best_match_prepared<'a>(
+        &self,
+        prepared: &PreparedPath<'a>,
+        score: Score,
+    ) -> Option<PathMatch<'a>> {
+        let mut scratch = PathMatchScratch::default();
+        best_match_with_prepared_path(prepared, score, self, &mut scratch)
     }
 
     /// Matches only the exact path class without evaluating typo distance.
     pub fn best_exact_match<'a>(&self, path: &'a str, score: Score) -> Option<PathMatch<'a>> {
-        exact_path_match(path, score, self)
+        let prepared = PreparedPath::new(path);
+        self.best_exact_match_prepared(&prepared, score)
+    }
+
+    pub fn best_exact_match_prepared<'a>(
+        &self,
+        prepared: &PreparedPath<'a>,
+        score: Score,
+    ) -> Option<PathMatch<'a>> {
+        exact_path_match(prepared, score, self)
     }
 
     /// Matches only the typo path class without repeating the exact check.
     pub fn best_typo_match<'a>(&self, path: &'a str, score: Score) -> Option<PathMatch<'a>> {
+        let prepared = PreparedPath::new(path);
+        self.best_typo_match_prepared(&prepared, score)
+    }
+
+    pub fn best_typo_match_prepared<'a>(
+        &self,
+        prepared: &PreparedPath<'a>,
+        score: Score,
+    ) -> Option<PathMatch<'a>> {
+        let mut scratch = PathMatchScratch::default();
+        self.best_typo_match_prepared_with_scratch(prepared, score, &mut scratch)
+    }
+
+    pub fn best_typo_match_prepared_with_scratch<'a>(
+        &self,
+        prepared: &PreparedPath<'a>,
+        score: Score,
+        scratch: &mut PathMatchScratch,
+    ) -> Option<PathMatch<'a>> {
         if !self.allow_typos || self.len <= 1 {
             return None;
         }
-        best_match_inner(path, score, &self.text, self.len, self.limit)
-            .map(|candidate| with_exact_relevance(candidate, Arc::clone(&self.keywords)))
+        best_match_inner(
+            prepared,
+            score,
+            &self.text,
+            self.len,
+            self.limit,
+            self.token_count,
+            &self.keywords,
+            &self.query_chars,
+            &mut scratch.token,
+        )
+        .map(|candidate| with_exact_relevance(candidate, Arc::clone(&self.keywords), prepared))
+    }
+
+    pub fn best_typo_match_prepared_without_exact<'a>(
+        &self,
+        prepared: &PreparedPath<'a>,
+        score: Score,
+        scratch: &mut PathMatchScratch,
+    ) -> Option<PathMatch<'a>> {
+        if !self.allow_typos || self.len <= 1 {
+            return None;
+        }
+        best_match_inner(
+            prepared,
+            score,
+            &self.text,
+            self.len,
+            self.limit,
+            self.token_count,
+            &self.keywords,
+            &self.query_chars,
+            &mut scratch.token,
+        )
     }
 
     pub fn best_basename_match<'a>(&self, path: &'a str, score: Score) -> Option<PathMatch<'a>> {
-        best_basename_match_with_query(path, score, self)
+        let prepared = PreparedPath::new(path);
+        best_basename_match_with_query(&prepared, score, self)
     }
+}
+
+#[derive(Default)]
+pub struct PathMatchScratch {
+    token: TokenMatchScratch,
 }
 
 pub fn best_match<'a>(path: &'a str, score: Score, query: &str) -> Option<PathMatch<'a>> {
     let query = TypoQuery::new(query)?;
-    best_match_with_query(path, score, &query)
+    query.best_match(path, score)
 }
 
 pub fn sort_matches(matches: &mut [PathMatch<'_>]) {
@@ -164,38 +276,48 @@ pub fn query_from_keywords(keywords: &[String]) -> Option<String> {
     )
 }
 
-fn best_match_with_query<'a>(
-    path: &'a str,
+fn best_match_with_prepared_path<'a>(
+    prepared: &PreparedPath<'a>,
     score: Score,
     query: &TypoQuery,
+    scratch: &mut PathMatchScratch,
 ) -> Option<PathMatch<'a>> {
-    let candidate = match exact_path_match(path, score, query) {
+    let candidate = match exact_path_match(prepared, score, query) {
         Some(candidate) => candidate,
-        None if query.allow_typos && query.len > 1 => {
-            best_match_inner(path, score, &query.text, query.len, query.limit)?
-        }
+        None if query.allow_typos && query.len > 1 => best_match_inner(
+            prepared,
+            score,
+            &query.text,
+            query.len,
+            query.limit,
+            query.token_count,
+            &query.keywords,
+            &query.query_chars,
+            &mut scratch.token,
+        )?,
         None => return None,
     };
     Some(if candidate.exact_relevance.is_some() {
         candidate
     } else {
-        with_exact_relevance(candidate, Arc::clone(&query.keywords))
+        with_exact_relevance(candidate, Arc::clone(&query.keywords), prepared)
     })
 }
 
 fn best_basename_match_with_query<'a>(
-    path: &'a str,
+    prepared: &PreparedPath<'a>,
     score: Score,
     query: &TypoQuery,
 ) -> Option<PathMatch<'a>> {
-    let candidate = match exact_path_match(path, score, query) {
+    let candidate = match exact_path_match(prepared, score, query) {
         Some(candidate) => candidate,
         None if query.allow_typos && query.len > 1 => best_basename_match_inner(
-            path,
+            prepared,
             score,
             &query.text,
             query.len,
             query.limit,
+            query.token_count,
             query.limit,
         )?,
         None => return None,
@@ -203,24 +325,33 @@ fn best_basename_match_with_query<'a>(
     Some(if candidate.exact_relevance.is_some() {
         candidate
     } else {
-        with_exact_relevance(candidate, Arc::clone(&query.keywords))
+        with_exact_relevance(candidate, Arc::clone(&query.keywords), prepared)
     })
 }
 
 fn with_exact_relevance<'a>(
     mut candidate: PathMatch<'a>,
     query_tokens: Arc<[String]>,
+    prepared: &PreparedPath<'a>,
 ) -> PathMatch<'a> {
-    candidate.exact_relevance = Some(PathExactRelevance::new(candidate.path, query_tokens));
+    candidate.exact_relevance = Some(PathExactRelevance::with_normalized_path(
+        candidate.path,
+        prepared.normalized_arc(),
+        query_tokens,
+    ));
     candidate
 }
 
-fn exact_path_match<'a>(path: &'a str, score: Score, query: &TypoQuery) -> Option<PathMatch<'a>> {
-    let matched = exact_match_with_query_tokens(path, Arc::clone(&query.keywords), score)?;
+fn exact_path_match<'a>(
+    prepared: &PreparedPath<'a>,
+    score: Score,
+    query: &TypoQuery,
+) -> Option<PathMatch<'a>> {
+    let matched = exact_match_prepared(prepared, Arc::clone(&query.keywords), score)?;
     let insertion_costs = matched.insertions.aligned().to_vec();
     let insertions = insertion_costs.iter().sum();
     Some(PathMatch {
-        path,
+        path: prepared.path(),
         exact: true,
         distance: 0,
         order_distance: 0,
@@ -231,6 +362,7 @@ fn exact_path_match<'a>(path: &'a str, score: Score, query: &TypoQuery) -> Optio
             insertions,
             ..OperationProfile::default()
         },
+        alignment_costs: AlignmentCostVector::new(vec![0; query.keywords.len()]),
         typo_costs: TypoCostVector::new(vec![0; query.keywords.len()]),
         insertions: InsertionVector::new(insertion_costs),
         score,
@@ -244,112 +376,118 @@ fn segment_vector(segment: usize, count: usize) -> Vec<usize> {
     vector
 }
 
+#[allow(clippy::too_many_arguments)]
 fn best_match_inner<'a>(
-    path: &'a str,
+    prepared: &PreparedPath<'a>,
     score: Score,
     query: &str,
     query_len: usize,
     limit: usize,
+    query_token_count: usize,
+    query_tokens: &[String],
+    query_chars: &[char],
+    scratch: &mut TokenMatchScratch,
 ) -> Option<PathMatch<'a>> {
-    let lower_path = normalize_path(path);
-    let components = path_components(&lower_path);
-    if components.is_empty() {
+    let component_count = prepared.component_count();
+    if component_count == 0 {
         return None;
     }
-    if split_path_tokens(query).len() == 1 {
+    if query_token_count == 1 {
         return best_match_single_token(
-            path,
+            prepared,
             score,
             query,
             query_len,
             limit,
-            &lower_path,
-            &components,
+            component_count,
+            query_tokens,
+            query_chars,
+            scratch,
         );
     }
 
-    let basename = *components.last().unwrap();
-    let basename_idx = components.len() - 1;
-    let ctx = MatchContext {
-        path,
+    let basename_idx = component_count - 1;
+    let basename = prepared.component(basename_idx);
+    let mut ctx = MatchContext {
+        path: prepared.path(),
         score,
         query,
         query_len,
         limit,
+        token_count: query_token_count,
+        query_tokens,
+        query_chars,
+        scratch,
     };
 
-    let mut best = candidate_for_text(&ctx, basename, 0);
-    update_best(&mut best, candidate_for_token_sequence(&ctx, basename, 0));
+    let mut best = None;
+    update_best(
+        &mut best,
+        candidate_for_token_sequence(&mut ctx, basename, 0),
+    );
     update_best(
         &mut best,
         candidate_for_compound_component(&ctx, basename, 0),
     );
     update_best(
         &mut best,
-        candidate_for_component_sequence(&ctx, &components),
+        candidate_for_component_sequence(prepared, &ctx, component_count),
     );
 
-    for token in split_path_tokens(basename) {
-        update_best(&mut best, candidate_for_text(&ctx, token, 0));
-    }
-
-    for (idx, component) in components[..components.len().saturating_sub(1)]
-        .iter()
-        .enumerate()
-    {
+    for idx in 0..basename_idx {
+        let component = prepared.component(idx);
         let path_position = basename_idx - idx;
-        update_best(
-            &mut best,
-            candidate_for_text(&ctx, component, path_position),
-        );
         update_best(
             &mut best,
             candidate_for_compound_component(&ctx, component, path_position),
         );
-        for token in split_path_tokens(component) {
-            update_best(&mut best, candidate_for_text(&ctx, token, path_position));
-        }
     }
-
-    update_best(
-        &mut best,
-        candidate_for_text(&ctx, &lower_path, basename_idx + 1),
-    );
     best
 }
 
 fn best_basename_match_inner<'a>(
-    path: &'a str,
+    prepared: &PreparedPath<'a>,
     score: Score,
     query: &str,
     query_len: usize,
     limit: usize,
+    token_count: usize,
     full_limit: usize,
 ) -> Option<PathMatch<'a>> {
-    let lower_path = normalize_path(path);
-    let components = path_components(&lower_path);
-    if components.is_empty() {
+    let component_count = prepared.component_count();
+    if component_count == 0 {
         return None;
     }
 
-    let basename = *components.last().unwrap();
-    let ctx = MatchContext {
-        path,
+    let basename_idx = component_count - 1;
+    let basename = prepared.component(basename_idx);
+    let query_chars = query.chars().collect::<Vec<_>>();
+    let query_tokens = split_path_tokens(query)
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let mut token_scratch = TokenMatchScratch::default();
+    let mut ctx = MatchContext {
+        path: prepared.path(),
         score,
         query,
         query_len,
         limit,
+        token_count,
+        query_tokens: &query_tokens,
+        query_chars: &query_chars,
+        scratch: &mut token_scratch,
     };
     let mut best = candidate_for_text(&ctx, basename, 0);
     update_best(
         &mut best,
-        candidate_for_partitioned_single_query(&ctx, basename, 0),
+        candidate_for_partitioned_single_query(&mut ctx, basename, 0),
     );
-    for token in split_path_tokens(basename) {
+    for token in prepared.tokens(basename_idx) {
         update_best(&mut best, candidate_for_text(&ctx, token, 0));
         update_best(
             &mut best,
-            candidate_for_partitioned_single_query(&ctx, token, 0),
+            candidate_for_partitioned_single_query(&mut ctx, token, 0),
         );
     }
     best.filter(|candidate| candidate.distance <= full_limit)
@@ -357,41 +495,41 @@ fn best_basename_match_inner<'a>(
 
 #[allow(clippy::too_many_arguments)]
 fn best_match_single_token<'a>(
-    path: &'a str,
+    prepared: &PreparedPath<'a>,
     score: Score,
     query: &str,
     query_len: usize,
     limit: usize,
-    lower_path: &str,
-    components: &[&str],
+    component_count: usize,
+    query_tokens: &[String],
+    query_chars: &[char],
+    scratch: &mut TokenMatchScratch,
 ) -> Option<PathMatch<'a>> {
-    let basename = *components.last().unwrap();
-    let basename_idx = components.len() - 1;
-    let ctx = MatchContext {
-        path,
+    let basename_idx = component_count - 1;
+    let basename = prepared.component(basename_idx);
+    let mut ctx = MatchContext {
+        path: prepared.path(),
         score,
         query,
         query_len,
         limit,
+        token_count: 1,
+        query_tokens,
+        query_chars,
+        scratch,
     };
 
-    let mut best = candidate_for_text(&ctx, basename, 0);
-    update_best(
-        &mut best,
-        candidate_for_partitioned_single_query(&ctx, basename, 0),
-    );
+    let mut best = candidate_for_single_token(&mut ctx, basename, 0);
     if best
         .as_ref()
         .is_some_and(|candidate| candidate.distance <= 1)
     {
         return best;
     }
-    for token in split_path_tokens(basename) {
-        update_best(&mut best, candidate_for_text(&ctx, token, 0));
-        update_best(
-            &mut best,
-            candidate_for_partitioned_single_query(&ctx, token, 0),
-        );
+    for token in prepared.tokens(basename_idx) {
+        if token != basename {
+            update_best(&mut best, candidate_for_single_token(&mut ctx, token, 0));
+        }
     }
     if best
         .as_ref()
@@ -400,31 +538,26 @@ fn best_match_single_token<'a>(
         return best;
     }
 
-    for (idx, component) in components[..components.len().saturating_sub(1)]
-        .iter()
-        .enumerate()
-    {
+    for idx in 0..basename_idx {
+        let component = prepared.component(idx);
         let path_position = basename_idx - idx;
         update_best(
             &mut best,
-            candidate_for_text(&ctx, component, path_position),
+            candidate_for_single_token(&mut ctx, component, path_position),
         );
-        update_best(
-            &mut best,
-            candidate_for_partitioned_single_query(&ctx, component, path_position),
-        );
-        for token in split_path_tokens(component) {
-            update_best(&mut best, candidate_for_text(&ctx, token, path_position));
-            update_best(
-                &mut best,
-                candidate_for_partitioned_single_query(&ctx, token, path_position),
-            );
+        for token in prepared.tokens(idx) {
+            if token != component {
+                update_best(
+                    &mut best,
+                    candidate_for_single_token(&mut ctx, token, path_position),
+                );
+            }
         }
     }
 
     update_best(
         &mut best,
-        candidate_for_text(&ctx, lower_path, basename_idx + 1),
+        candidate_for_single_token(&mut ctx, prepared.normalized(), basename_idx + 1),
     );
     best
 }
@@ -446,6 +579,45 @@ struct MatchContext<'a, 'q> {
     query: &'q str,
     query_len: usize,
     limit: usize,
+    token_count: usize,
+    query_tokens: &'q [String],
+    query_chars: &'q [char],
+    scratch: &'q mut TokenMatchScratch,
+}
+
+fn candidate_for_single_token<'a>(
+    ctx: &mut MatchContext<'a, '_>,
+    candidate: &str,
+    path_position: usize,
+) -> Option<PathMatch<'a>> {
+    if candidate.is_empty() {
+        return None;
+    }
+
+    let candidate_len = candidate.chars().count();
+    let matched =
+        choose_path_token_match_with_scratch(ctx.query_chars, candidate, ctx.limit, ctx.scratch)?;
+    let ratio = matched.distance as f64 / ctx.query_len.max(candidate_len) as f64;
+    let minimum_breaks = usize::from(ctx.query_len.abs_diff(candidate_len) <= ctx.limit) + 1;
+    if ratio > 0.5 || matched.fragmented && matched.internal_breaks < minimum_breaks {
+        return None;
+    }
+
+    Some(PathMatch {
+        path: ctx.path,
+        exact: false,
+        distance: matched.distance,
+        order_distance: 0,
+        ratio,
+        segment: segment_vector(path_position, 1),
+        position: simple_position_vector([matched.position_rank]),
+        operations: matched.operations,
+        alignment_costs: AlignmentCostVector::from_slice(&[matched.alignment_cost]),
+        typo_costs: TypoCostVector::from_slice(&[matched.operations.core_typo_cost()]),
+        insertions: InsertionVector::from_slice(&[matched.operations.insertions]),
+        score: ctx.score,
+        exact_relevance: None,
+    })
 }
 
 fn candidate_for_text<'a>(
@@ -458,7 +630,7 @@ fn candidate_for_text<'a>(
     }
 
     let candidate_len = candidate.chars().count();
-    let query_token_count = split_path_tokens(ctx.query).len();
+    let query_token_count = ctx.token_count;
 
     if query_token_count == 1
         && let Some(start) = candidate.find(ctx.query)
@@ -487,8 +659,9 @@ fn candidate_for_text<'a>(
                     insertions,
                     ..OperationProfile::default()
                 },
-                typo_costs: TypoCostVector::new(vec![0]),
-                insertions: InsertionVector::new(vec![insertions]),
+                alignment_costs: AlignmentCostVector::from_slice(&[0]),
+                typo_costs: TypoCostVector::from_slice(&[0]),
+                insertions: InsertionVector::from_slice(&[insertions]),
                 score: ctx.score,
                 exact_relevance: None,
             });
@@ -526,19 +699,22 @@ fn candidate_for_text<'a>(
         segment: segment_vector(path_position, query_token_count),
         position: simple_position_vector(std::iter::repeat_n(position_rank, query_token_count)),
         operations,
-        typo_costs: TypoCostVector::new(vec![operations.core_typo_cost()]),
-        insertions: InsertionVector::new(vec![operations.insertions]),
+        alignment_costs: AlignmentCostVector::from_slice(&[alignment_cost_milli(
+            operations, false, 0,
+        )]),
+        typo_costs: TypoCostVector::from_slice(&[operations.core_typo_cost()]),
+        insertions: InsertionVector::from_slice(&[operations.insertions]),
         score: ctx.score,
         exact_relevance: None,
     })
 }
 
 fn candidate_for_token_sequence<'a>(
-    ctx: &MatchContext<'a, '_>,
+    ctx: &mut MatchContext<'a, '_>,
     candidate: &str,
     path_position: usize,
 ) -> Option<PathMatch<'a>> {
-    let query_tokens = split_path_tokens(ctx.query);
+    let query_tokens = ctx.query_tokens;
     let candidate_tokens = split_path_tokens(candidate);
     if query_tokens.len() < 2 || query_tokens.len() != candidate_tokens.len() {
         return None;
@@ -550,16 +726,25 @@ fn candidate_for_token_sequence<'a>(
     let mut operations = OperationProfile::default();
     let mut typo_costs = Vec::with_capacity(query_token_count);
     let mut insertion_costs = Vec::with_capacity(query_token_count);
-    for (query_token, candidate_token) in query_tokens.into_iter().zip(candidate_tokens) {
+    let mut alignment_costs = Vec::with_capacity(query_token_count);
+    for (query_idx, candidate_token) in candidate_tokens.into_iter().enumerate() {
+        let query_token = query_tokens[query_idx].as_str();
+        let query_chars = query_token.chars().collect::<Vec<_>>();
         let remaining = ctx.limit.checked_sub(distance)?;
         let (cost, penalty, position_rank, _, token_operations) =
-            best_token_match(query_token, candidate_token, remaining)?;
+            best_token_match_chars_with_scratch(
+                &query_chars,
+                candidate_token,
+                remaining,
+                ctx.scratch,
+            )?;
         distance += cost;
         increment_simple_position_vector(&mut position, position_rank, 1);
         let _ = penalty;
         operations = operations.merge(token_operations);
         typo_costs.push(token_operations.core_typo_cost());
         insertion_costs.push(token_operations.insertions);
+        alignment_costs.push(alignment_cost_milli(token_operations, false, 0));
     }
 
     let ratio = distance as f64 / ctx.query_len as f64;
@@ -576,6 +761,7 @@ fn candidate_for_token_sequence<'a>(
         segment: segment_vector(path_position, query_token_count),
         position,
         operations,
+        alignment_costs: AlignmentCostVector::new(alignment_costs),
         typo_costs: TypoCostVector::new(typo_costs),
         insertions: InsertionVector::new(insertion_costs),
         score: ctx.score,
@@ -588,14 +774,15 @@ fn candidate_for_compound_component<'a>(
     candidate: &str,
     path_position: usize,
 ) -> Option<PathMatch<'a>> {
-    let query_tokens = split_path_tokens(ctx.query);
+    let query_tokens = ctx.query_tokens;
     let candidate_tokens = split_path_tokens(candidate);
     if query_tokens.len() < 2 || candidate_tokens.len() != 1 {
         return None;
     }
 
-    let (distance, _structure, position, operations, typo_costs, insertion_costs) =
-        partitioned_token_distance(&query_tokens, candidate, ctx.limit)?;
+    let query_token_refs = query_tokens.iter().map(String::as_str).collect::<Vec<_>>();
+    let (distance, _structure, position, operations, typo_costs, insertion_costs, alignment_costs) =
+        partitioned_token_distance(&query_token_refs, candidate, ctx.limit)?;
     let ratio = distance as f64 / ctx.query_len.max(candidate.chars().count()) as f64;
     if ratio > 0.5 {
         return None;
@@ -610,6 +797,7 @@ fn candidate_for_compound_component<'a>(
         segment: segment_vector(path_position, query_tokens.len()),
         position,
         operations,
+        alignment_costs: AlignmentCostVector::new(alignment_costs),
         typo_costs: TypoCostVector::new(typo_costs),
         insertions: InsertionVector::new(insertion_costs),
         score: ctx.score,
@@ -618,7 +806,7 @@ fn candidate_for_compound_component<'a>(
 }
 
 fn candidate_for_partitioned_single_query<'a>(
-    ctx: &MatchContext<'a, '_>,
+    ctx: &mut MatchContext<'a, '_>,
     candidate: &str,
     path_position: usize,
 ) -> Option<PathMatch<'a>> {
@@ -626,30 +814,11 @@ fn candidate_for_partitioned_single_query<'a>(
         return None;
     }
     let candidate_len = candidate.chars().count();
-    if ctx.query_len.abs_diff(candidate_len) <= ctx.limit {
-        let matched = fragmented_token_match(ctx.query, candidate, ctx.limit)?;
-        let ratio = matched.distance as f64 / ctx.query_len.max(candidate_len) as f64;
-        if ratio > 0.5 || matched.internal_breaks < 2 {
-            return None;
-        }
-        return Some(PathMatch {
-            path: ctx.path,
-            exact: false,
-            distance: matched.distance,
-            order_distance: 0,
-            ratio,
-            segment: segment_vector(path_position, 1),
-            position: simple_position_vector([matched.position_rank]),
-            operations: matched.operations,
-            typo_costs: TypoCostVector::new(vec![matched.operations.core_typo_cost()]),
-            insertions: InsertionVector::new(vec![matched.operations.insertions]),
-            score: ctx.score,
-            exact_relevance: None,
-        });
-    }
-    let matched = fragmented_token_match(ctx.query, candidate, ctx.limit)?;
+    let matched =
+        choose_path_token_match_with_scratch(ctx.query_chars, candidate, ctx.limit, ctx.scratch)?;
     let ratio = matched.distance as f64 / ctx.query_len.max(candidate_len) as f64;
-    if ratio > 0.5 || matched.internal_breaks == 0 {
+    let minimum_breaks = usize::from(ctx.query_len.abs_diff(candidate_len) <= ctx.limit) + 1;
+    if ratio > 0.5 || matched.fragmented && matched.internal_breaks < minimum_breaks {
         return None;
     }
 
@@ -662,34 +831,33 @@ fn candidate_for_partitioned_single_query<'a>(
         segment: segment_vector(path_position, 1),
         position: simple_position_vector([matched.position_rank]),
         operations: matched.operations,
-        typo_costs: TypoCostVector::new(vec![matched.operations.core_typo_cost()]),
-        insertions: InsertionVector::new(vec![matched.operations.insertions]),
+        alignment_costs: AlignmentCostVector::from_slice(&[matched.alignment_cost]),
+        typo_costs: TypoCostVector::from_slice(&[matched.operations.core_typo_cost()]),
+        insertions: InsertionVector::from_slice(&[matched.operations.insertions]),
         score: ctx.score,
         exact_relevance: None,
     })
 }
 
 fn candidate_for_component_sequence<'a>(
+    prepared: &PreparedPath<'a>,
     ctx: &MatchContext<'a, '_>,
-    components: &[&str],
+    component_count: usize,
 ) -> Option<PathMatch<'a>> {
-    let query_tokens = split_path_tokens(ctx.query);
+    let query_tokens = ctx.query_tokens;
     if query_tokens.len() < 2 {
         return None;
     }
+    let query_token_refs = query_tokens.iter().map(String::as_str).collect::<Vec<_>>();
 
-    let basename_idx = components.len() - 1;
-    let candidate_tokens: Vec<_> = components
-        .iter()
-        .enumerate()
-        .flat_map(|(idx, component)| {
+    let basename_idx = component_count - 1;
+    let candidate_tokens: Vec<_> = (0..component_count)
+        .flat_map(|idx| {
             let path_position = basename_idx - idx;
-            split_path_tokens(component)
-                .into_iter()
-                .map(move |token| PositionedToken {
-                    token,
-                    segment: path_position,
-                })
+            prepared.tokens(idx).map(move |token| PositionedToken {
+                token,
+                segment: path_position,
+            })
         })
         .collect();
     if candidate_tokens.len() < query_tokens.len() {
@@ -706,7 +874,8 @@ fn candidate_for_component_sequence<'a>(
         operations,
         typo_costs,
         insertion_costs,
-    ) = aligned_token_distance(&query_tokens, &candidate_tokens, ctx.limit)?;
+        alignment_costs,
+    ) = aligned_token_distance(&query_token_refs, &candidate_tokens, ctx.limit)?;
     let ratio = distance as f64 / ctx.query_len as f64;
     if ratio > 0.5 {
         return None;
@@ -721,17 +890,12 @@ fn candidate_for_component_sequence<'a>(
         segment,
         position,
         operations,
+        alignment_costs: AlignmentCostVector::new(alignment_costs),
         typo_costs: TypoCostVector::new(typo_costs),
         insertions: InsertionVector::new(insertion_costs),
         score: ctx.score,
         exact_relevance: None,
     })
-}
-
-fn path_components(path: &str) -> Vec<&str> {
-    path.split(['/', '\\'])
-        .filter(|component| !component.is_empty())
-        .collect()
 }
 
 fn compare_exact_relevance(left: &PathMatch<'_>, right: &PathMatch<'_>) -> std::cmp::Ordering {
@@ -1073,6 +1237,99 @@ mod tests {
             best_match("/home/lewis/Dev/applicationlauncher", 93.2, "dev applaunch").unwrap();
         assert_eq!(candidate.operations.core_typo_cost(), 0);
         assert_eq!(candidate.operations.insertions, 10);
+    }
+
+    #[test]
+    fn compact_whole_token_typos_beat_excessively_fragmented_matches() {
+        let cases = [
+            (
+                "dwv",
+                "/home/lewis/Dev",
+                878.0,
+                "/home/lewis/Dev/markdownviewer",
+                64.0,
+            ),
+            (
+                "trre",
+                "/home/lewis/Dev/tree",
+                239.2,
+                "/home/lewis/tasks/tplinkwirelesstransmitter",
+                21.0,
+            ),
+            (
+                "nvtio",
+                "/home/lewis/repos/nvtop",
+                12.0,
+                "/home/lewis/.gemini/antigravity-cli/conversations",
+                14.5,
+            ),
+            (
+                "dav",
+                "/home/lewis/Dev",
+                926.0,
+                "/home/lewis/Dev/aimodeinteract",
+                254.0,
+            ),
+            (
+                "dav",
+                "/home/lewis/Dev",
+                926.0,
+                "/home/lewis/Dev/daterepair",
+                0.9,
+            ),
+            (
+                "dav",
+                "/home/lewis/Dev",
+                926.0,
+                "/home/lewis/tasks/agentdvr",
+                0.4,
+            ),
+            (
+                "dav",
+                "/home/lewis/Dev",
+                926.0,
+                "/home/lewis/tasks/antigravitylogin",
+                1.4,
+            ),
+            (
+                "dav",
+                "/home/lewis/Dev",
+                926.0,
+                "/home/lewis/.gemini/antigravity-cli/conversations",
+                1.8,
+            ),
+            (
+                "dav",
+                "/home/lewis/Dev",
+                926.0,
+                "/home/lewis/.gemini/antigravity-cli/log",
+                0.3,
+            ),
+            (
+                "dav",
+                "/home/lewis/Dev",
+                926.0,
+                "/home/lewis/.gemini/antigravity-cli/brain/session/scratch",
+                0.9,
+            ),
+        ];
+        let mut failures = Vec::new();
+
+        for (query, expected, expected_score, decoy, decoy_score) in cases {
+            let mut matches = vec![
+                best_match(decoy, decoy_score, query).unwrap(),
+                best_match(expected, expected_score, query).unwrap(),
+            ];
+            sort_matches(&mut matches);
+            if matches[0].path != expected {
+                failures.push(format!(
+                    "{query:?}: expected {expected:?}, ranked {:?}",
+                    matches[0].path
+                ));
+            }
+        }
+
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
     #[test]
