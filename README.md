@@ -32,13 +32,22 @@ fuzzy-rank/
     ├── token_match.rs
     ├── path.rs
     ├── path/
-    │   ├── exact.rs
-    │   └── typo.rs
+    │   ├── fuzzy.rs
+    │   ├── literal.rs
+    │   ├── literal/
+    │   │   └── bulk.rs
+    │   ├── bulk.rs       # deprecated compatibility shim
+    │   ├── exact.rs      # deprecated compatibility shim
+    │   └── typo.rs       # deprecated compatibility shim
+    ├── fields/
+    │   ├── fuzzy.rs
+    │   ├── literal.rs
+    │   └── mod.rs
     ├── bin/
     │   └── fuzzy-rank-debug.rs
     ├── command_history.rs
-    ├── message.rs
-    └── metadata.rs
+    ├── message.rs        # deprecated compatibility shim
+    └── metadata.rs       # deprecated compatibility shim
 ```
 
 ## Debug CLI
@@ -59,27 +68,46 @@ cargo run --bin fuzzy-rank-debug -- ADAPTOR "QUERY" "CANDIDATE" [OPTIONS]
 Examples:
 
 ```sh
-cargo run --bin fuzzy-rank-debug -- path::typo applaunch \
+cargo run --bin fuzzy-rank-debug -- path::fuzzy applaunch \
   /home/lewis/Dev/applicationlauncher
-cargo run --bin fuzzy-rank-debug -- message "cachyos ssh" \
+cargo run --bin fuzzy-rank-debug -- fields::literal "cachyos ssh" \
   "cachyos setup uses ssh and ssh-agent" --score 10
-cargo run --bin fuzzy-rank-debug -- message "chat ssh" \
+cargo run --bin fuzzy-rank-debug -- fields::literal "chat ssh" \
   "message body" --field "0:Chat title" --field "1:message body"
 cargo run --bin fuzzy-rank-debug -- command-history elextron \
   "npx electron ." --recency 42
-cargo run --bin fuzzy-rank-debug -- metadata "chrome profile" \
+cargo run --bin fuzzy-rank-debug -- fields::fuzzy "chrome profile" \
   chrome --field "0:Google Chrome" --field "2:chrome --profile-directory=Default" --typos
 ```
 
-Supported adaptor names are `path`, `path::bulk`, `path::exact`, `path::typo`,
-`message`, `command-history`, and `metadata`. `path` runs the unified exact-first
-path adapter; `path::bulk` uses the high-throughput exact implementation, while
-the other qualified names force one path class. Metadata treats the
+Supported adaptor names are `path::literal`, `path::fuzzy`,
+`path::literal::bulk`, `fields::literal`, `command-history`, and `fields::fuzzy`.
+`path::fuzzy` is the unified exact-first path adapter; `path::literal::BulkMatcher`
+is its high-throughput literal execution strategy, implemented in the
+`path::literal::bulk` module, while `path::literal` exposes the literal-only
+policy. `fields::literal` and `fields::fuzzy` share the prioritized
+field shape but differ in whether typo/fuzzy stages are enabled. The legacy names
+`path`, `path::exact`, `path::typo`, `path::bulk`, `message`, and `metadata` remain
+available as deprecated compatibility aliases. Fields treats the
 candidate as one priority-0 field unless one or more repeatable `--field
-PRIORITY:VALUE` options are supplied. Message uses the same rule: its positional
+PRIORITY:VALUE` options are supplied. `fields::literal` uses the same rule: its positional
 candidate is a priority-0 field, and repeatable `--field PRIORITY:VALUE`
 options replace it with prioritized message fields. `--score` and `--recency`
 are caller inputs, not values calculated by fuzzy-rank.
+
+## Benchmarks
+
+The repository includes a Criterion benchmark for the high-throughput literal
+path pipeline. It exercises broad and specific single-term scans, multi-token
+scans, ordered compound matching, and preparation of a 100,000-path source:
+
+```sh
+cargo bench --bench path_bulk
+```
+
+The benchmark uses prepared paths and bounded `BulkTopK` collection, so it
+measures the execution strategy used by Friz rather than fully sorting every
+matching path.
 
 ## Ownership Boundaries
 
@@ -94,16 +122,16 @@ These modules are intended to be reused by all adapters:
 - `text`
 - `token_match`
 
-They own the generic machinery. They do not own path-specific, command-history-specific, or metadata-specific policy.
+They own the generic machinery. They do not own path-specific, command-history-specific, or field-policy-specific behavior.
 
 ### Adapter layers
 
-These modules are domain-specific adapters:
+These public namespaces are domain-specific adapters:
 
 - `path`
 - `command_history`
-- `message`
-- `metadata`
+- `fields::literal`
+- `fields::fuzzy`
 
 They own the rules that differ by data type:
 
@@ -134,6 +162,7 @@ Owns domain-neutral matching and comparison primitives:
 - `saturated_exact_query_token_occurrence_total`
 - `ordered_token_span`
 - `inversion_count`
+- `TopK<T>` for bounded best-first collection and parallel fold/reduce merging
 - `compare_score_desc`
 - `compare_key_asc`
 - `ratio_milli`
@@ -148,6 +177,8 @@ This module is responsible for:
 - counting raw exact phrase occurrences only for explicit later tie-breaks
 - calculating exact phrase-run vectors and exact distinct coverage
 - providing shared score and deterministic-key comparisons
+- retaining only the best `k` values without sorting the complete candidate set;
+  callers provide the `Ord` implementation, so the core does not own a thread pool
 
 This module does not know anything about:
 
@@ -221,7 +252,7 @@ Their current adapter-specific uses are:
   token matching. It requires at least one query-token signal in the command;
   the later full-query coverage check still requires every query token to
   match. This gate is retained because shell history can be large.
-- `metadata`: `token_has_signal` gates the field-level fuzzy and typo
+- `fields::fuzzy`: `token_has_signal` gates the field-level fuzzy and typo
   `SearchRank` paths, each candidate variant in fuzzy ranking, per-token
   `TOKEN_MATCH` typo fallback, and typo highlighting. Literal substring
   matches bypass it. Queries shorter than three characters also bypass typo
@@ -261,7 +292,7 @@ Examples:
 
 - zoxide computes directory frecency itself, then passes `score` into `path`
 - a shell-history consumer should compute command history recency itself, then pass `recency` into `command_history`
-- an application launcher should compute app/window recency or launch counts itself, then pass `score` into `metadata`
+- an application launcher should compute app/window recency or launch counts itself, then pass `score` into `fields::fuzzy`
 
 The crate uses those caller-owned priorities in ranking, but it does not define one universal frecency or recency model.
 
@@ -358,7 +389,7 @@ This table puts every final comparator side by side. Repeated bracketed names
 refer to the same implementation. `—` means that the adaptor has no stage at
 that position; it does not by itself mean the adaptor is missing required policy.
 
-| Order | `path::exact` | `path::typo` | `command_history` | `message` | `metadata` |
+| Order | `path::literal` | `path::fuzzy` | `command_history` | `fields::literal` | `fields::fuzzy` |
 | ---: | --- | --- | --- | --- | --- |
 | 1 | `[CORE.EXACT_PHRASE_PRESENT]` | `[CORE.EXACT_PHRASE_PRESENT]` | `[CORE.EXACT_PHRASE_PRESENT]` | `[CORE.EXACT_PHRASE_PRESENT]` | `[CORE.EXACT_PHRASE_PRESENT]` |
 | 2 | `[CORE.EXACT_SUBPHRASE_COUNTS_VECTOR]` | `[CORE.EXACT_SUBPHRASE_COUNTS_VECTOR]` | `[CORE.EXACT_COVERAGE]` | `[CORE.EXACT_SUBPHRASE_COUNTS_VECTOR]` | `[CORE.EXACT_SUBPHRASE_COUNTS_VECTOR]` |
@@ -458,7 +489,7 @@ meaning, such as path component depth or metadata field priority.
 
 Shared implementation coverage, with each cell showing its sort position:
 
-| Shared implementation | `path::exact` | `path::typo` | `command_history` | `message` | `metadata` |
+| Shared implementation | `path::literal` | `path::fuzzy` | `command_history` | `fields::literal` | `fields::fuzzy` |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | `CORE.EXACT_PHRASE_PRESENT` | 1 | 1 | 1 | 1 | 1 |
 | `CORE.EXACT_PHRASE_OCCURRENCE_COUNT` | — | — | — | 7 | 5 |
@@ -499,14 +530,14 @@ This adapter is intended for zoxide-style search.
 
 It owns:
 
-- `path::bulk`
-- `path::exact`
-- `path::typo`
+- `path::literal::BulkMatcher`
+- `path::literal`
+- `path::fuzzy`
 
 It uses shared core from:
 
-- `path::exact` uses `text` for path normalization and token-boundary logic
-- `path::typo` uses:
+- `path::literal` uses `text` for path normalization and token-boundary logic
+- `path::fuzzy` uses:
   - `core` for edit distance
   - `ranking` for typo sort-key comparison
   - `text` for path-token splitting and query variants
@@ -520,10 +551,10 @@ What is path-specific here:
 
 This is the adapter to use for filesystem path search.
 
-### `path::exact`
+### `path::literal`
 
-`path::exact` owns the reusable non-typo path helpers used internally by the
-unified `path::typo` adapter:
+`path::literal` owns the reusable non-typo path helpers used internally by the
+unified `path::fuzzy` adapter:
 
 - `match_qualities`
 - `match_path_segment`
@@ -591,15 +622,16 @@ Exact phrase, subphrase, direct coverage, and ordered compound coverage remain
 cached relevance stages. `path_depth` is evaluated only when comparison reaches
 that tie-break.
 
-### `path::bulk`
+### `path::literal::BulkMatcher`
 
-`path::bulk` is the high-throughput execution strategy for scanning large path
-collections with the `path::exact` ordering. `BulkQuery` owns the normalized
-query terms, while `PreparedBulkPath` owns query-independent normalized path
-data and depth. Callers can prepare each source path once and reuse it across
-keystrokes, then materialize an immutable `BulkPathMatch` only for candidates
-that survive the cheap gate. Bulk supports both a full sort and bounded top-k
-collection through `BulkTopK`.
+`path::literal::BulkMatcher` is the high-throughput execution strategy for scanning
+large path collections with the `path::literal` ordering. It owns a `BulkQuery`
+with normalized query terms, while `PreparedBulkPath` owns query-independent
+normalized path data and depth. Callers can prepare each source path once and
+reuse it across keystrokes, then materialize an immutable `BulkPathMatch` only
+for candidates that survive the cheap gate. The lower-level
+`path::literal::bulk` module also exposes full-sort and bounded top-k collection
+through `BulkTopK`.
 
 It is not a separate relevance policy: `BulkPathMatch::compare` uses the same
 ten exact-path sort stages documented above. The caller may use `BulkTopK`
@@ -618,9 +650,16 @@ temporary component trees. Segment vectors remain inline for ordinary path
 depths, avoiding per-match heap allocation for extremely broad queries such as
 one-character filters.
 
-### `path::typo`
+`PreparedBulkPath` stores a normalized path only when normalization changes the
+source string; ordinary lowercase paths therefore do not carry a duplicate
+allocation. The single-term evidence scan fuses the final direct-match lookup
+with token-boundary detection, avoiding a second full path scan in the common
+case. Multi-token relevance uses stack-backed small vectors for its temporary
+component/token view.
 
-`path::typo` is the unified exact-first path adapter. It owns:
+### `path::fuzzy`
+
+`path::fuzzy` is the unified exact-first path adapter. It owns:
 
 - `TypoQuery`
 - `PathMatch`
@@ -648,7 +687,7 @@ substitutions.
 token assignment. It lets an in-order zero-cost match beat an otherwise
 equivalent reversed match without charging token order as typo distance.
 
-The effective `path::typo` comparator is a thirteen-stage pipeline. `PathMatch::compare`
+The effective `path::fuzzy` comparator is a thirteen-stage pipeline. `PathMatch::compare`
 owns the first four stages, then delegates the remaining stages to the shared
 `PathTypoSortKey` comparator in `ranking.rs`:
 
@@ -698,7 +737,7 @@ alignment for each key would add work without making the sort more selective.
 `PathMatch.exact` is not a comparator stage. It is provenance indicating whether
 the candidate came from the exact path check, and it remains available to callers
 that need to partition exact candidates before requesting typo candidates. Exact
-candidates bypass Damerau-Levenshtein, but the unified `path::typo` comparator
+candidates bypass Damerau-Levenshtein, but the unified `path::fuzzy` comparator
 does not impose a separate exact-before-typo class; it ranks candidates through
 the shared exact-evidence and typo-quality stages above.
 
@@ -743,7 +782,7 @@ The path-specific comparator uses the exact stages above, then:
 - raw `insertions`, ascending, as a separate noise key
 
 For single-token contiguous substring matches that satisfy the normal path exact
-rules, `path::typo` takes the exact fast path instead of running
+rules, `path::fuzzy` takes the exact fast path instead of running
 Damerau-Levenshtein. Those matches come through with:
 
 - `exact = true`
@@ -784,6 +823,8 @@ It owns:
 - `CommandHistoryQuery`
 - `CommandHistoryCandidate`
 - `CommandHistoryMatch`
+- `PreparedCommandHistoryCandidate`
+- `PreparedCommandHistoryMatch`
 - `parse_command_history_candidate`
 
 It uses shared core for exact phrase count, exact coverage, exact subphrase
@@ -834,7 +875,17 @@ Command-local policy is limited to command tokenization, whole-token typo
 eligibility, the full-query acceptance filter, fuzzy subphrase construction,
 caller-provided recency, and preserving legacy diagnostic fields for fish.
 
-## `message.rs`
+For repeated searches over one history snapshot, callers should construct
+`PreparedCommandHistoryCandidate` once per command. It retains the original
+command for display and precomputes its normalized command and search tokens;
+each query then reuses those values instead of lowercasing and tokenizing every
+history item again. `CommandHistoryQuery` also tokenizes its normalized query
+once, rather than repeating that work for every candidate. Fish uses the shared
+command-history matcher directly because each history snapshot is consumed by
+one typo-fallback pass; retaining an owned prepared copy would add memory and
+preparation work without a second query to reuse it.
+
+## `fields::literal` (`fields/literal.rs`)
 
 Purpose:
 
@@ -842,7 +893,7 @@ Purpose:
 - phrase-aware ordering for exact multi-token sequences
 - lightweight precomputation for repeated query evaluation
 
-This adapter is intended for message search where metadata-style exact phrase,
+This adapter is intended for message search where field-oriented exact phrase,
 coverage, and field-priority ranking are needed without typo handling. A message
 candidate can expose fields such as chat title/message title at priority `0` and
 message name/body at priority `1` (lower numbers are stronger).
@@ -905,14 +956,15 @@ This is the adapter to use for:
 - searchable conversation history
 - other structured text records where phrase continuity and field priority matter
 
-## `metadata.rs`
+## `fields::fuzzy` (`fields/fuzzy.rs`)
 
 Purpose:
 
 - multi-field matching for records like applications and windows
 - field-priority-aware structural, abbreviation, fuzzy, and typo ranking
 
-This adapter is intended for application launchers and window search.
+This adapter is intended for application launchers, window search, and other
+prioritized records that need fuzzy or typo matching.
 
 It owns:
 
@@ -945,7 +997,7 @@ This is the adapter to use for:
 
 ### Metadata sort order
 
-`metadata` now uses a query-aware relevance stack before caller score and final
+`fields::fuzzy` now uses a query-aware relevance stack before caller score and final
 deterministic tie-breaks.
 
 Final metadata result ordering is:
@@ -1021,10 +1073,11 @@ Shared versus adapter-local:
 
 ## Which Adapter To Use
 
-- Use `path` for filesystem paths.
+- Use `path::literal` for literal-only filesystem path matching.
+- Use `path::fuzzy` for filesystem paths with exact-first typo fallback.
 - Use `command_history` for shell command history lines.
-- Use `message` for tokenized free-text records where phrase continuity matters.
-- Use `metadata` for apps, windows, or generic multi-field searchable records.
+- Use `fields::literal` for tokenized free-text records where phrase continuity matters.
+- Use `fields::fuzzy` for apps, windows, or generic multi-field searchable records.
 
 If the data is not naturally a path, do not force it through `path`.
 If the data is not naturally shell command history, do not force it through `command_history`.
@@ -1037,7 +1090,7 @@ The current design is:
 2. `ranking` provides one ranking/comparison framework.
 3. `text` provides one shared text/query-prep layer.
 4. `token_match` provides one shared token-matching layer.
-5. `path`, `command_history`, `message`, and `metadata` adapt those shared layers to their own domains.
+5. `path`, `command_history`, `fields::literal`, and `fields::fuzzy` adapt those shared layers to their own domains.
 
 So the crate does not have separate ad hoc matcher implementations anymore.
 It has:

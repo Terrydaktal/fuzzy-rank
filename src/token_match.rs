@@ -649,6 +649,41 @@ pub(crate) fn best_token_match_chars_with_scratch(
     let query_len = query_chars.len();
     let candidate_len = candidate_chars.len();
 
+    // Exact windows are common in path and metadata searches. They have a
+    // deterministic zero-distance result, so avoid running the DP once per
+    // possible substring when one is present.
+    let mut exact = None;
+    if query_len <= candidate_len {
+        for (start, window) in candidate_chars.windows(query_len).enumerate() {
+            if window != query_chars {
+                continue;
+            }
+            let end = start + query_len;
+            let position_rank = if start == 0 {
+                0
+            } else if end == candidate_len {
+                1
+            } else {
+                2
+            };
+            let total = (
+                0,
+                start + (candidate_len - end),
+                position_rank,
+                query_len,
+                OperationProfile::default(),
+            );
+            exact = Some(match exact {
+                None => total,
+                Some(current) if total < current => total,
+                Some(current) => current,
+            });
+        }
+    }
+    if exact.is_some() {
+        return exact;
+    }
+
     let mut best = None;
     for start in 0..candidate_len {
         let min_len = 1usize.max(query_len.saturating_sub(limit));

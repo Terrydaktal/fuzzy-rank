@@ -9,3 +9,10 @@ path = "src/lib.rs"
 
 [dependencies]
 smallvec = "1.15.1"
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "path_bulk"
+harness = false

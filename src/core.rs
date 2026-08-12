@@ -1,4 +1,48 @@
-use std::cmp::Ordering;
+use std::{cmp::Ordering, collections::BinaryHeap};
+
+/// Bounded top-k collection for values whose natural ordering is best-first:
+/// `Ordering::Less` means that the left value is better than the right value.
+/// The heap keeps the worst retained value at its root, so rejected candidates
+/// do not need to be fully sorted.
+pub struct TopK<T> {
+    limit: usize,
+    heap: BinaryHeap<T>,
+}
+
+impl<T: Ord> TopK<T> {
+    pub fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            heap: BinaryHeap::with_capacity(limit),
+        }
+    }
+
+    pub fn push(&mut self, candidate: T) {
+        if self.limit == 0 {
+            return;
+        }
+        if self.heap.len() < self.limit {
+            self.heap.push(candidate);
+        } else if candidate.cmp(self.heap.peek().expect("non-empty top-k heap")) == Ordering::Less {
+            self.heap.pop();
+            self.heap.push(candidate);
+        }
+    }
+
+    pub fn merge(mut self, other: Self) -> Self {
+        debug_assert_eq!(self.limit, other.limit);
+        for candidate in other.heap {
+            self.push(candidate);
+        }
+        self
+    }
+
+    pub fn into_sorted(self) -> Vec<T> {
+        let mut values = self.heap.into_vec();
+        values.sort_unstable();
+        values
+    }
+}
 
 #[derive(Clone, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
 pub struct CoverageRank {
@@ -584,6 +628,109 @@ impl OperationProfile {
     }
 }
 
+/// Compact operation state used inside the edit-distance matrix.
+///
+/// The public operation profile intentionally uses `usize` fields, but a DP
+/// cell only needs counters bounded by the input strings. Keeping these as
+/// `u32` cuts the hot cell state roughly in half without changing the public
+/// result or its ordering.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct CompactOperationProfile {
+    substitutions: u32,
+    insertions: u32,
+    deletions: u32,
+    transpositions: u32,
+    keyboard_distance: u32,
+    substitution_penalty: u32,
+    insertion_penalty: u32,
+}
+
+impl CompactOperationProfile {
+    fn to_public(self) -> OperationProfile {
+        OperationProfile {
+            substitutions: self.substitutions as usize,
+            insertions: self.insertions as usize,
+            deletions: self.deletions as usize,
+            transpositions: self.transpositions as usize,
+            keyboard_distance: self.keyboard_distance as usize,
+            substitution_penalty: self.substitution_penalty as usize,
+            insertion_penalty: self.insertion_penalty as usize,
+        }
+    }
+
+    fn with_insertion(self, inserted: char, prev: Option<char>, next: Option<char>) -> Self {
+        Self {
+            insertions: self.insertions.saturating_add(1),
+            insertion_penalty: self
+                .insertion_penalty
+                .saturating_add(insertion_likelihood_penalty(inserted, prev, next) as u32),
+            ..self
+        }
+    }
+
+    fn with_deletion(self, deleted: char, prev: Option<char>, next: Option<char>) -> Self {
+        Self {
+            deletions: self.deletions.saturating_add(1),
+            substitution_penalty: self
+                .substitution_penalty
+                .saturating_add(deletion_likelihood_penalty(deleted, prev, next) as u32),
+            ..self
+        }
+    }
+
+    fn with_substitution(self, left: char, right: char) -> Self {
+        let keyboard_distance = keyboard_substitution_cost(left, right) as u32;
+        Self {
+            substitutions: self.substitutions.saturating_add(1),
+            keyboard_distance: self.keyboard_distance.saturating_add(keyboard_distance),
+            substitution_penalty: self.substitution_penalty.saturating_add(keyboard_distance),
+            ..self
+        }
+    }
+
+    fn with_transposition(self) -> Self {
+        Self {
+            transpositions: self.transpositions.saturating_add(1),
+            substitution_penalty: self.substitution_penalty.saturating_add(65),
+            ..self
+        }
+    }
+}
+
+impl Ord for CompactOperationProfile {
+    fn cmp(&self, other: &Self) -> Ordering {
+        (
+            self.substitution_penalty
+                .saturating_add(self.insertion_penalty),
+            self.substitution_penalty,
+            self.insertion_penalty,
+            self.substitutions,
+            self.transpositions,
+            self.deletions,
+            self.insertions,
+            self.keyboard_distance,
+        )
+            .cmp(&(
+                other
+                    .substitution_penalty
+                    .saturating_add(other.insertion_penalty),
+                other.substitution_penalty,
+                other.insertion_penalty,
+                other.substitutions,
+                other.transpositions,
+                other.deletions,
+                other.insertions,
+                other.keyboard_distance,
+            ))
+    }
+}
+
+impl PartialOrd for CompactOperationProfile {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 pub fn keyboard_substitution_cost(left: char, right: char) -> usize {
     if left == right {
         return 0;
@@ -658,14 +805,14 @@ fn deletion_likelihood_penalty(_deleted: char, _prev: Option<char>, _next: Optio
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct EditCost {
     distance: usize,
-    operations: OperationProfile,
+    operations: CompactOperationProfile,
 }
 
 impl EditCost {
     fn infinite(limit: usize) -> Self {
         Self {
             distance: limit + 1,
-            operations: OperationProfile::default(),
+            operations: CompactOperationProfile::default(),
         }
     }
 
@@ -755,10 +902,10 @@ pub(crate) fn bounded_damerau_levenshtein_chars_with_scratch(
     for (idx, cell) in scratch.prev.iter_mut().enumerate() {
         *cell = EditCost {
             distance: idx,
-            operations: OperationProfile {
+            operations: CompactOperationProfile {
                 substitutions: 0,
                 insertions: 0,
-                deletions: idx,
+                deletions: idx as u32,
                 transpositions: 0,
                 keyboard_distance: 0,
                 substitution_penalty: 0,
@@ -771,9 +918,9 @@ pub(crate) fn bounded_damerau_levenshtein_chars_with_scratch(
         scratch.curr.fill(inf);
         scratch.curr[0] = EditCost {
             distance: i,
-            operations: OperationProfile {
+            operations: CompactOperationProfile {
                 substitutions: 0,
-                insertions: i,
+                insertions: i as u32,
                 deletions: 0,
                 transpositions: 0,
                 keyboard_distance: 0,
@@ -828,12 +975,23 @@ pub(crate) fn bounded_damerau_levenshtein_chars_with_scratch(
     }
 
     let cost = scratch.prev[query.len()];
-    (cost.distance <= limit).then_some((cost.distance, cost.operations))
+    (cost.distance <= limit).then_some((cost.distance, cost.operations.to_public()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn top_k_retains_the_best_values_in_order() {
+        let mut top = TopK::new(2);
+        top.push(3);
+        top.push(1);
+        top.push(2);
+        top.push(0);
+
+        assert_eq!(top.into_sorted(), vec![0, 1]);
+    }
 
     #[test]
     fn exact_relevance_primitives_work_across_fields() {

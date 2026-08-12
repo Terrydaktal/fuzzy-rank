@@ -90,10 +90,13 @@ pub fn split_search_tokens(value: &str) -> Vec<&str> {
 }
 
 pub fn split_path_tokens(value: &str) -> Vec<&str> {
+    iter_path_tokens(value).collect()
+}
+
+pub fn iter_path_tokens(value: &str) -> impl Iterator<Item = &str> {
     value
         .split(|c: char| matches!(c, '/' | '\\' | '-' | '_' | '.') || c.is_whitespace())
         .filter(|token| !token.is_empty())
-        .collect()
 }
 
 pub fn normalize_compact_alnum(value: &str) -> String {

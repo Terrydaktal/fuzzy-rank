@@ -5,10 +5,10 @@ use std::process;
 use fuzzy_rank::command_history::{CommandHistoryQuery, parse_command_history_candidate};
 use fuzzy_rank::core::{CoverageRank, RankedTokenVector};
 use fuzzy_rank::debug::{DebugReport, DebugStage};
-use fuzzy_rank::message::{MessageCandidate, MessageField, MessageQuery};
-use fuzzy_rank::metadata::{MetadataCandidate, MetadataQuery, SearchField};
-use fuzzy_rank::path::bulk;
-use fuzzy_rank::path::typo::{PathMatch, TypoQuery};
+use fuzzy_rank::fields::fuzzy::{MetadataCandidate, MetadataQuery, SearchField};
+use fuzzy_rank::fields::literal::{MessageCandidate, MessageField, MessageQuery};
+use fuzzy_rank::path::fuzzy::{PathMatch, TypoQuery};
+use fuzzy_rank::path::literal::bulk;
 use fuzzy_rank::text::{split_path_tokens, to_lowercase};
 
 #[derive(Clone, Copy)]
@@ -41,16 +41,15 @@ fn main() {
 fn run() -> Result<(), String> {
     let config = parse_args(env::args().skip(1).collect())?;
     let report = match config.adaptor.as_str() {
-        "path" => run_path(&config, PathMode::Normal),
-        "path::bulk" | "path-bulk" => run_bulk_path(&config),
-        "path::exact" | "path-exact" => run_path(&config, PathMode::Exact),
-        "path::typo" | "path-typo" => run_path(&config, PathMode::Typo),
-        "message" => run_message(&config),
+        "path" | "path::fuzzy" | "path::typo" | "path-typo" => run_path(&config, PathMode::Normal),
+        "path::literal::bulk" | "path::bulk" | "path-bulk" => run_bulk_path(&config),
+        "path::literal" | "path::exact" | "path-exact" => run_path(&config, PathMode::Exact),
+        "fields::literal" | "message" => run_message(&config),
         "command-history" | "command_history" | "command" => run_command_history(&config),
-        "metadata" => run_metadata(&config),
+        "fields::fuzzy" | "metadata" => run_metadata(&config),
         adaptor => {
             return Err(format!(
-                "unknown adaptor `{adaptor}`; expected path, path::bulk, path::exact, path::typo, message, command-history, or metadata"
+                "unknown adaptor `{adaptor}`; expected path::literal, path::fuzzy, path::literal::bulk, fields::literal, command-history, or fields::fuzzy"
             ));
         }
     }?;
@@ -135,7 +134,6 @@ fn parse_f64_option(args: &[String], index: &mut usize, option: &str) -> Result<
 enum PathMode {
     Normal,
     Exact,
-    Typo,
 }
 
 fn run_path(config: &Config, mode: PathMode) -> Result<DebugReport, String> {
@@ -143,7 +141,6 @@ fn run_path(config: &Config, mode: PathMode) -> Result<DebugReport, String> {
     let matched = match mode {
         PathMode::Normal => query.best_match(&config.candidate, config.score),
         PathMode::Exact => query.best_exact_match(&config.candidate, config.score),
-        PathMode::Typo => query.best_typo_match(&config.candidate, config.score),
     };
 
     let Some(matched) = matched else {
@@ -473,7 +470,10 @@ fn print_report(config: &Config, report: DebugReport) {
     let is_path_report = matches!(
         config.adaptor.as_str(),
         "path"
+            | "path::fuzzy"
+            | "path::literal::bulk"
             | "path::bulk"
+            | "path::literal"
             | "path::exact"
             | "path::typo"
             | "path-bulk"
@@ -539,7 +539,7 @@ fn paint(enabled: bool, code: &str, value: &str) -> String {
 fn print_help() {
     println!(
         "Usage: fuzzy-rank-debug ADAPTOR QUERY CANDIDATE [OPTIONS]\n\n\
-Adaptors:\n  path\n  path::bulk\n  path::exact\n  path::typo\n  message\n  command-history\n  metadata\n\n\
+Adaptors:\n  path::literal\n  path::fuzzy\n  path::literal::bulk\n  fields::literal\n  command-history\n  fields::fuzzy\n\n\
 Options:\n  --score VALUE       Caller score for path, message, and metadata\n  --recency VALUE     Caller recency for command-history\n  --field P:VALUE     Metadata field with priority P; repeatable\n  --typos             Enable metadata typo fallback\n  --color             Force ANSI colors\n  --no-color          Disable ANSI colors\n  -h, --help          Show this help\n\n\
 Queries and candidates containing spaces must be quoted. Metadata without\n\
 --field treats CANDIDATE as one field with priority 0."

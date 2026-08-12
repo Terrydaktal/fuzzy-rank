@@ -66,14 +66,25 @@ impl<'a> CommandHistoryMatch<'a> {
     }
 
     pub fn compare(&self, other: &Self) -> std::cmp::Ordering {
-        compare_ranks(
-            &self.rank(),
-            self.candidate.recency,
-            self.candidate.command,
-            &other.rank(),
-            other.candidate.recency,
-            other.candidate.command,
-        )
+        Reverse(self.exact_phrase_present)
+            .cmp(&Reverse(other.exact_phrase_present))
+            .then_with(|| Reverse(self.exact_coverage).cmp(&Reverse(other.exact_coverage)))
+            .then_with(|| {
+                Reverse(&self.exact_subphrase_counts_vector)
+                    .cmp(&Reverse(&other.exact_subphrase_counts_vector))
+            })
+            .then_with(|| Reverse(self.total_coverage).cmp(&Reverse(other.total_coverage)))
+            .then_with(|| {
+                Reverse(&self.fuzzy_subphrase_counts_vector)
+                    .cmp(&Reverse(&other.fuzzy_subphrase_counts_vector))
+            })
+            .then_with(|| self.typo_costs.cmp(&other.typo_costs))
+            .then_with(|| self.insertions.cmp(&other.insertions))
+            .then_with(|| self.operations.cmp(&other.operations))
+            .then_with(|| self.order_distance.cmp(&other.order_distance))
+            .then_with(|| self.total_gap.cmp(&other.total_gap))
+            .then_with(|| compare_score_desc(self.candidate.recency, other.candidate.recency))
+            .then_with(|| compare_key_asc(self.candidate.command, other.candidate.command))
     }
 }
 
@@ -107,7 +118,7 @@ pub fn compare_ranks(
 }
 
 pub struct CommandHistoryQuery {
-    text: String,
+    tokens: Vec<String>,
     len: usize,
     limit: usize,
 }
@@ -120,8 +131,13 @@ impl CommandHistoryQuery {
             return None;
         }
 
+        let tokens = split_whitespace_tokens(&query)
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+
         Some(Self {
-            text: query.clone(),
+            tokens,
             len,
             limit: max_typos(len),
         })
@@ -142,7 +158,35 @@ impl CommandHistoryQuery {
             command: lower_command,
             tokens: lower_tokens,
         };
-        best_match_inner(&lowered, &self.text, self.len, self.limit)
+        best_match_inner(&lowered, &self.tokens, self.len, self.limit)
+    }
+
+    pub fn best_rank_prepared(
+        &self,
+        candidate: &PreparedCommandHistoryCandidate,
+    ) -> Option<CommandHistoryRank> {
+        self.best_match_prepared(candidate)
+            .map(|matched| matched.rank)
+    }
+
+    pub fn best_match_prepared(
+        &self,
+        candidate: &PreparedCommandHistoryCandidate,
+    ) -> Option<PreparedCommandHistoryMatch> {
+        compute_match_fields(
+            &candidate.normalized_command,
+            &candidate.tokens,
+            &self.tokens,
+            self.len,
+            self.limit,
+        )
+        .map(|computed| {
+            let distance = computed.distance;
+            PreparedCommandHistoryMatch {
+                rank: computed.into_rank(),
+                distance,
+            }
+        })
     }
 }
 
@@ -168,6 +212,48 @@ pub struct ParsedCommandHistoryCandidate<'a> {
     command: &'a str,
     tokens: Vec<&'a str>,
     recency: Recency,
+}
+
+/// Owned command-history preparation for repeated queries over the same
+/// history snapshot. The original command is retained for display, while the
+/// normalized command and tokens are computed only once.
+#[derive(Clone, Debug)]
+pub struct PreparedCommandHistoryCandidate {
+    command: String,
+    normalized_command: String,
+    tokens: Vec<String>,
+    recency: Recency,
+}
+
+#[derive(Clone, Debug)]
+pub struct PreparedCommandHistoryMatch {
+    pub rank: CommandHistoryRank,
+    pub distance: usize,
+}
+
+impl PreparedCommandHistoryCandidate {
+    pub fn new(command: &str, recency: Recency) -> Self {
+        let command = command.to_string();
+        let normalized_command = to_lowercase(&command);
+        let tokens = split_search_tokens(&normalized_command)
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        Self {
+            command,
+            normalized_command,
+            tokens,
+            recency,
+        }
+    }
+
+    pub fn command(&self) -> &str {
+        &self.command
+    }
+
+    pub fn recency(&self) -> Recency {
+        self.recency
+    }
 }
 
 impl<'a> ParsedCommandHistoryCandidate<'a> {
@@ -203,33 +289,99 @@ struct LoweredCandidate<'a> {
     tokens: Vec<String>,
 }
 
+struct ComputedCommandHistory {
+    exact_phrase_present: bool,
+    exact_coverage: usize,
+    exact_subphrase_counts_vector: Vec<usize>,
+    total_coverage: usize,
+    fuzzy_subphrase_counts_vector: Vec<usize>,
+    order_distance: usize,
+    total_gap: usize,
+    exact_count: usize,
+    span_len: usize,
+    distance: usize,
+    ratio: f64,
+    operations: OperationProfile,
+    typo_costs: TypoCostVector,
+    insertions: InsertionVector,
+}
+
+impl ComputedCommandHistory {
+    fn into_match<'a>(self, candidate: CommandHistoryCandidate<'a>) -> CommandHistoryMatch<'a> {
+        CommandHistoryMatch {
+            candidate,
+            exact_phrase_present: self.exact_phrase_present,
+            exact_coverage: self.exact_coverage,
+            exact_subphrase_counts_vector: self.exact_subphrase_counts_vector,
+            total_coverage: self.total_coverage,
+            fuzzy_subphrase_counts_vector: self.fuzzy_subphrase_counts_vector,
+            order_distance: self.order_distance,
+            total_gap: self.total_gap,
+            exact_count: self.exact_count,
+            span_len: self.span_len,
+            distance: self.distance,
+            ratio: self.ratio,
+            operations: self.operations,
+            typo_costs: self.typo_costs,
+            insertions: self.insertions,
+        }
+    }
+
+    fn into_rank(self) -> CommandHistoryRank {
+        CommandHistoryRank {
+            exact_phrase_present: self.exact_phrase_present,
+            exact_coverage: self.exact_coverage,
+            exact_subphrase_counts_vector: self.exact_subphrase_counts_vector,
+            total_coverage: self.total_coverage,
+            fuzzy_subphrase_counts_vector: self.fuzzy_subphrase_counts_vector,
+            typo_costs: self.typo_costs,
+            insertions: self.insertions,
+            typo_operations: self.operations,
+            order_distance: self.order_distance,
+            total_gap: self.total_gap,
+        }
+    }
+}
+
 fn best_match_inner<'a>(
     candidate: &LoweredCandidate<'a>,
-    query: &str,
+    query_tokens: &[String],
     query_len: usize,
     limit: usize,
 ) -> Option<CommandHistoryMatch<'a>> {
-    if !has_query_signal(split_whitespace_tokens(query), &candidate.command) {
+    compute_match_fields(
+        &candidate.command,
+        &candidate.tokens,
+        query_tokens,
+        query_len,
+        limit,
+    )
+    .map(|computed| computed.into_match(candidate.original))
+}
+
+fn compute_match_fields(
+    command: &str,
+    candidate_tokens: &[String],
+    query_tokens: &[String],
+    query_len: usize,
+    limit: usize,
+) -> Option<ComputedCommandHistory> {
+    if !has_query_signal(query_tokens.iter().map(String::as_str), command) {
         return None;
     }
 
-    let query_tokens = split_whitespace_tokens(query);
-    if query_tokens.is_empty() || candidate.tokens.is_empty() {
+    if query_tokens.is_empty() || candidate_tokens.is_empty() {
         return None;
     }
 
-    let query_tokens = query_tokens
-        .into_iter()
-        .map(str::to_string)
-        .collect::<Vec<_>>();
-    let fields = std::iter::once(candidate.tokens.as_slice());
+    let fields = std::iter::once(candidate_tokens);
     let exact_phrase_present = exact_phrase_present(&query_tokens, fields.clone());
     let exact_coverage = exact_distinct_coverage(&query_tokens, fields.clone());
     let exact_subphrase_counts_vector = exact_subphrase_counts_vector(&query_tokens, fields);
 
     let token_matches = query_tokens
         .iter()
-        .map(|query_token| best_command_token_match(query_token, &candidate.tokens, limit))
+        .map(|query_token| best_command_token_match(query_token, candidate_tokens, limit))
         .collect::<Vec<_>>();
     let total_coverage = token_matches
         .iter()
@@ -240,10 +392,10 @@ fn best_match_inner<'a>(
     }
 
     let fuzzy_subphrase_counts_vector =
-        command_fuzzy_subphrase_counts_vector(&query_tokens, &candidate.tokens, limit);
+        command_fuzzy_subphrase_counts_vector(&query_tokens, candidate_tokens, limit);
     let (order_distance, total_gap) = ordered_token_span(
         &query_tokens,
-        std::iter::once(candidate.tokens.as_slice()),
+        std::iter::once(candidate_tokens),
         |query, token| command_token_match(query, token, limit).is_some(),
     );
     let (distance, operations, compared_len) = token_matches.iter().flatten().fold(
@@ -277,8 +429,7 @@ fn best_match_inner<'a>(
             .collect(),
     );
 
-    Some(CommandHistoryMatch {
-        candidate: candidate.original,
+    Some(ComputedCommandHistory {
         exact_phrase_present,
         exact_coverage,
         exact_subphrase_counts_vector,
@@ -397,6 +548,19 @@ mod tests {
     fn command_history_typo_matches_token() {
         let matched = best_match(candidate("git status", &["git", "status"], 10.0), "gti").unwrap();
         assert_eq!(matched.distance, 1);
+    }
+
+    #[test]
+    fn prepared_command_history_matches_unprepared_candidate() {
+        let query = CommandHistoryQuery::new("gti status").unwrap();
+        let prepared = PreparedCommandHistoryCandidate::new("GIT STATUS", 10.0);
+        let prepared_match = query.best_match_prepared(&prepared).unwrap();
+        let regular_match = query
+            .best_match(candidate("GIT STATUS", &["GIT", "STATUS"], 10.0))
+            .unwrap();
+
+        assert_eq!(prepared_match.distance, regular_match.distance);
+        assert_eq!(prepared_match.rank, regular_match.rank());
     }
 
     #[test]

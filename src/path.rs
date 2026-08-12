@@ -6,8 +6,14 @@ use crate::core::{
 };
 use crate::text::{split_path_tokens, to_lowercase};
 
+pub mod fuzzy;
+pub mod literal;
+
+#[deprecated(note = "use fuzzy_rank::path::literal::bulk instead")]
 pub mod bulk;
+#[deprecated(note = "use fuzzy_rank::path::literal instead")]
 pub mod exact;
+#[deprecated(note = "use fuzzy_rank::path::fuzzy instead")]
 pub mod typo;
 
 pub type Score = f64;
@@ -242,10 +248,11 @@ pub(crate) struct SingleTermPathEvidence {
     pub(crate) position: usize,
     pub(crate) insertions: usize,
     pub(crate) compound: bool,
+    pub(crate) exact_token_prefix: bool,
 }
 
 #[derive(Clone, Copy)]
-struct PathToken<'a> {
+pub(crate) struct PathToken<'a> {
     text: &'a str,
     start: usize,
     end: usize,
@@ -256,8 +263,24 @@ pub(crate) fn ordered_path_evidence(
     normalized_path: &str,
     query_tokens: &[String],
 ) -> Option<OrderedPathEvidence> {
+    let matches = select_direct_matches(normalized_path, query_tokens).or_else(|| {
+        let path_tokens = path_tokens(normalized_path);
+        select_mixed_matches_with_tokens(normalized_path, &path_tokens, query_tokens)
+    })?;
+    Some(evidence_from_matches(
+        normalized_path,
+        query_tokens,
+        &matches,
+    ))
+}
+
+pub(crate) fn ordered_path_evidence_with_tokens(
+    normalized_path: &str,
+    path_tokens: &[PathToken<'_>],
+    query_tokens: &[String],
+) -> Option<OrderedPathEvidence> {
     let matches = select_direct_matches(normalized_path, query_tokens)
-        .or_else(|| select_mixed_matches(normalized_path, query_tokens))?;
+        .or_else(|| select_mixed_matches_with_tokens(normalized_path, path_tokens, query_tokens))?;
     Some(evidence_from_matches(
         normalized_path,
         query_tokens,
@@ -273,8 +296,13 @@ pub(crate) fn single_term_path_evidence(
         return None;
     }
 
-    let matched = if let Some(start) = normalized_path.rfind(query) {
-        direct_term_match(normalized_path, start, query.len())
+    let (matched, exact_token_prefix) = if let Some((start, exact_token_prefix)) =
+        last_direct_term_match(normalized_path, query)
+    {
+        (
+            direct_term_match(normalized_path, start, query.len()),
+            exact_token_prefix,
+        )
     } else {
         let tokens = path_tokens(normalized_path);
         let mut options = compound_options(normalized_path, &tokens, query, normalized_path.len())
@@ -287,7 +315,7 @@ pub(crate) fn single_term_path_evidence(
                 .then_with(|| left.insertions.cmp(&right.insertions))
                 .then_with(|| right.start.cmp(&left.start))
         });
-        options.into_iter().next()?
+        (options.into_iter().next()?, false)
     };
 
     Some(SingleTermPathEvidence {
@@ -295,7 +323,41 @@ pub(crate) fn single_term_path_evidence(
         position: matched.position,
         insertions: matched.insertions,
         compound: matched.compound,
+        exact_token_prefix,
     })
+}
+
+fn last_direct_term_match(path: &str, query: &str) -> Option<(usize, bool)> {
+    let last = path.rfind(query)?;
+    if is_path_token_prefix(path, last) {
+        return Some((last, true));
+    }
+
+    // The reverse lookup supplies the selected match. Only search earlier
+    // occurrences when the selected match did not begin at a token boundary.
+    let mut search_start = 0;
+    while search_start < last {
+        let Some(relative_start) = path[search_start..last].find(query) else {
+            break;
+        };
+        let start = search_start + relative_start;
+        if is_path_token_prefix(path, start) {
+            return Some((last, true));
+        }
+
+        let advance = path[start..].chars().next()?.len_utf8();
+        search_start = start + advance;
+    }
+
+    Some((last, false))
+}
+
+fn is_path_token_prefix(path: &str, start: usize) -> bool {
+    start == 0
+        || path[..start]
+            .chars()
+            .next_back()
+            .is_some_and(is_path_token_separator)
 }
 
 pub(crate) fn ordered_compound_coverage(normalized_path: &str, query_tokens: &[String]) -> usize {
@@ -324,9 +386,17 @@ pub(crate) fn compound_term_may_match(normalized_path: &str, query: &str) -> boo
         return false;
     }
 
+    let path_tokens = path_tokens(normalized_path);
+    compound_term_may_match_with_tokens(&path_tokens, query)
+}
+
+pub(crate) fn compound_term_may_match_with_tokens(
+    path_tokens: &[PathToken<'_>],
+    query: &str,
+) -> bool {
     let mut remaining = query;
     let mut fragments = 0;
-    for token in path_tokens(normalized_path) {
+    for token in path_tokens {
         if remaining.is_empty() {
             break;
         }
@@ -360,15 +430,18 @@ fn select_direct_matches(path: &str, query_tokens: &[String]) -> Option<Vec<Term
     Some(matches)
 }
 
-fn select_mixed_matches(path: &str, query_tokens: &[String]) -> Option<Vec<TermMatch>> {
+fn select_mixed_matches_with_tokens(
+    path: &str,
+    path_tokens: &[PathToken<'_>],
+    query_tokens: &[String],
+) -> Option<Vec<TermMatch>> {
     if query_tokens.is_empty() {
         return None;
     }
-    let path_tokens = path_tokens(path);
     let mut reversed = Vec::with_capacity(query_tokens.len());
     if !select_mixed_matches_from(
         path,
-        &path_tokens,
+        path_tokens,
         query_tokens,
         query_tokens.len(),
         path.len(),
@@ -575,7 +648,7 @@ fn direct_term_match(path: &str, start: usize, len: usize) -> TermMatch {
     }
 }
 
-fn path_tokens(path: &str) -> Vec<PathToken<'_>> {
+pub(crate) fn path_tokens(path: &str) -> Vec<PathToken<'_>> {
     let mut tokens = Vec::new();
     let mut token_start = None;
     for (index, character) in path.char_indices() {
