@@ -152,6 +152,14 @@ fn run_path(config: &Config, mode: PathMode) -> Result<DebugReport, String> {
 
     let stages = vec![
         DebugStage::new(
+            "PATH.EXACT_BASENAME_COMPONENT_PHRASE",
+            matched.exact_whole_basename_component().to_string(),
+        ),
+        DebugStage::new(
+            "PATH.EXACT_COMPONENT_PHRASE",
+            matched.exact_whole_component().to_string(),
+        ),
+        DebugStage::new(
             "CORE.EXACT_PHRASE_PRESENT",
             matched.exact_whole_phrase().to_string(),
         ),
@@ -248,6 +256,14 @@ fn run_bulk_path(config: &Config) -> Result<DebugReport, String> {
     };
 
     let stages = vec![
+        DebugStage::new(
+            "PATH.EXACT_BASENAME_COMPONENT_PHRASE",
+            matched.exact_basename_component_phrase_present.to_string(),
+        ),
+        DebugStage::new(
+            "PATH.EXACT_COMPONENT_PHRASE",
+            matched.exact_component_phrase_present.to_string(),
+        ),
         DebugStage::new(
             "CORE.EXACT_PHRASE_PRESENT",
             matched.exact_phrase_present.to_string(),

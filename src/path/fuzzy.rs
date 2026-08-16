@@ -6,7 +6,7 @@ use crate::core::{
     simple_position_vector,
 };
 use crate::path::literal::exact_match_prepared;
-use crate::path::{PathExactRelevance, PreparedPath, Score};
+use crate::path::{PathExactRelevance, PreparedPath, Score, is_single_path_token};
 use crate::ranking::{PathTypoSortKey, compare_path_typo_sort_keys, path_typo_keys_are_ambiguous};
 use crate::text::{split_path_tokens, to_lowercase};
 use crate::token_match::{
@@ -57,6 +57,18 @@ impl<'a> PathMatch<'a> {
         self.exact_relevance
             .as_ref()
             .is_some_and(PathExactRelevance::whole_phrase)
+    }
+
+    pub fn exact_whole_component(&self) -> bool {
+        self.exact_relevance
+            .as_ref()
+            .is_some_and(PathExactRelevance::whole_component)
+    }
+
+    pub fn exact_whole_basename_component(&self) -> bool {
+        self.exact_relevance
+            .as_ref()
+            .is_some_and(PathExactRelevance::whole_basename_component)
     }
 
     pub fn exact_subphrase_counts_vector(&self) -> &[usize] {
@@ -633,7 +645,7 @@ fn candidate_for_single_token<'a>(
     candidate: &str,
     path_position: usize,
 ) -> Option<PathMatch<'a>> {
-    if candidate.is_empty() {
+    if !is_single_path_token(candidate) {
         return None;
     }
 
@@ -674,6 +686,10 @@ fn candidate_for_text<'a>(
 
     let candidate_len = candidate.chars().count();
     let query_token_count = ctx.token_count;
+
+    if query_token_count == 1 && !is_single_path_token(candidate) {
+        return None;
+    }
 
     if query_token_count == 1
         && let Some(start) = candidate.find(ctx.query)
@@ -950,8 +966,14 @@ fn compare_exact_relevance(left: &PathMatch<'_>, right: &PathMatch<'_>) -> std::
     }
 
     right
-        .exact_whole_phrase()
-        .cmp(&left.exact_whole_phrase())
+        .exact_whole_basename_component()
+        .cmp(&left.exact_whole_basename_component())
+        .then_with(|| {
+            right
+                .exact_whole_component()
+                .cmp(&left.exact_whole_component())
+        })
+        .then_with(|| right.exact_whole_phrase().cmp(&left.exact_whole_phrase()))
         .then_with(|| {
             right
                 .exact_subphrase_counts_vector()
@@ -1043,6 +1065,42 @@ mod tests {
         assert_eq!(candidate.ordered_compound_coverage(), 1);
         assert_eq!(candidate.typo_costs.aligned(), [0]);
         assert_eq!(candidate.insertions.aligned(), [5]);
+    }
+
+    #[test]
+    fn whole_path_component_beats_exact_token_in_longer_component() {
+        let mut matches = [
+            best_match(
+                "/home/lewis/Dev/wordelites/wordelites-server",
+                1000.0,
+                "wordelites",
+            )
+            .unwrap(),
+            best_match("/home/lewis/Dev/wordelites", 0.0, "wordelites").unwrap(),
+        ];
+
+        sort_matches(&mut matches);
+
+        assert_eq!(matches[0].path, "/home/lewis/Dev/wordelites");
+        assert!(matches[0].exact_whole_basename_component());
+        assert!(matches[0].exact_whole_component());
+        assert!(!matches[1].exact_whole_basename_component());
+        assert!(matches[1].exact_whole_component());
+    }
+
+    #[test]
+    fn repeated_suffixes_do_not_become_exact_compound_matches() {
+        for query in ["wordelitess", "wordelitesss"] {
+            let mut matches = [
+                best_match("/home/lewis/Dev/wordelites/wordelites-server", 1.2, query).unwrap(),
+                best_match("/home/lewis/Dev/wordelites", 171.2, query).unwrap(),
+            ];
+
+            assert!(!matches[0].exact);
+            assert_eq!(matches[0].ordered_compound_coverage(), 0);
+            sort_matches(&mut matches);
+            assert_eq!(matches[0].path, "/home/lewis/Dev/wordelites");
+        }
     }
 
     #[test]

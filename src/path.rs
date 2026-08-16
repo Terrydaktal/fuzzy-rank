@@ -4,7 +4,7 @@ use crate::core::{
     exact_distinct_coverage_by, exact_phrase_present, exact_subphrase_counts_vector,
     increment_simple_position_vector,
 };
-use crate::text::{split_path_tokens, to_lowercase};
+use crate::text::{iter_path_tokens, split_path_tokens, to_lowercase};
 
 pub mod fuzzy;
 pub mod literal;
@@ -133,6 +133,8 @@ pub(crate) struct PathExactRelevance<'a> {
     query_tokens: Arc<[String]>,
     normalized_path: Arc<str>,
     component_tokens: OnceCell<Vec<Vec<String>>>,
+    whole_basename_component: OnceCell<bool>,
+    whole_component: OnceCell<bool>,
     whole_phrase: OnceCell<bool>,
     run_vector: OnceCell<Vec<usize>>,
     distinct_coverage: OnceCell<usize>,
@@ -150,6 +152,8 @@ impl<'a> PathExactRelevance<'a> {
             query_tokens,
             normalized_path,
             component_tokens: OnceCell::new(),
+            whole_basename_component: OnceCell::new(),
+            whole_component: OnceCell::new(),
             whole_phrase: OnceCell::new(),
             run_vector: OnceCell::new(),
             distinct_coverage: OnceCell::new(),
@@ -188,6 +192,24 @@ impl<'a> PathExactRelevance<'a> {
             })
         });
         direct || self.ordered_compound_coverage() > 0
+    }
+
+    pub(crate) fn whole_component(&self) -> bool {
+        *self.whole_component.get_or_init(|| {
+            exact_component_phrase_present(&self.normalized_path, &self.query_tokens)
+        })
+    }
+
+    pub(crate) fn whole_basename_component(&self) -> bool {
+        *self.whole_basename_component.get_or_init(|| {
+            self.normalized_path
+                .split(['/', '\\'])
+                .filter(|component| !component.is_empty())
+                .next_back()
+                .is_some_and(|component| {
+                    exact_component_phrase_present(component, &self.query_tokens)
+                })
+        })
     }
 
     pub(crate) fn whole_phrase(&self) -> bool {
@@ -376,6 +398,33 @@ pub(crate) fn ordered_compound_coverage(normalized_path: &str, query_tokens: &[S
         .count()
 }
 
+pub(crate) fn exact_component_phrase_present(
+    normalized_path: &str,
+    query_tokens: &[String],
+) -> bool {
+    if query_tokens.is_empty() {
+        return false;
+    }
+
+    normalized_path
+        .split(['/', '\\'])
+        .filter(|component| !component.is_empty())
+        .any(|component| {
+            let mut candidate_tokens = iter_path_tokens(component);
+            query_tokens
+                .iter()
+                .all(|query| candidate_tokens.next() == Some(query.as_str()))
+                && candidate_tokens.next().is_none()
+        })
+}
+
+pub(crate) fn is_single_path_token(value: &str) -> bool {
+    !value.is_empty()
+        && !value.chars().any(|character| {
+            matches!(character, '/' | '\\' | '-' | '_' | '.') || character.is_whitespace()
+        })
+}
+
 /// Returns whether a query can be formed from ordered path-token prefixes.
 ///
 /// This is deliberately only a rejection gate. The full evidence calculation
@@ -405,7 +454,7 @@ pub(crate) fn compound_term_may_match_with_tokens(
             fragments += 1;
             continue;
         }
-        if token.text.starts_with(remaining) {
+        if remaining.chars().count() >= 2 && token.text.starts_with(remaining) {
             remaining = "";
             fragments += 1;
             break;
@@ -590,7 +639,7 @@ fn collect_compound_options(
                 search_end,
                 options,
             );
-        } else if token.text.starts_with(remaining) {
+        } else if remaining.chars().count() >= 2 && token.text.starts_with(remaining) {
             collect_compound_options(
                 path,
                 tokens,

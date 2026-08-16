@@ -75,8 +75,20 @@ pub fn compare_exact_path_matches(
 ) -> std::cmp::Ordering {
     right
         .exact_relevance
-        .whole_phrase()
-        .cmp(&left.exact_relevance.whole_phrase())
+        .whole_basename_component()
+        .cmp(&left.exact_relevance.whole_basename_component())
+        .then_with(|| {
+            right
+                .exact_relevance
+                .whole_component()
+                .cmp(&left.exact_relevance.whole_component())
+        })
+        .then_with(|| {
+            right
+                .exact_relevance
+                .whole_phrase()
+                .cmp(&left.exact_relevance.whole_phrase())
+        })
         .then_with(|| {
             right
                 .exact_relevance

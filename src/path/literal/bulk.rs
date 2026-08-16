@@ -12,8 +12,9 @@ use crate::core::{
     exact_phrase_present, exact_subphrase_counts_vector,
 };
 use crate::path::{
-    compound_term_may_match_with_tokens, normalize_path, ordered_path_evidence,
-    ordered_path_evidence_with_tokens, path_depth, path_tokens, single_term_path_evidence,
+    compound_term_may_match_with_tokens, exact_component_phrase_present, normalize_path,
+    ordered_path_evidence, ordered_path_evidence_with_tokens, path_depth, path_tokens,
+    single_term_path_evidence,
 };
 use crate::text::iter_path_tokens;
 
@@ -110,6 +111,8 @@ pub struct BulkPathMatch<'a> {
     pub segment: BulkSegmentVector,
     pub position: [usize; 3],
     pub insertions: InsertionVector,
+    pub exact_basename_component_phrase_present: bool,
+    pub exact_component_phrase_present: bool,
     pub exact_phrase_present: bool,
     pub exact_subphrase_counts_vector: Vec<usize>,
     pub exact_coverage: usize,
@@ -120,8 +123,14 @@ pub struct BulkPathMatch<'a> {
 impl BulkPathMatch<'_> {
     pub fn compare(&self, other: &Self) -> Ordering {
         other
-            .exact_phrase_present
-            .cmp(&self.exact_phrase_present)
+            .exact_basename_component_phrase_present
+            .cmp(&self.exact_basename_component_phrase_present)
+            .then_with(|| {
+                other
+                    .exact_component_phrase_present
+                    .cmp(&self.exact_component_phrase_present)
+            })
+            .then_with(|| other.exact_phrase_present.cmp(&self.exact_phrase_present))
             .then_with(|| {
                 other
                     .exact_subphrase_counts_vector
@@ -198,6 +207,9 @@ pub fn exact_match_prepared<'a>(
         |query, candidate| candidate.contains(query),
     );
     let ordered_compound_coverage = evidence.ordered_compound_coverage;
+    let basename_component_present =
+        exact_basename_component_phrase_present(normalized_path, keywords);
+    let whole_component_present = exact_component_phrase_present(normalized_path, keywords);
 
     Some(BulkPathMatch {
         path,
@@ -205,6 +217,8 @@ pub fn exact_match_prepared<'a>(
         segment: evidence.segment.into_iter().collect(),
         position: evidence.position,
         insertions: InsertionVector::new(evidence.insertions),
+        exact_basename_component_phrase_present: basename_component_present,
+        exact_component_phrase_present: whole_component_present,
         exact_phrase_present: exact_phrase_present(
             keywords,
             components.iter().map(|tokens| tokens.as_slice()),
@@ -240,12 +254,28 @@ fn exact_match_single_term<'a>(
         segment,
         position,
         insertions: InsertionVector::from_slice(&[evidence.insertions]),
+        exact_basename_component_phrase_present: exact_basename_component_phrase_present(
+            prepared.normalized(path),
+            &[keyword.to_string()],
+        ),
+        exact_component_phrase_present: exact_component_phrase_present(
+            prepared.normalized(path),
+            &[keyword.to_string()],
+        ),
         exact_phrase_present: evidence.exact_token_prefix,
         exact_subphrase_counts_vector: Vec::new(),
         exact_coverage: usize::from(!evidence.compound),
         ordered_compound_coverage: usize::from(evidence.compound),
         path_depth: prepared.depth,
     })
+}
+
+fn exact_basename_component_phrase_present(normalized_path: &str, keywords: &[String]) -> bool {
+    normalized_path
+        .split(['/', '\\'])
+        .filter(|component| !component.is_empty())
+        .next_back()
+        .is_some_and(|component| exact_component_phrase_present(component, keywords))
 }
 
 pub fn sort_matches(matches: &mut [BulkPathMatch<'_>]) {
@@ -429,6 +459,32 @@ mod tests {
         assert_eq!(compound.exact_coverage, 0);
         assert_eq!(compound.ordered_compound_coverage, 1);
         assert_eq!(direct.compare(&compound), Ordering::Less);
+    }
+
+    #[test]
+    fn whole_path_component_beats_exact_token_in_longer_component() {
+        let mut matches = [
+            super::exact_match(
+                "/home/lewis/Dev/wordelites/wordelites-server",
+                &["wordelites".to_string()],
+                1000.0,
+            )
+            .unwrap(),
+            super::exact_match(
+                "/home/lewis/Dev/wordelites",
+                &["wordelites".to_string()],
+                0.0,
+            )
+            .unwrap(),
+        ];
+
+        sort_matches(&mut matches);
+
+        assert_eq!(matches[0].path, "/home/lewis/Dev/wordelites");
+        assert!(matches[0].exact_basename_component_phrase_present);
+        assert!(matches[0].exact_component_phrase_present);
+        assert!(!matches[1].exact_basename_component_phrase_present);
+        assert!(matches[1].exact_component_phrase_present);
     }
 
     #[test]
