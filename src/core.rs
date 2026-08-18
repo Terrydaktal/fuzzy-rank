@@ -73,6 +73,10 @@ impl FieldOccurrenceRank {
         }
         Self(merged)
     }
+
+    pub fn entries(&self) -> &[(u8, usize)] {
+        &self.0
+    }
 }
 
 impl Ord for FieldOccurrenceRank {

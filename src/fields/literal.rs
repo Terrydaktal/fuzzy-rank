@@ -5,6 +5,10 @@ use crate::core::{
     exact_phrase_occurrence_count_by, exact_phrase_present_by, exact_subphrase_counts_vector_by,
     exact_token_position, ordered_token_span, position_vector,
 };
+use crate::fields::model::{
+    FieldRankFeatures, FieldRankModel, density_quality, feature, longest_subphrase,
+    occurrence_features, quality_from_priority, set_coverage_features,
+};
 use crate::text::{split_search_tokens, to_lowercase};
 
 pub type Score = f64;
@@ -44,6 +48,7 @@ struct PreparedMessageField {
 pub struct MessageMatch<'a> {
     pub key: &'a str,
     pub score: Score,
+    pub query_token_count: usize,
     pub exact_whole_phrase_present: bool,
     pub exact_subphrase_counts_vector: Vec<usize>,
     pub exact_weighted_positional_coverage_vector: CoverageRank,
@@ -60,6 +65,55 @@ pub type Candidate<'a, 'b> = MessageCandidate<'a, 'b>;
 pub type Query = MessageQuery;
 pub type PreparedCandidate<'a> = PreparedMessageCandidate<'a>;
 pub type Match<'a> = MessageMatch<'a>;
+
+impl MessageMatch<'_> {
+    /// Convert this exact field match into the stable feature vector used by
+    /// [`FieldRankModel`].  Fuzzy-only features remain zero for this exact
+    /// adaptor.
+    pub fn rank_features(&self) -> FieldRankFeatures {
+        let mut features = FieldRankFeatures::zero();
+        features.set(feature::SEARCH_RANK_QUALITY, 1.0);
+        features.set(
+            feature::EXACT_PHRASE_PRESENT,
+            f64::from(self.exact_whole_phrase_present),
+        );
+        features.set(
+            feature::EXACT_SUBPHRASE_PRESENCE,
+            self.exact_subphrase_counts_vector
+                .iter()
+                .filter(|count| **count != 0)
+                .count() as f64,
+        );
+        features.set(
+            feature::EXACT_LONGEST_SUBPHRASE,
+            longest_subphrase(&self.exact_subphrase_counts_vector, self.query_token_count),
+        );
+        set_coverage_features(
+            &mut features,
+            feature::EXACT_COVERAGE_WHOLE,
+            &self.exact_weighted_positional_coverage_vector,
+        );
+        features.set(
+            feature::EXACT_FIELD_QUALITY,
+            quality_from_priority(self.exact_field_quality),
+        );
+        features.set(feature::ORDER_QUALITY, -(self.order_distance as f64));
+        features.set(feature::GAP_QUALITY, -(self.total_gap as f64));
+        let (phrase_priority, phrase_count, phrase_total) =
+            occurrence_features(&self.exact_phrase_occurrence_rank);
+        features.set(feature::EXACT_PHRASE_OCCURRENCE_PRIORITY, phrase_priority);
+        features.set(feature::EXACT_PHRASE_OCCURRENCE_COUNT, phrase_count);
+        features.set(feature::EXACT_PHRASE_OCCURRENCE_TOTAL, phrase_total);
+        let (token_priority, token_count, token_total) =
+            occurrence_features(&self.exact_token_occurrence_rank);
+        features.set(feature::EXACT_TOKEN_OCCURRENCE_PRIORITY, token_priority);
+        features.set(feature::EXACT_TOKEN_OCCURRENCE_COUNT, token_count);
+        features.set(feature::EXACT_TOKEN_OCCURRENCE_TOTAL, token_total);
+        features.set(feature::DENSITY_QUALITY, density_quality(self.density));
+        features.set(feature::CALLER_SCORE, self.score.max(0.0).ln_1p());
+        features
+    }
+}
 
 impl<'a, 'b> MessageCandidate<'a, 'b> {
     pub fn prepare(self) -> PreparedMessageCandidate<'a> {
@@ -208,6 +262,7 @@ impl MessageQuery {
         Some(MessageMatch {
             key,
             score,
+            query_token_count: self.tokens.len(),
             exact_whole_phrase_present,
             exact_subphrase_counts_vector,
             exact_weighted_positional_coverage_vector,
@@ -239,6 +294,61 @@ pub fn select_top_k(matches: &mut Vec<MessageMatch<'_>>, limit: usize) {
     let _ = matches.select_nth_unstable_by(limit, compare_matches);
     matches.truncate(limit);
     matches.sort_unstable_by(compare_matches);
+}
+
+/// Sort using the deterministic exact matcher, then rerank only the leading
+/// `rerank_limit` candidates with a caller-trained field model.
+pub fn sort_matches_with_model(
+    matches: &mut [MessageMatch<'_>],
+    model: &FieldRankModel,
+    rerank_limit: usize,
+) {
+    sort_matches(matches);
+    if !model.is_active() || rerank_limit == 0 {
+        return;
+    }
+
+    let limit = matches.len().min(rerank_limit);
+    let mut reranked = matches[..limit]
+        .iter()
+        .cloned()
+        .map(|candidate| {
+            let score = model.score(&candidate.rank_features());
+            (candidate, score)
+        })
+        .collect::<Vec<_>>();
+    reranked.sort_unstable_by(|(left, left_score), (right, right_score)| {
+        right_score
+            .total_cmp(left_score)
+            .then_with(|| compare_matches(left, right))
+    });
+    for (index, (candidate, _)) in reranked.into_iter().enumerate() {
+        matches[index] = candidate;
+    }
+}
+
+/// Retain the best candidates after deterministic retrieval and learned
+/// reranking.  The model is deliberately limited to the rerank prefix so a
+/// large database never requires full-corpus expensive feature work.
+pub fn select_top_k_with_model(
+    matches: &mut Vec<MessageMatch<'_>>,
+    limit: usize,
+    model: &FieldRankModel,
+    rerank_limit: usize,
+) {
+    if limit == 0 {
+        matches.clear();
+        return;
+    }
+    if !model.is_active() || rerank_limit == 0 {
+        select_top_k(matches, limit);
+        return;
+    }
+
+    let pool_limit = matches.len().min(limit.max(rerank_limit));
+    select_top_k(matches, pool_limit);
+    sort_matches_with_model(matches, model, rerank_limit.min(pool_limit));
+    matches.truncate(limit);
 }
 
 fn compare_matches(left: &MessageMatch<'_>, right: &MessageMatch<'_>) -> Ordering {
@@ -290,8 +400,9 @@ fn literal_token_match(query: &str, candidate: &str) -> bool {
 mod tests {
     use super::{
         MessageCandidate, MessageField, MessageQuery, PreparedMessageCandidate,
-        contains_query_signal, sort_matches,
+        contains_query_signal, sort_matches, sort_matches_with_model,
     };
+    use crate::fields::FieldRankModel;
 
     fn matched_keys<'a>(
         query: &str,
@@ -403,6 +514,48 @@ mod tests {
             matched_keys("word1 word2 word3", &candidates),
             vec!["later", "earlier"]
         );
+    }
+
+    #[test]
+    fn message_features_have_stable_shape_and_exact_direction() {
+        let candidate = prepare("message", "server error", 3.0);
+        let query = MessageQuery::new("server error").unwrap();
+        let matched = query.search_rank_prepared(&candidate).unwrap();
+        let features = matched.rank_features();
+
+        assert_eq!(
+            features.values().len(),
+            crate::fields::FIELD_RANK_FEATURE_COUNT
+        );
+        assert_eq!(
+            features.get(crate::fields::model::feature::EXACT_PHRASE_PRESENT),
+            Some(1.0)
+        );
+        assert!(
+            features
+                .get(crate::fields::model::feature::CALLER_SCORE)
+                .unwrap()
+                > 0.0
+        );
+    }
+
+    #[test]
+    fn message_model_can_rerank_the_retrieval_prefix() {
+        let candidates = [
+            prepare("low-score", "server error", 1.0),
+            prepare("high-score", "server error", 10.0),
+        ];
+        let query = MessageQuery::new("server error").unwrap();
+        let mut matches = candidates
+            .iter()
+            .filter_map(|candidate| query.search_rank_prepared(candidate))
+            .collect::<Vec<_>>();
+        let mut weights = [0.0; crate::fields::FIELD_RANK_FEATURE_COUNT];
+        weights[crate::fields::model::feature::CALLER_SCORE] = 10.0;
+        let model = FieldRankModel::new(0.0, weights);
+
+        sort_matches_with_model(&mut matches, &model, 2);
+        assert_eq!(matches[0].key, "high-score");
     }
 
     #[test]

@@ -15,6 +15,208 @@ use crate::token_match::{
     partitioned_token_distance,
 };
 
+/// Number of scalar features exposed by the path reranker.
+pub const PATH_RANK_FEATURE_COUNT: usize = 22;
+
+/// Stable names for [`PathRankFeatures`]. Positive values mean stronger
+/// evidence for the candidate; negative values represent penalties.
+pub const PATH_RANK_FEATURE_NAMES: [&str; PATH_RANK_FEATURE_COUNT] = [
+    "match_exact",
+    "exact_basename_component",
+    "exact_component",
+    "exact_phrase",
+    "exact_subphrase_presence",
+    "exact_coverage",
+    "ordered_compound_coverage",
+    "alignment_quality",
+    "order_quality",
+    "segment_proximity",
+    "position_quality",
+    "caller_score_log",
+    "typo_quality",
+    "insertion_quality",
+    "substitution_quality",
+    "deletion_quality",
+    "transposition_quality",
+    "keyboard_quality",
+    "distance_quality",
+    "ratio_quality",
+    "path_shallowness",
+    "query_signal",
+];
+
+/// A fixed-size, direction-normalized representation of a path match.
+///
+/// This is intentionally separate from the default lexicographic comparator.
+/// Callers can use it for a learned or caller-specific reranker without
+/// reimplementing path tokenization, exact evidence, or edit accounting.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PathRankFeatures {
+    values: [f64; PATH_RANK_FEATURE_COUNT],
+}
+
+impl PathRankFeatures {
+    pub fn from_match(candidate: &PathMatch<'_>) -> Self {
+        let alignment = candidate.alignment_costs.aligned();
+        let typo = candidate.typo_costs.worst_first();
+        let insertions = candidate.insertions.worst_first();
+        let segment_depth = candidate
+            .segment
+            .iter()
+            .position(|count| *count != 0)
+            .unwrap_or(candidate.segment.len()) as f64;
+        let position_quality = candidate.position[0] as f64 + candidate.position[1] as f64 * 0.5
+            - candidate.position[2] as f64 * 0.5;
+        let exact_subphrase_presence = candidate
+            .exact_subphrase_counts_vector()
+            .iter()
+            .filter(|count| **count != 0)
+            .count() as f64;
+        let exact_coverage = candidate.exact_distinct_coverage() as f64;
+        let ordered_compound_coverage = candidate.ordered_compound_coverage() as f64;
+        let worst_alignment = alignment.first().copied().unwrap_or(0) as f64;
+        let worst_typo = typo.first().copied().unwrap_or(0) as f64;
+        let worst_insertions = insertions.first().copied().unwrap_or(0) as f64;
+        let path_depth = crate::path::path_depth(candidate.path) as f64;
+        let query_signal =
+            (exact_coverage + exact_subphrase_presence + ordered_compound_coverage).min(16.0);
+
+        Self {
+            values: [
+                f64::from(candidate.exact),
+                f64::from(candidate.exact_whole_basename_component()),
+                f64::from(candidate.exact_whole_component()),
+                f64::from(candidate.exact_whole_phrase()),
+                exact_subphrase_presence,
+                exact_coverage,
+                ordered_compound_coverage,
+                -worst_alignment / 1000.0,
+                -(candidate.order_distance as f64),
+                -segment_depth,
+                position_quality,
+                candidate.score.max(0.0).ln_1p(),
+                -worst_typo,
+                -worst_insertions,
+                -(candidate.operations.substitutions as f64),
+                -(candidate.operations.deletions as f64),
+                -(candidate.operations.transpositions as f64),
+                -(candidate.operations.keyboard_distance as f64),
+                -(candidate.distance as f64),
+                -candidate.ratio,
+                -path_depth,
+                query_signal,
+            ],
+        }
+    }
+
+    pub fn values(&self) -> &[f64; PATH_RANK_FEATURE_COUNT] {
+        &self.values
+    }
+
+    pub fn get(&self, index: usize) -> Option<f64> {
+        self.values.get(index).copied()
+    }
+
+    pub fn score(&self, model: &PathRankModel) -> f64 {
+        let score = model.bias
+            + self
+                .values
+                .iter()
+                .zip(model.weights)
+                .map(|(feature, weight)| {
+                    let feature = if feature.is_finite() { *feature } else { 0.0 };
+                    let weight = if weight.is_finite() { weight } else { 0.0 };
+                    feature * weight
+                })
+                .sum::<f64>();
+        if score.is_finite() { score } else { 0.0 }
+    }
+}
+
+/// A compact native linear reranker for path candidates.
+///
+/// The model contains no runtime or allocator requirements. It is suitable
+/// for a caller that wants to load learned weights and score only a small
+/// candidate set after fuzzy-rank has performed matching.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PathRankModel {
+    pub bias: f64,
+    pub weights: [f64; PATH_RANK_FEATURE_COUNT],
+}
+
+impl PathRankModel {
+    pub const fn new(bias: f64, weights: [f64; PATH_RANK_FEATURE_COUNT]) -> Self {
+        Self { bias, weights }
+    }
+
+    /// A conservative built-in baseline for callers that do not have a
+    /// trained model yet. It rewards strong lexical evidence and penalizes
+    /// structural distance while leaving the normal comparator available as
+    /// the final deterministic tie-breaker.
+    pub const fn baseline() -> Self {
+        Self::new(
+            0.0,
+            [
+                10_000.0, 5_000.0, 1_000.0, 500.0, 100.0, 50.0, 25.0, 100.0, 10.0, 20.0, 10.0, 2.0,
+                20.0, 5.0, 10.0, 10.0, 10.0, 2.0, 10.0, 1.0, 1.0, 5.0,
+            ],
+        )
+    }
+
+    pub fn score(&self, features: &PathRankFeatures) -> f64 {
+        features.score(self)
+    }
+
+    pub fn is_active(&self) -> bool {
+        // A constant bias cancels when two candidates are compared.
+        self.weights
+            .iter()
+            .any(|weight| weight.is_finite() && *weight != 0.0)
+    }
+
+    pub fn learn_pair(&mut self, preferred: &PathRankFeatures, other: &PathRankFeatures) -> bool {
+        self.learn_pair_with(
+            preferred,
+            other,
+            crate::learning::DEFAULT_LEARNING_RATE,
+            crate::learning::DEFAULT_MARGIN,
+        )
+    }
+
+    pub fn learn_preference(
+        &mut self,
+        preferred: &PathRankFeatures,
+        alternatives: &[PathRankFeatures],
+    ) -> usize {
+        alternatives
+            .iter()
+            .filter(|alternative| self.learn_pair(preferred, alternative))
+            .count()
+    }
+
+    pub fn learn_pair_with(
+        &mut self,
+        preferred: &PathRankFeatures,
+        other: &PathRankFeatures,
+        learning_rate: f64,
+        margin: f64,
+    ) -> bool {
+        crate::learning::learn_pair(
+            &mut self.weights,
+            preferred.values(),
+            other.values(),
+            learning_rate,
+            margin,
+        )
+    }
+}
+
+impl Default for PathRankModel {
+    fn default() -> Self {
+        Self::new(0.0, [0.0; PATH_RANK_FEATURE_COUNT])
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct PathMatch<'a> {
     pub path: &'a str,
@@ -87,6 +289,10 @@ impl<'a> PathMatch<'a> {
         self.exact_relevance
             .as_ref()
             .map_or(0, PathExactRelevance::ordered_compound_coverage)
+    }
+
+    pub fn rank_features(&self) -> PathRankFeatures {
+        PathRankFeatures::from_match(self)
     }
 
     fn has_exact_token_signal(&self) -> bool {
@@ -295,7 +501,7 @@ impl TypoQuery {
 }
 
 fn is_ascii_lowercase_path(path: &str) -> bool {
-    path.is_ascii() && path.bytes().all(|byte| !(b'A'..=b'Z').contains(&byte))
+    path.is_ascii() && path.bytes().all(|byte| !byte.is_ascii_uppercase())
 }
 
 #[derive(Default)]
@@ -1253,6 +1459,16 @@ mod tests {
         sort_matches(&mut matches);
         assert!(matches[0].exact);
         assert_eq!(matches[0].path, "/home/lewis/cctv");
+    }
+
+    #[test]
+    fn rank_features_have_stable_shape_and_direction() {
+        let match_ = best_match("/home/lewis/applicationlauncher", 10.0, "applaunch").unwrap();
+        let features = match_.rank_features();
+        assert_eq!(features.values().len(), PATH_RANK_FEATURE_COUNT);
+        assert_eq!(PATH_RANK_FEATURE_NAMES.len(), PATH_RANK_FEATURE_COUNT);
+        assert!(features.get(11).unwrap() > 0.0);
+        assert!(features.get(13).unwrap() < 0.0);
     }
 
     #[test]

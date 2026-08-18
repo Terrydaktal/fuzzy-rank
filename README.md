@@ -28,6 +28,7 @@ fuzzy-rank/
     ├── core.rs
     ├── debug.rs
     ├── ranking.rs
+    ├── learning.rs
     ├── text.rs
     ├── token_match.rs
     ├── path.rs
@@ -42,6 +43,7 @@ fuzzy-rank/
     ├── fields/
     │   ├── fuzzy.rs
     │   ├── literal.rs
+    │   ├── model.rs
     │   └── mod.rs
     ├── bin/
     │   └── fuzzy-rank-debug.rs
@@ -121,6 +123,8 @@ These modules are intended to be reused by all adapters:
 - `ranking`
 - `text`
 - `token_match`
+- `fields::model`
+- `learning`
 
 They own the generic machinery. They do not own path-specific, command-history-specific, or field-policy-specific behavior.
 
@@ -754,6 +758,106 @@ candidates bypass Damerau-Levenshtein, but the unified `path::fuzzy` comparator
 does not impose a separate exact-before-typo class; it ranks candidates through
 the shared exact-evidence and typo-quality stages above.
 
+### Path reranking features
+
+`PathMatch::rank_features()` exposes the same path evidence as a fixed-size
+`PathRankFeatures` vector with 22 stable, direction-normalized values. Positive
+values represent stronger evidence; negative values represent penalties. The
+features include exact basename/component/phrase evidence, exact coverage,
+ordered compound coverage, alignment and order quality, segment and position
+quality, caller score, typo operations, keyboard distance, candidate distance,
+ratio, path depth, and overall query signal.
+
+`PathRankModel` is a small native linear scorer over that vector. Callers can
+load and train weights without adding a runtime, process, or allocator to the
+matching path. `PathRankModel::baseline()` is a conservative starting point,
+not a user-trained model. fuzzy-rank does not persist personal preferences:
+callers such as zoxide own query-to-destination memory, feedback, contextual
+signals, model serialization, and the decision about which hard path rules may
+not be overridden. This keeps the generic matcher reusable while allowing a
+caller to rerank only a small high-recall candidate set.
+
+### Field reranking features and feedback
+
+`fields::model` provides the corresponding learned layer for `fields::literal`
+and `fields::fuzzy`. `FieldRankFeatures` is a fixed 34-value vector with schema
+version `FIELD_RANK_FEATURE_SCHEMA_VERSION = 2`, containing:
+
+- search-rank quality
+- exact phrase, subphrase, coverage-class, coverage-quality, and field-quality evidence
+- fuzzy phrase, subphrase, coverage-class, coverage-quality, and field-quality evidence
+- typo, insertion, ordering, and gap quality
+- exact phrase occurrence priority, best-field count, and total count
+- exact token occurrence priority, best-field count, and total count
+- density and caller score
+
+The values are direction-normalized: larger means stronger evidence. The
+literal adaptor fills the exact and caller features; fuzzy-only values remain
+zero. The fuzzy adaptor fills the exact, fuzzy, typo, field, and structural
+features from the same lazy relevance calculations used by its deterministic
+comparator. `MessageMatch::rank_features`,
+`MetadataQuery::rank_features`, and `MetadataQuery::rank_features_prepared`
+expose these vectors without requiring callers to reconstruct the ranking
+signals. If a caller already has the `SearchRank` from retrieval, use
+`MetadataQuery::rank_features_with_rank` or
+`MetadataQuery::rank_features_prepared_with_rank` to avoid running the matcher
+again.
+
+`FieldRankModel` is an online pairwise linear model. After a user selects a
+result, the caller can train the selected feature vector above the alternative
+vectors:
+
+```rust
+let preferred = selected.rank_features();
+let alternatives = displayed
+    .iter()
+    .filter(|candidate| candidate.key != selected.key)
+    .map(MessageMatch::rank_features)
+    .collect::<Vec<_>>();
+model.learn_preference(&preferred, &alternatives);
+```
+
+For metadata, use `MetadataQuery::rank_features` for the selected candidate
+and the same method for the displayed alternatives. The model provides
+`learn_pair` and `learn_pair_with` for explicit corrections and offline replay;
+it does not know candidate IDs, queries, user actions, or storage formats.
+
+The default deterministic sort is unchanged. Callers opt into learned
+reranking with `fields::literal::sort_matches_with_model`,
+`fields::literal::select_top_k_with_model`,
+`MetadataQuery::sort_matches_with_model`, or
+`MetadataQuery::sort_matches_prepared_with_model` and their corresponding
+`select_top_k_with_model` methods. Each first applies the normal adaptor ranking
+to a bounded deterministic pool and then reranks only a caller-selected prefix,
+such as the top 100--500 retrieved candidates. The `select_top_k_with_model`
+variants retain at most `max(limit, rerank_limit)` deterministic candidates
+before extracting model features; they never fully sort or feature-score the
+entire corpus just to return a small top-K result. This is the intended retrieval ->
+deterministic relevance -> learned reranking pipeline; the model must not be
+used to scan a large message database in place of an index or full-text
+retriever.
+
+Persisted field models must include and validate the schema version and reject
+weights from another version rather than silently shifting feature meanings.
+Models should be separate for different domains. Application/window metadata,
+ChatGPT messages, and Telegram messages may share this feature schema and
+training code, but each caller should persist its own weights and feedback
+because their fields, user actions, and relevance policies differ. A click or
+open is a weak message label; explicit selection/correction is a stronger
+pairwise label.
+
+The field adapters are intentionally opt-in: callers without a trained model
+continue to use the deterministic comparator. Applicationlauncher loads an
+optional model from `APPLICATIONLAUNCHER_FIELD_RANK_MODEL` or
+`$XDG_STATE_HOME/applicationlauncher/field-rank-model.json` and reranks its
+leading application/window metadata candidates. ChatGPT `db-search` follows
+the same pattern through `CHATGPT_FIELD_RANK_MODEL` or
+`$XDG_STATE_HOME/chatgpt-db-search/field-rank-model.json`. Telegram search
+still uses its pinned fuzzy-rank revision and remains on deterministic sorting
+until that dependency is updated to a revision containing the field model.
+These callers load models but still own persistence and feedback collection;
+they do not silently train on selections.
+
 The debug CLI includes the inputs used by each stage. For path typo matches,
 `CORE.ALIGNMENT_COST_VECTOR` shows the worst-first fixed-point cost in
 thousandths. It counts substitutions, query-only deletions, transpositions, one
@@ -1089,6 +1193,11 @@ Shared versus adapter-local:
   - field-priority policy
   - caller-controlled `score`
 
+`fields::model` is shared between the literal and fuzzy field adapters. It
+owns the stable field feature schema, while `learning` owns the bounded
+pairwise update used by both field and path models. Neither module owns
+candidate IDs, user-action interpretation, or persistence.
+
 ## Which Adapter To Use
 
 - Use `path::literal` for literal-only filesystem path matching.
@@ -1109,6 +1218,8 @@ The current design is:
 3. `text` provides one shared text/query-prep layer.
 4. `token_match` provides one shared token-matching layer.
 5. `path`, `command_history`, `fields::literal`, and `fields::fuzzy` adapt those shared layers to their own domains.
+6. `learning` provides one bounded pairwise update for caller-owned linear models.
+7. `fields::model` provides one reusable field-feature schema for message and metadata callers.
 
 So the crate does not have separate ad hoc matcher implementations anymore.
 It has:

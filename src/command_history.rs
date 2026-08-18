@@ -375,9 +375,9 @@ fn compute_match_fields(
     }
 
     let fields = std::iter::once(candidate_tokens);
-    let exact_phrase_present = exact_phrase_present(&query_tokens, fields.clone());
-    let exact_coverage = exact_distinct_coverage(&query_tokens, fields.clone());
-    let exact_subphrase_counts_vector = exact_subphrase_counts_vector(&query_tokens, fields);
+    let exact_phrase_present = exact_phrase_present(query_tokens, fields.clone());
+    let exact_coverage = exact_distinct_coverage(query_tokens, fields.clone());
+    let exact_subphrase_counts_vector = exact_subphrase_counts_vector(query_tokens, fields);
 
     let token_matches = query_tokens
         .iter()
@@ -392,9 +392,9 @@ fn compute_match_fields(
     }
 
     let fuzzy_subphrase_counts_vector =
-        command_fuzzy_subphrase_counts_vector(&query_tokens, candidate_tokens, limit);
+        command_fuzzy_subphrase_counts_vector(query_tokens, candidate_tokens, limit);
     let (order_distance, total_gap) = ordered_token_span(
-        &query_tokens,
+        query_tokens,
         std::iter::once(candidate_tokens),
         |query, token| command_token_match(query, token, limit).is_some(),
     );
