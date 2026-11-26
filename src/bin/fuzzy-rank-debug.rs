@@ -422,8 +422,8 @@ fn run_command_history(config: &Config) -> Result<DebugReport, String> {
 }
 
 fn run_metadata(config: &Config) -> Result<DebugReport, String> {
-    let query =
-        MetadataQuery::new(&config.query).ok_or("metadata query has no searchable tokens")?;
+    let query = MetadataQuery::new_with_literal_fallback(&config.query)
+        .ok_or("metadata query has no searchable tokens")?;
     let field_values = if config.fields.is_empty() {
         vec![(0, config.candidate.clone())]
     } else {

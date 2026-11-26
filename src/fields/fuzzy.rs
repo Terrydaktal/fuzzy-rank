@@ -20,6 +20,8 @@ use std::borrow::Cow;
 use std::cell::OnceCell;
 use std::cmp::{Ordering, Reverse};
 
+mod literal_query;
+
 pub type Score = f64;
 
 #[derive(Clone, Copy, Debug)]
@@ -57,6 +59,18 @@ impl PreparedMetadataField {
             priority,
             value: lowered,
             tokens,
+        })
+    }
+
+    /// Also retain nonempty symbol-only fields for literal-fallback queries.
+    pub fn new_with_literal_fallback(priority: u8, value: &str) -> Option<Self> {
+        Self::new(priority, value).or_else(|| {
+            let value = to_lowercase(value.trim());
+            (!value.is_empty()).then_some(Self {
+                priority,
+                value,
+                tokens: Vec::new(),
+            })
         })
     }
 }
@@ -109,6 +123,7 @@ pub struct MetadataQuery {
     query: String,
     query_tokens: Vec<String>,
     allow_typo: bool,
+    literal_only: bool,
 }
 
 trait MetadataFieldView {
@@ -147,6 +162,7 @@ impl MetadataQuery {
             query,
             query_tokens,
             allow_typo: false,
+            literal_only: false,
         })
     }
 
@@ -167,6 +183,9 @@ impl MetadataQuery {
     }
 
     fn search_rank_fields<F: MetadataFieldView>(&self, fields: &[F]) -> Option<SearchRank> {
+        if self.literal_only {
+            return self.literal_rank_fields(fields);
+        }
         if self.query_tokens.len() <= 1 {
             return self.rank_single_query(self.query.as_str(), fields);
         }
@@ -549,7 +568,7 @@ impl MetadataQuery {
     pub fn debug_report<'a>(&self, candidate: MetadataCandidate<'a>) -> DebugReport {
         let relevance = LazyRelevance::new(&self.query_tokens, self.allow_typo, candidate.fields);
         let rank = self.search_rank(candidate);
-        let stages = vec![
+        let mut stages = vec![
             DebugStage::new(
                 "CORE.EXACT_PHRASE_PRESENT",
                 format!("{}", relevance.get_exact_whole_phrase_present()),
@@ -620,6 +639,10 @@ impl MetadataQuery {
             DebugStage::new("CORE.KEY_ASC", candidate.key),
         ];
 
+        if self.literal_only {
+            stages.insert(0, DebugStage::new("METADATA.LITERAL_FALLBACK", "true"));
+        }
+
         match rank {
             Some(rank) => DebugReport::matched(format!("{:?}", rank), stages),
             None => DebugReport::no_match("no metadata match", stages),
@@ -650,6 +673,9 @@ impl MetadataQuery {
         candidate: MetadataCandidate<'_>,
         _rank: &SearchRank,
     ) -> Vec<MatchedFieldHighlight> {
+        if self.literal_only {
+            return self.literal_highlights(candidate.fields);
+        }
         let mut field_highlights = Vec::new();
 
         for (field_index, field) in candidate.fields.iter().enumerate() {
@@ -778,7 +804,11 @@ impl MetadataQuery {
         let overall_field = *candidate
             .fields
             .get(overall_rank.provenance().field_index)?;
-        let query_terms = split_search_tokens(&self.query);
+        let query_terms = if self.literal_only {
+            vec![self.query.as_str()]
+        } else {
+            split_search_tokens(&self.query)
+        };
         let term_explanations = query_terms
             .into_iter()
             .map(|query_term| {
@@ -786,6 +816,7 @@ impl MetadataQuery {
                     query: query_term.to_string(),
                     query_tokens: vec![query_term.to_string()],
                     allow_typo: self.allow_typo,
+                    literal_only: self.literal_only,
                 }
                 .search_rank(candidate);
                 let field = rank

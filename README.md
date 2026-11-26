@@ -97,6 +97,15 @@ candidate is a priority-0 field, and repeatable `--field PRIORITY:VALUE`
 options replace it with prioritized message fields. `--score` and `--recency`
 are caller inputs, not values calculated by fuzzy-rank.
 
+For symbol-only field queries, opt in with
+`fields::fuzzy::MetadataQuery::new_with_literal_fallback`. Word queries retain
+the normal matcher; nonempty punctuation-only queries use exact substrings,
+exact highlight ranges and no fuzzy/typo fallback. Use
+`PreparedMetadataField::new_with_literal_fallback` when preparing fields to keep
+symbol-only values. The existing `new` constructors retain their token-only
+contract. The debug CLI opts in for `fields::fuzzy` and reports
+`METADATA.LITERAL_FALLBACK` for this case.
+
 ## Benchmarks
 
 The repository includes a Criterion benchmark for the high-throughput literal
