@@ -10,6 +10,34 @@ use crate::learning::{
     learn_pair as learn_pair_weights,
 };
 
+/// Rerank an already deterministically sorted prefix. Its original index is
+/// the deterministic tie-break, so equal model scores need no feature work.
+pub(crate) fn rerank_sorted_prefix<T: Clone>(
+    matches: &mut [T],
+    model: &FieldRankModel,
+    limit: usize,
+    mut features: impl FnMut(&T) -> FieldRankFeatures,
+) {
+    if !model.is_active() || limit == 0 {
+        return;
+    }
+    let limit = limit.min(matches.len());
+    let mut ranked: Vec<_> = matches[..limit]
+        .iter()
+        .enumerate()
+        .map(|(index, candidate)| (candidate.clone(), model.score(&features(candidate)), index))
+        .collect();
+    ranked.sort_unstable_by(|left, right| {
+        right
+            .1
+            .total_cmp(&left.1)
+            .then_with(|| left.2.cmp(&right.2))
+    });
+    for (slot, (candidate, _, _)) in matches.iter_mut().zip(ranked) {
+        *slot = candidate;
+    }
+}
+
 /// Version of the persisted field-feature schema.
 ///
 /// Callers that persist model weights should store and validate this value
@@ -316,6 +344,28 @@ fn finite(value: f64) -> f64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn reranking_evaluates_each_feature_once_and_preserves_deterministic_ties() {
+        let mut candidates = vec![1, 2, 3, 4];
+        super::rerank_sorted_prefix(
+            &mut candidates,
+            &super::FieldRankModel::default(),
+            3,
+            |_| panic!("inactive models must not evaluate features"),
+        );
+        let mut weights = [0.0; super::FIELD_RANK_FEATURE_COUNT];
+        weights[0] = 1.0;
+        let model = super::FieldRankModel::new(0.0, weights);
+        let mut calls = 0;
+        super::rerank_sorted_prefix(&mut candidates, &model, 3, |candidate| {
+            calls += 1;
+            let mut features = super::FieldRankFeatures::zero();
+            features.set(0, f64::from(*candidate > 1));
+            features
+        });
+        assert_eq!(calls, 3);
+        assert_eq!(candidates, [2, 3, 1, 4]);
+    }
     use super::{FIELD_RANK_FEATURE_COUNT, FieldRankFeatures, FieldRankModel};
 
     #[test]

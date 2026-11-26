@@ -819,6 +819,13 @@ selection use the shared final path comparator; raw edit distance cannot overrid
 alignment quality or reverse the descending position histogram. Search pruning
 uses lossless character-deficit bounds for admission and alignment quality,
 rather than the raw distance of the current winner or preferred token alignment.
+
+Fuzzy field top-K selection keeps one lazy relevance cache per candidate through
+both partial selection and the retained-prefix sort. Learned field reranking
+evaluates each retained candidate's features once and preserves deterministic
+order on equal model scores, without repeating relevance comparisons or sorting
+the deterministic prefix again.
+
 ### Field reranking features and feedback
 
 `fields::model` provides the corresponding learned layer for `fields::literal`
@@ -1088,6 +1095,27 @@ cross a field boundary. Candidates that do not contain any usable exact query
 signal are rejected before sorting. Exact matching uses arbitrary substring
 matching within a candidate token, just like metadata; it does not calculate
 fuzzy matches, edit distance, keyboard distance, or typo provenance.
+
+The original query token sequence is preserved for phrase/subphrase and order
+stages, including repeated words: `very very good` does not have a whole-phrase
+match in `very good`. Coverage and token-occurrence totals use distinct query
+tokens, so repeating a word in the query does not manufacture additional coverage.
+
+`MessageQuery::search_top_k_prepared` provides a lazy batch execution strategy:
+it rejects candidates with no literal signal, compares stages only as needed,
+uses shared `core::TopK` to maintain a bounded heap, and fully materializes only
+the returned results. Inferior candidates are compared to the retained cutoff,
+not needlessly ordered against one another.
+`search_top_k_prepared_with_model` adds the existing bounded learned rerank.
+The eager `search_rank`/`search_rank_prepared` APIs remain available for diagnostics
+and callers requiring every feature. Both strategies share the same stage
+implementations and comparator; the ranking policy is unchanged.
+
+Reproduce the scratch-reuse, field top-K, and lazy literal measurements with
+`cargo bench --bench query_ranking`. These use deterministic synthetic corpora
+and perform no candidate filesystem access. `path_multi_token` and
+`path_single_token` each measure 128 related paths; `fields_fuzzy` and
+`fields_literal` each measure 1,000 candidates.
 
 Final message result ordering is:
 

@@ -4,12 +4,12 @@ use crate::core::{
     bounded_damerau_levenshtein_chars_with_scratch, compare_key_asc, compare_score_desc,
     exact_phrase_occurrence_count_by, exact_phrase_present_by, exact_subphrase_counts_vector_by,
     exact_token_position, keyboard_substitution_cost, max_typos, ordered_token_span,
-    position_vector, ratio_milli,
+    ordered_token_span_indexed, position_vector, ratio_milli,
 };
 use crate::debug::{DebugReport, DebugStage};
 use crate::fields::model::{
     FieldRankFeatures, FieldRankModel, density_quality, feature, longest_subphrase,
-    occurrence_features, quality_from_priority, set_coverage_features,
+    occurrence_features, quality_from_priority, rerank_sorted_prefix, set_coverage_features,
 };
 use crate::ranking::{
     AbbreviationRank, DistanceRank, SearchRank, StructuralRank, compare_search_results,
@@ -355,35 +355,9 @@ impl MetadataQuery {
         rerank_limit: usize,
     ) {
         self.sort_matches(matches);
-        if !model.is_active() || rerank_limit == 0 {
-            return;
-        }
-
-        let limit = matches.len().min(rerank_limit);
-        let mut reranked = matches[..limit]
-            .iter()
-            .map(|(candidate, rank)| {
-                let features = self.features_for_rank(*candidate, rank);
-                let score = model.score(&features);
-                (*candidate, rank.clone(), score)
-            })
-            .collect::<Vec<_>>();
-        reranked.sort_unstable_by(
-            |(left_candidate, left_rank, left_score),
-             (right_candidate, right_rank, right_score)| {
-                right_score.total_cmp(left_score).then_with(|| {
-                    self.compare_candidates(
-                        *left_candidate,
-                        left_rank,
-                        *right_candidate,
-                        right_rank,
-                    )
-                })
-            },
-        );
-        for (index, (candidate, rank, _)) in reranked.into_iter().enumerate() {
-            matches[index] = (candidate, rank);
-        }
+        rerank_sorted_prefix(matches, model, rerank_limit, |(candidate, rank)| {
+            self.features_for_rank(*candidate, rank)
+        });
     }
 
     pub fn sort_matches_prepared_with_model(
@@ -393,35 +367,9 @@ impl MetadataQuery {
         rerank_limit: usize,
     ) {
         self.sort_matches_prepared(matches);
-        if !model.is_active() || rerank_limit == 0 {
-            return;
-        }
-
-        let limit = matches.len().min(rerank_limit);
-        let mut reranked = matches[..limit]
-            .iter()
-            .map(|(candidate, rank)| {
-                let features = self.features_for_prepared_rank(*candidate, rank);
-                let score = model.score(&features);
-                (*candidate, rank.clone(), score)
-            })
-            .collect::<Vec<_>>();
-        reranked.sort_unstable_by(
-            |(left_candidate, left_rank, left_score),
-             (right_candidate, right_rank, right_score)| {
-                right_score.total_cmp(left_score).then_with(|| {
-                    self.compare_prepared_candidates(
-                        *left_candidate,
-                        left_rank,
-                        *right_candidate,
-                        right_rank,
-                    )
-                })
-            },
-        );
-        for (index, (candidate, rank, _)) in reranked.into_iter().enumerate() {
-            matches[index] = (candidate, rank);
-        }
+        rerank_sorted_prefix(matches, model, rerank_limit, |(candidate, rank)| {
+            self.features_for_prepared_rank(*candidate, rank)
+        });
     }
 
     /// Prepared-candidate model reranking while retaining caller-owned
@@ -433,35 +381,9 @@ impl MetadataQuery {
         rerank_limit: usize,
     ) {
         self.sort_matches_prepared_with(matches);
-        if !model.is_active() || rerank_limit == 0 {
-            return;
-        }
-
-        let limit = matches.len().min(rerank_limit);
-        let mut reranked = matches[..limit]
-            .iter()
-            .map(|(candidate, rank, payload)| {
-                let features = self.features_for_prepared_rank(*candidate, rank);
-                let score = model.score(&features);
-                (*candidate, rank.clone(), payload.clone(), score)
-            })
-            .collect::<Vec<_>>();
-        reranked.sort_unstable_by(
-            |(left_candidate, left_rank, _, left_score),
-             (right_candidate, right_rank, _, right_score)| {
-                right_score.total_cmp(left_score).then_with(|| {
-                    self.compare_prepared_candidates(
-                        *left_candidate,
-                        left_rank,
-                        *right_candidate,
-                        right_rank,
-                    )
-                })
-            },
-        );
-        for (index, (candidate, rank, payload, _)) in reranked.into_iter().enumerate() {
-            matches[index] = (candidate, rank, payload);
-        }
+        rerank_sorted_prefix(matches, model, rerank_limit, |(candidate, rank, _)| {
+            self.features_for_prepared_rank(*candidate, rank)
+        });
     }
 
     pub fn select_top_k_with_model(
@@ -481,7 +403,9 @@ impl MetadataQuery {
         }
         let pool_limit = matches.len().min(limit.max(rerank_limit));
         self.select_top_k_deterministic(matches, pool_limit);
-        self.sort_matches_with_model(matches, model, rerank_limit.min(pool_limit));
+        rerank_sorted_prefix(matches, model, rerank_limit, |(candidate, rank)| {
+            self.features_for_rank(*candidate, rank)
+        });
         matches.truncate(limit);
     }
 
@@ -502,7 +426,9 @@ impl MetadataQuery {
         }
         let pool_limit = matches.len().min(limit.max(rerank_limit));
         self.select_top_k_prepared_deterministic(matches, pool_limit);
-        self.sort_matches_prepared_with_model(matches, model, rerank_limit.min(pool_limit));
+        rerank_sorted_prefix(matches, model, rerank_limit, |(candidate, rank)| {
+            self.features_for_prepared_rank(*candidate, rank)
+        });
         matches.truncate(limit);
     }
 
@@ -519,11 +445,34 @@ impl MetadataQuery {
             matches.clear();
             return;
         }
-        let _ = matches.select_nth_unstable_by(limit, |left, right| {
-            self.compare_candidates(left.0, &left.1, right.0, &right.1)
-        });
-        matches.truncate(limit);
-        self.sort_matches(matches);
+        let mut cached: Vec<_> = matches
+            .iter()
+            .map(|(candidate, rank)| {
+                (
+                    *candidate,
+                    rank.clone(),
+                    LazyRelevance::new(&self.query_tokens, self.allow_typo, candidate.fields),
+                )
+            })
+            .collect();
+        let compare =
+            |left: &(MetadataCandidate<'_>, SearchRank, LazyRelevance<'_>),
+             right: &(MetadataCandidate<'_>, SearchRank, LazyRelevance<'_>)| {
+                left.2
+                    .compare(&right.2)
+                    .then_with(|| compare_score_desc(left.0.score, right.0.score))
+                    .then_with(|| left.1.cmp(&right.1))
+                    .then_with(|| compare_key_asc(left.0.key, right.0.key))
+            };
+        cached.select_nth_unstable_by(limit, compare);
+        cached.truncate(limit);
+        cached.sort_unstable_by(compare);
+        matches.clear();
+        matches.extend(
+            cached
+                .into_iter()
+                .map(|(candidate, rank, _)| (candidate, rank)),
+        );
     }
 
     fn select_top_k_prepared_deterministic(
@@ -539,11 +488,38 @@ impl MetadataQuery {
             matches.clear();
             return;
         }
-        let _ = matches.select_nth_unstable_by(limit, |left, right| {
-            self.compare_prepared_candidates(left.0, &left.1, right.0, &right.1)
-        });
-        matches.truncate(limit);
-        self.sort_matches_prepared(matches);
+        let mut cached: Vec<_> = matches
+            .iter()
+            .map(|(candidate, rank)| {
+                (
+                    *candidate,
+                    rank.clone(),
+                    LazyRelevance::from_prepared(
+                        &self.query_tokens,
+                        self.allow_typo,
+                        candidate.fields,
+                    ),
+                )
+            })
+            .collect();
+        let compare =
+            |left: &(PreparedMetadataCandidate<'_>, SearchRank, LazyRelevance<'_>),
+             right: &(PreparedMetadataCandidate<'_>, SearchRank, LazyRelevance<'_>)| {
+                left.2
+                    .compare(&right.2)
+                    .then_with(|| compare_score_desc(left.0.score, right.0.score))
+                    .then_with(|| left.1.cmp(&right.1))
+                    .then_with(|| compare_key_asc(left.0.key, right.0.key))
+            };
+        cached.select_nth_unstable_by(limit, compare);
+        cached.truncate(limit);
+        cached.sort_unstable_by(compare);
+        matches.clear();
+        matches.extend(
+            cached
+                .into_iter()
+                .map(|(candidate, rank, _)| (candidate, rank)),
+        );
     }
 
     fn features_for_rank(
@@ -563,30 +539,6 @@ impl MetadataQuery {
         let relevance =
             LazyRelevance::from_prepared(&self.query_tokens, self.allow_typo, candidate.fields);
         features_from_relevance(&relevance, candidate.score, rank, self.query_tokens.len())
-    }
-
-    fn compare_prepared_candidates(
-        &self,
-        left_candidate: PreparedMetadataCandidate<'_>,
-        left_rank: &SearchRank,
-        right_candidate: PreparedMetadataCandidate<'_>,
-        right_rank: &SearchRank,
-    ) -> Ordering {
-        let left_relevance = LazyRelevance::from_prepared(
-            &self.query_tokens,
-            self.allow_typo,
-            left_candidate.fields,
-        );
-        let right_relevance = LazyRelevance::from_prepared(
-            &self.query_tokens,
-            self.allow_typo,
-            right_candidate.fields,
-        );
-        left_relevance.compare(&right_relevance).then_with(|| {
-            compare_score_desc(left_candidate.score, right_candidate.score)
-                .then_with(|| left_rank.cmp(right_rank))
-                .then_with(|| compare_key_asc(left_candidate.key, right_candidate.key))
-        })
     }
 
     /// Explain every metadata comparator stage for one candidate.
@@ -1072,21 +1024,28 @@ impl<'a> LazyRelevance<'a> {
     }
 
     fn get_order_distance(&self) -> usize {
-        if self.query_tokens.is_empty() || self.fields.is_empty() {
-            return usize::MAX;
-        }
-        self.scattered_stats
-            .get_or_init(|| ordered_span_stats(self.query_tokens, &self.fields, self.allow_typo))
-            .0
+        self.get_ordered_span().0
     }
 
     fn get_total_gap(&self) -> usize {
-        if self.query_tokens.is_empty() || self.fields.is_empty() {
-            return usize::MAX;
-        }
-        self.scattered_stats
-            .get_or_init(|| ordered_span_stats(self.query_tokens, &self.fields, self.allow_typo))
-            .1
+        self.get_ordered_span().1
+    }
+
+    fn get_ordered_span(&self) -> (usize, usize) {
+        *self.scattered_stats.get_or_init(|| {
+            if let Some(matches) = self.fuzzy_token_matches.get() {
+                ordered_token_span_indexed(
+                    self.query_tokens,
+                    self.fields.iter().map(|field| field.tokens.as_slice()),
+                    |query_idx, field_idx, token_idx, _, _| {
+                        let matched = matches[query_idx][field_idx][token_idx];
+                        matched.exact || (self.allow_typo && matched.fuzzy)
+                    },
+                )
+            } else {
+                ordered_span_stats(self.query_tokens, &self.fields, self.allow_typo)
+            }
+        })
     }
 
     fn get_exact_phrase_occurrence_rank(&self) -> &FieldOccurrenceRank {
@@ -2632,6 +2591,157 @@ fn best_typo_rank<F: MetadataFieldView>(query: &str, fields: &[F]) -> Option<Dis
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ordered_span_reuses_pair_results_with_the_same_field_boundaries() {
+        let fields = [
+            SearchField {
+                priority: 1,
+                value: "chrome browser profiles chrome",
+            },
+            SearchField {
+                priority: 0,
+                value: "profile qwerty crhome",
+            },
+        ];
+        for query in ["crhome profile", "profile chrome chrome", "chrome profiles"] {
+            let query = Query::new(query).unwrap();
+            for allow_typo in [false, true] {
+                let cached = LazyRelevance::new(&query.query_tokens, allow_typo, &fields);
+                let expected = ordered_span_stats(&query.query_tokens, &cached.fields, allow_typo);
+                cached.get_fuzzy_token_matches();
+                assert_eq!(cached.get_ordered_span(), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn cached_top_k_equals_full_order_for_prepared_and_raw_fields() {
+        let texts = [
+            "Chrome profile",
+            "Chromium browser",
+            "chrome",
+            "a chrome browser",
+            "krome",
+            "profile chrome",
+            "backup of Chrome",
+            "chroma",
+            "unrelated",
+        ];
+        let fields: Vec<_> = texts
+            .iter()
+            .enumerate()
+            .map(|(i, value)| {
+                [SearchField {
+                    priority: (i % 3) as u8,
+                    value,
+                }]
+            })
+            .collect();
+        let prepared_fields: Vec<_> = fields.iter().map(|fields| prepare_fields(fields)).collect();
+        for text in ["chrome", "krome", "chrome profile", "c", "profil chrome"] {
+            let query = MetadataQuery::new(text).unwrap().with_typo_fallback(true);
+            let candidates: Vec<_> = texts
+                .iter()
+                .zip(&fields)
+                .enumerate()
+                .filter_map(|(i, (key, fields))| {
+                    let candidate = MetadataCandidate {
+                        key,
+                        fields,
+                        score: (i % 4) as f64,
+                    };
+                    query.search_rank(candidate).map(|rank| (candidate, rank))
+                })
+                .rev()
+                .collect();
+            let prepared: Vec<_> = texts
+                .iter()
+                .zip(&prepared_fields)
+                .enumerate()
+                .filter_map(|(i, (key, fields))| {
+                    let candidate = PreparedMetadataCandidate {
+                        key,
+                        fields,
+                        score: (i % 4) as f64,
+                    };
+                    query
+                        .search_rank_prepared(candidate)
+                        .map(|rank| (candidate, rank))
+                })
+                .rev()
+                .collect();
+            let mut full = candidates.clone();
+            query.sort_matches(&mut full);
+            let mut full_prepared = prepared.clone();
+            query.sort_matches_prepared(&mut full_prepared);
+            assert_eq!(
+                full.iter().map(|entry| entry.0.key).collect::<Vec<_>>(),
+                full_prepared
+                    .iter()
+                    .map(|entry| entry.0.key)
+                    .collect::<Vec<_>>()
+            );
+            for limit in 0..=texts.len() + 1 {
+                let mut top = candidates.clone();
+                query.select_top_k_deterministic(&mut top, limit);
+                let mut top_prepared = prepared.clone();
+                query.select_top_k_prepared_deterministic(&mut top_prepared, limit);
+                let expected: Vec<_> = full.iter().take(limit).map(|entry| entry.0.key).collect();
+                assert_eq!(
+                    top.iter().map(|entry| entry.0.key).collect::<Vec<_>>(),
+                    expected
+                );
+                assert_eq!(
+                    top_prepared
+                        .iter()
+                        .map(|entry| entry.0.key)
+                        .collect::<Vec<_>>(),
+                    expected
+                );
+            }
+            let mut weights = [0.0; crate::fields::model::FIELD_RANK_FEATURE_COUNT];
+            weights[feature::CALLER_SCORE] = 1.0;
+            let model = FieldRankModel::new(0.0, weights);
+            for rerank_limit in [0, 1, 3, texts.len() + 1] {
+                let mut full = candidates.clone();
+                query.sort_matches_with_model(&mut full, &model, rerank_limit);
+                let mut payloads: Vec<_> = prepared
+                    .iter()
+                    .map(|(candidate, rank)| (*candidate, rank.clone(), candidate.key))
+                    .collect();
+                query.sort_matches_prepared_with_model_and(&mut payloads, &model, rerank_limit);
+                assert_eq!(
+                    payloads.iter().map(|entry| entry.2).collect::<Vec<_>>(),
+                    full.iter().map(|entry| entry.0.key).collect::<Vec<_>>()
+                );
+                for limit in 0..=texts.len() + 1 {
+                    let expected: Vec<_> =
+                        full.iter().take(limit).map(|entry| entry.0.key).collect();
+                    let mut top = candidates.clone();
+                    query.select_top_k_with_model(&mut top, limit, &model, rerank_limit);
+                    let mut top_prepared = prepared.clone();
+                    query.select_top_k_prepared_with_model(
+                        &mut top_prepared,
+                        limit,
+                        &model,
+                        rerank_limit,
+                    );
+                    assert_eq!(
+                        top.iter().map(|entry| entry.0.key).collect::<Vec<_>>(),
+                        expected
+                    );
+                    assert_eq!(
+                        top_prepared
+                            .iter()
+                            .map(|entry| entry.0.key)
+                            .collect::<Vec<_>>(),
+                        expected
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn app_name_field_beats_exec_field() {

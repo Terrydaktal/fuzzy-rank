@@ -3,7 +3,7 @@ use std::cmp::{Ordering, Reverse};
 use crate::core::{
     InsertionVector, OperationProfile, TypoCostVector, bounded_damerau_levenshtein,
     compare_key_asc, compare_score_desc, exact_distinct_coverage, exact_phrase_present,
-    exact_subphrase_counts_vector, max_typos, ordered_token_span,
+    exact_subphrase_counts_vector, max_typos, ordered_token_span_indexed,
 };
 use crate::text::{has_query_signal, split_search_tokens, split_whitespace_tokens, to_lowercase};
 
@@ -374,31 +374,40 @@ fn compute_match_fields(
         return None;
     }
 
-    let fields = std::iter::once(candidate_tokens);
-    let exact_phrase_present = exact_phrase_present(query_tokens, fields.clone());
-    let exact_coverage = exact_distinct_coverage(query_tokens, fields.clone());
-    let exact_subphrase_counts_vector = exact_subphrase_counts_vector(query_tokens, fields);
-
-    let token_matches = query_tokens
-        .iter()
-        .map(|query_token| best_command_token_match(query_token, candidate_tokens, limit))
-        .collect::<Vec<_>>();
-    let total_coverage = token_matches
-        .iter()
-        .filter(|matched| matched.is_some())
-        .count();
-    if total_coverage < query_tokens.len() {
-        return None;
+    let mut pair_matches = smallvec::SmallVec::<[bool; 128]>::new();
+    let mut best_matches = smallvec::SmallVec::<[CommandTokenMatch; 8]>::new();
+    for query in query_tokens {
+        let mut best = None;
+        for candidate in candidate_tokens {
+            let matched = command_token_match(query, candidate, limit);
+            pair_matches.push(matched.is_some());
+            if let Some(matched) = matched
+                && best.is_none_or(|current: CommandTokenMatch| matched.key() < current.key())
+            {
+                best = Some(matched);
+            }
+        }
+        best_matches.push(best?);
     }
+    let total_coverage = query_tokens.len();
+    let fields = [candidate_tokens];
+    let exact_phrase_present = exact_phrase_present(query_tokens, fields);
+    let exact_coverage = exact_distinct_coverage(query_tokens, fields);
+    let exact_subphrase_counts_vector = exact_subphrase_counts_vector(query_tokens, fields);
+    let matches_at =
+        |query_idx, token_idx| pair_matches[query_idx * candidate_tokens.len() + token_idx];
 
-    let fuzzy_subphrase_counts_vector =
-        command_fuzzy_subphrase_counts_vector(query_tokens, candidate_tokens, limit);
-    let (order_distance, total_gap) = ordered_token_span(
+    let fuzzy_subphrase_counts_vector = command_fuzzy_subphrase_counts_vector(
+        query_tokens.len(),
+        candidate_tokens.len(),
+        matches_at,
+    );
+    let (order_distance, total_gap) = ordered_token_span_indexed(
         query_tokens,
         std::iter::once(candidate_tokens),
-        |query, token| command_token_match(query, token, limit).is_some(),
+        |query_idx, _, token_idx, _, _| matches_at(query_idx, token_idx),
     );
-    let (distance, operations, compared_len) = token_matches.iter().flatten().fold(
+    let (distance, operations, compared_len) = best_matches.iter().fold(
         (0, OperationProfile::default(), 0),
         |(distance, operations, compared_len), matched| {
             (
@@ -409,23 +418,15 @@ fn compute_match_fields(
         },
     );
     let typo_costs = TypoCostVector::new(
-        token_matches
+        best_matches
             .iter()
-            .map(|matched| {
-                matched
-                    .as_ref()
-                    .map_or(0, |matched| matched.operations.core_typo_cost())
-            })
+            .map(|matched| matched.operations.core_typo_cost())
             .collect(),
     );
     let insertions = InsertionVector::new(
-        token_matches
+        best_matches
             .iter()
-            .map(|matched| {
-                matched
-                    .as_ref()
-                    .map_or(0, |matched| matched.operations.insertions)
-            })
+            .map(|matched| matched.operations.insertions)
             .collect(),
     );
 
@@ -458,6 +459,12 @@ struct CommandTokenMatch {
     compared_len: usize,
 }
 
+impl CommandTokenMatch {
+    fn key(self) -> (usize, OperationProfile, usize) {
+        (self.distance, self.operations, self.compared_len)
+    }
+}
+
 fn command_token_match(query: &str, token: &str, global_limit: usize) -> Option<CommandTokenMatch> {
     if token.starts_with(query) {
         return Some(CommandTokenMatch {
@@ -480,46 +487,24 @@ fn command_token_match(query: &str, token: &str, global_limit: usize) -> Option<
     })
 }
 
-fn best_command_token_match(
-    query: &str,
-    tokens: &[String],
-    limit: usize,
-) -> Option<CommandTokenMatch> {
-    tokens
-        .iter()
-        .filter_map(|token| command_token_match(query, token, limit))
-        .min_by(|left, right| {
-            (left.distance, left.operations, left.compared_len).cmp(&(
-                right.distance,
-                right.operations,
-                right.compared_len,
-            ))
-        })
-}
-
 fn command_fuzzy_subphrase_counts_vector(
-    query_tokens: &[String],
-    tokens: &[String],
-    limit: usize,
+    query_len: usize,
+    token_count: usize,
+    matches_at: impl Fn(usize, usize) -> bool,
 ) -> Vec<usize> {
-    if query_tokens.len() < 3 {
-        return Vec::new();
-    }
-    (2..query_tokens.len())
+    (2..query_len)
         .rev()
         .map(|window_len| {
-            (0..=query_tokens.len() - window_len)
+            if window_len > token_count {
+                return 0;
+            }
+            (0..=query_len - window_len)
                 .map(|query_start| {
-                    let query_window = &query_tokens[query_start..query_start + window_len];
-                    tokens
-                        .windows(window_len)
-                        .filter(|candidate_window| {
-                            candidate_window
-                                .iter()
-                                .zip(query_window)
-                                .all(|(token, query)| {
-                                    command_token_match(query, token, limit).is_some()
-                                })
+                    (0..=token_count - window_len)
+                        .filter(|candidate_start| {
+                            (0..window_len).all(|offset| {
+                                matches_at(query_start + offset, candidate_start + offset)
+                            })
                         })
                         .count()
                 })

@@ -470,17 +470,40 @@ where
     I: IntoIterator<Item = &'a [C]>,
     F: FnMut(&str, &str) -> bool,
 {
+    ordered_token_span_indexed(query_tokens, fields, |_, _, _, query, candidate| {
+        token_matches(query, candidate)
+    })
+}
+
+pub(crate) fn ordered_token_span_indexed<'a, Q, C, I, F>(
+    query_tokens: &[Q],
+    fields: I,
+    mut token_matches: F,
+) -> (usize, usize)
+where
+    Q: AsRef<str>,
+    C: AsRef<str> + 'a,
+    I: IntoIterator<Item = &'a [C]>,
+    F: FnMut(usize, usize, usize, &str, &str) -> bool,
+{
     if query_tokens.is_empty() {
         return (usize::MAX, usize::MAX);
     }
 
     let mut best: Option<(usize, usize, usize)> = None;
-    for field in fields {
+    for (field_idx, field) in fields.into_iter().enumerate() {
         let mut used = vec![false; field.len()];
         let mut positions = Vec::new();
-        for query in query_tokens {
+        for (query_idx, query) in query_tokens.iter().enumerate() {
             let Some((idx, _)) = field.iter().enumerate().find(|(idx, candidate)| {
-                !used[*idx] && token_matches(query.as_ref(), candidate.as_ref())
+                !used[*idx]
+                    && token_matches(
+                        query_idx,
+                        field_idx,
+                        *idx,
+                        query.as_ref(),
+                        candidate.as_ref(),
+                    )
             }) else {
                 continue;
             };

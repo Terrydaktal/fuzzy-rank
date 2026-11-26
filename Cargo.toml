@@ -16,3 +16,7 @@ criterion = "0.5"
 [[bench]]
 name = "path_bulk"
 harness = false
+
+[[bench]]
+name = "query_ranking"
+harness = false

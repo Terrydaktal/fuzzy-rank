@@ -1,13 +1,14 @@
+use std::cell::OnceCell;
 use std::cmp::{Ordering, Reverse};
 
 use crate::core::{
-    CoverageRank, DensityRank, FieldOccurrenceRank, compare_key_asc, compare_score_desc,
+    CoverageRank, DensityRank, FieldOccurrenceRank, TopK, compare_key_asc, compare_score_desc,
     exact_phrase_occurrence_count_by, exact_phrase_present_by, exact_subphrase_counts_vector_by,
     exact_token_position, ordered_token_span, position_vector,
 };
 use crate::fields::model::{
     FieldRankFeatures, FieldRankModel, density_quality, feature, longest_subphrase,
-    occurrence_features, quality_from_priority, set_coverage_features,
+    occurrence_features, quality_from_priority, rerank_sorted_prefix, set_coverage_features,
 };
 use crate::text::{split_search_tokens, to_lowercase};
 
@@ -29,6 +30,7 @@ pub struct MessageCandidate<'a, 'b> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MessageQuery {
     tokens: Vec<String>,
+    distinct_tokens: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -142,14 +144,21 @@ impl<'a, 'b> MessageCandidate<'a, 'b> {
 impl MessageQuery {
     pub fn new(query: &str) -> Option<Self> {
         let lowered = to_lowercase(query);
-        let mut tokens = Vec::new();
-        for token in split_search_tokens(&lowered) {
-            if !tokens.iter().any(|existing| existing == token) {
-                tokens.push(token.to_owned());
+        let tokens: Vec<_> = split_search_tokens(&lowered)
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        let mut distinct_tokens = Vec::new();
+        for token in &tokens {
+            if !distinct_tokens.contains(token) {
+                distinct_tokens.push(token.clone());
             }
         }
 
-        (!tokens.is_empty()).then_some(Self { tokens })
+        (!tokens.is_empty()).then_some(Self {
+            tokens,
+            distinct_tokens,
+        })
     }
 
     pub fn search_rank<'a, 'b>(
@@ -162,9 +171,58 @@ impl MessageQuery {
 
     pub fn search_rank_prepared<'a>(
         &self,
-        candidate: &'a PreparedMessageCandidate<'a>,
+        candidate: &PreparedMessageCandidate<'a>,
     ) -> Option<MessageMatch<'a>> {
         self.rank_from_parts(candidate.key, candidate.score, &candidate.fields)
+    }
+
+    /// Retrieve the best literal field matches, evaluating subordinate relevance
+    /// stages only on ties. Only the retained results are fully materialized.
+    pub fn search_top_k_prepared<'a>(
+        &self,
+        candidates: &[PreparedMessageCandidate<'a>],
+        limit: usize,
+    ) -> Vec<MessageMatch<'a>> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let mut matches = TopK::new(limit.min(candidates.len()));
+        for candidate in candidates
+            .iter()
+            .filter(|candidate| contains_query_signal(self, candidate))
+        {
+            matches.push(LazyLiteralMatch {
+                key: candidate.key,
+                score: candidate.score,
+                relevance: LiteralRelevance::new(self, &candidate.fields),
+            });
+        }
+        matches
+            .into_sorted()
+            .into_iter()
+            .map(|matched| matched.relevance.materialize(matched.key, matched.score))
+            .collect()
+    }
+
+    /// Lazy deterministic retrieval followed by the same bounded learned rerank
+    /// used by [`select_top_k_with_model`].
+    pub fn search_top_k_prepared_with_model<'a>(
+        &self,
+        candidates: &[PreparedMessageCandidate<'a>],
+        limit: usize,
+        model: &FieldRankModel,
+        rerank_limit: usize,
+    ) -> Vec<MessageMatch<'a>> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        if !model.is_active() || rerank_limit == 0 {
+            return self.search_top_k_prepared(candidates, limit);
+        }
+        let mut matches = self.search_top_k_prepared(candidates, limit.max(rerank_limit));
+        rerank_sorted_matches(&mut matches, model, rerank_limit);
+        matches.truncate(limit);
+        matches
     }
 
     fn rank_from_parts<'a>(
@@ -173,106 +231,242 @@ impl MessageQuery {
         score: Score,
         fields: &[PreparedMessageField],
     ) -> Option<MessageMatch<'a>> {
-        if fields.is_empty() {
-            return None;
-        }
+        let relevance = LiteralRelevance::new(self, fields);
+        (relevance.coverage().distinct_coverage != 0).then(|| relevance.materialize(key, score))
+    }
+}
 
-        let field_tokens = fields.iter().map(|field| field.tokens.as_slice());
-        let exact_weighted_positional_coverage_vector = CoverageRank::new(
-            position_vector(
-                self.tokens.iter().map(|query| {
-                    fields
-                        .iter()
-                        .flat_map(|field| field.tokens.iter())
-                        .filter_map(|candidate| exact_token_position(query, candidate))
-                        .min()
-                }),
-                4,
-            ),
-            &[4, 2, 2, 1],
-        );
-        if exact_weighted_positional_coverage_vector.distinct_coverage == 0 {
-            return None;
-        }
+struct LazyLiteralMatch<'a, 'q> {
+    key: &'a str,
+    score: Score,
+    relevance: LiteralRelevance<'q>,
+}
 
-        let exact_whole_phrase_present =
-            exact_phrase_present_by(&self.tokens, field_tokens.clone(), literal_token_match);
-        let exact_subphrase_counts_vector = exact_subphrase_counts_vector_by(
-            &self.tokens,
-            field_tokens.clone(),
-            literal_token_match,
-        );
-        let exact_field_quality = fields
-            .iter()
-            .filter(|field| {
-                field.tokens.iter().any(|candidate| {
-                    self.tokens
-                        .iter()
-                        .any(|query| literal_token_match(query, candidate))
-                })
-            })
-            .map(|field| field.priority)
-            .min()
-            .unwrap_or(u8::MAX);
-        let (order_distance, total_gap) =
-            ordered_token_span(&self.tokens, field_tokens.clone(), literal_token_match);
-        let exact_phrase_occurrence_rank =
-            FieldOccurrenceRank::from_entries(fields.iter().map(|field| {
+impl Ord for LazyLiteralMatch<'_, '_> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        compare_relevance(&self.relevance, &other.relevance)
+            .then_with(|| compare_score_desc(self.score, other.score))
+            .then_with(|| compare_key_asc(self.key, other.key))
+    }
+}
+
+impl PartialOrd for LazyLiteralMatch<'_, '_> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for LazyLiteralMatch<'_, '_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+
+impl Eq for LazyLiteralMatch<'_, '_> {}
+
+trait LiteralRank {
+    fn whole_phrase(&self) -> bool;
+    fn subphrases(&self) -> &[usize];
+    fn coverage(&self) -> &CoverageRank;
+    fn field_quality(&self) -> u8;
+    fn span(&self) -> (usize, usize);
+    fn phrase_occurrences(&self) -> &FieldOccurrenceRank;
+    fn token_occurrences(&self) -> &FieldOccurrenceRank;
+    fn density(&self) -> DensityRank;
+}
+
+struct LiteralRelevance<'a> {
+    query: &'a MessageQuery,
+    fields: &'a [PreparedMessageField],
+    phrase: OnceCell<bool>,
+    subphrases: OnceCell<Vec<usize>>,
+    coverage: OnceCell<CoverageRank>,
+    field_quality: OnceCell<u8>,
+    span: OnceCell<(usize, usize)>,
+    phrase_occurrences: OnceCell<FieldOccurrenceRank>,
+    token_occurrences: OnceCell<FieldOccurrenceRank>,
+    density: OnceCell<DensityRank>,
+}
+
+impl<'a> LiteralRelevance<'a> {
+    fn new(query: &'a MessageQuery, fields: &'a [PreparedMessageField]) -> Self {
+        Self {
+            query,
+            fields,
+            phrase: OnceCell::new(),
+            subphrases: OnceCell::new(),
+            coverage: OnceCell::new(),
+            field_quality: OnceCell::new(),
+            span: OnceCell::new(),
+            phrase_occurrences: OnceCell::new(),
+            token_occurrences: OnceCell::new(),
+            density: OnceCell::new(),
+        }
+    }
+
+    fn field_matches(&self, field: &PreparedMessageField) -> bool {
+        field.tokens.iter().any(|candidate| {
+            self.query
+                .distinct_tokens
+                .iter()
+                .any(|query| literal_token_match(query, candidate))
+        })
+    }
+
+    fn materialize<'k>(&self, key: &'k str, score: Score) -> MessageMatch<'k> {
+        let (order_distance, total_gap) = self.span();
+        MessageMatch {
+            key,
+            score,
+            query_token_count: self.query.tokens.len(),
+            exact_whole_phrase_present: self.whole_phrase(),
+            exact_subphrase_counts_vector: self.subphrases().to_vec(),
+            exact_weighted_positional_coverage_vector: self.coverage().clone(),
+            exact_field_quality: self.field_quality(),
+            order_distance,
+            total_gap,
+            exact_phrase_occurrence_rank: self.phrase_occurrences().clone(),
+            exact_token_occurrence_rank: self.token_occurrences().clone(),
+            density: self.density(),
+        }
+    }
+}
+
+impl LiteralRank for LiteralRelevance<'_> {
+    fn whole_phrase(&self) -> bool {
+        *self.phrase.get_or_init(|| {
+            exact_phrase_present_by(
+                &self.query.tokens,
+                self.fields.iter().map(|field| field.tokens.as_slice()),
+                literal_token_match,
+            )
+        })
+    }
+
+    fn subphrases(&self) -> &[usize] {
+        self.subphrases.get_or_init(|| {
+            exact_subphrase_counts_vector_by(
+                &self.query.tokens,
+                self.fields.iter().map(|field| field.tokens.as_slice()),
+                literal_token_match,
+            )
+        })
+    }
+
+    fn coverage(&self) -> &CoverageRank {
+        self.coverage.get_or_init(|| {
+            CoverageRank::new(
+                position_vector(
+                    self.query.distinct_tokens.iter().map(|query| {
+                        self.fields
+                            .iter()
+                            .flat_map(|field| field.tokens.iter())
+                            .filter_map(|candidate| exact_token_position(query, candidate))
+                            .min()
+                    }),
+                    4,
+                ),
+                &[4, 2, 2, 1],
+            )
+        })
+    }
+
+    fn field_quality(&self) -> u8 {
+        *self.field_quality.get_or_init(|| {
+            self.fields
+                .iter()
+                .filter(|field| self.field_matches(field))
+                .map(|field| field.priority)
+                .min()
+                .unwrap_or(u8::MAX)
+        })
+    }
+
+    fn span(&self) -> (usize, usize) {
+        *self.span.get_or_init(|| {
+            ordered_token_span(
+                &self.query.tokens,
+                self.fields.iter().map(|field| field.tokens.as_slice()),
+                literal_token_match,
+            )
+        })
+    }
+
+    fn phrase_occurrences(&self) -> &FieldOccurrenceRank {
+        self.phrase_occurrences.get_or_init(|| {
+            FieldOccurrenceRank::from_entries(self.fields.iter().map(|field| {
                 (
                     field.priority,
                     exact_phrase_occurrence_count_by(
-                        &self.tokens,
+                        &self.query.tokens,
                         std::iter::once(field.tokens.as_slice()),
                         literal_token_match,
                     ),
                 )
-            }));
-        let exact_token_occurrence_rank =
-            FieldOccurrenceRank::from_entries(fields.iter().map(|field| {
+            }))
+        })
+    }
+
+    fn token_occurrences(&self) -> &FieldOccurrenceRank {
+        self.token_occurrences.get_or_init(|| {
+            FieldOccurrenceRank::from_entries(self.fields.iter().map(|field| {
                 (
                     field.priority,
                     field
                         .tokens
                         .iter()
                         .map(|candidate| {
-                            self.tokens
+                            self.query
+                                .distinct_tokens
                                 .iter()
                                 .filter(|query| literal_token_match(query, candidate))
                                 .count()
                         })
                         .sum(),
                 )
-            }));
-        let density = DensityRank::new(
-            exact_weighted_positional_coverage_vector.distinct_coverage,
-            fields
-                .iter()
-                .filter(|field| {
-                    field.tokens.iter().any(|candidate| {
-                        self.tokens
-                            .iter()
-                            .any(|query| literal_token_match(query, candidate))
-                    })
-                })
-                .map(|field| field.tokens.len())
-                .min()
-                .unwrap_or(usize::MAX),
-        );
-
-        Some(MessageMatch {
-            key,
-            score,
-            query_token_count: self.tokens.len(),
-            exact_whole_phrase_present,
-            exact_subphrase_counts_vector,
-            exact_weighted_positional_coverage_vector,
-            exact_field_quality,
-            order_distance,
-            total_gap,
-            exact_phrase_occurrence_rank,
-            exact_token_occurrence_rank,
-            density,
+            }))
         })
+    }
+
+    fn density(&self) -> DensityRank {
+        *self.density.get_or_init(|| {
+            DensityRank::new(
+                self.coverage().distinct_coverage,
+                self.fields
+                    .iter()
+                    .filter(|field| self.field_matches(field))
+                    .map(|field| field.tokens.len())
+                    .min()
+                    .unwrap_or(usize::MAX),
+            )
+        })
+    }
+}
+
+impl LiteralRank for MessageMatch<'_> {
+    fn whole_phrase(&self) -> bool {
+        self.exact_whole_phrase_present
+    }
+    fn subphrases(&self) -> &[usize] {
+        &self.exact_subphrase_counts_vector
+    }
+    fn coverage(&self) -> &CoverageRank {
+        &self.exact_weighted_positional_coverage_vector
+    }
+    fn field_quality(&self) -> u8 {
+        self.exact_field_quality
+    }
+    fn span(&self) -> (usize, usize) {
+        (self.order_distance, self.total_gap)
+    }
+    fn phrase_occurrences(&self) -> &FieldOccurrenceRank {
+        &self.exact_phrase_occurrence_rank
+    }
+    fn token_occurrences(&self) -> &FieldOccurrenceRank {
+        &self.exact_token_occurrence_rank
+    }
+    fn density(&self) -> DensityRank {
+        self.density
     }
 }
 
@@ -304,27 +498,15 @@ pub fn sort_matches_with_model(
     rerank_limit: usize,
 ) {
     sort_matches(matches);
-    if !model.is_active() || rerank_limit == 0 {
-        return;
-    }
+    rerank_sorted_matches(matches, model, rerank_limit);
+}
 
-    let limit = matches.len().min(rerank_limit);
-    let mut reranked = matches[..limit]
-        .iter()
-        .cloned()
-        .map(|candidate| {
-            let score = model.score(&candidate.rank_features());
-            (candidate, score)
-        })
-        .collect::<Vec<_>>();
-    reranked.sort_unstable_by(|(left, left_score), (right, right_score)| {
-        right_score
-            .total_cmp(left_score)
-            .then_with(|| compare_matches(left, right))
-    });
-    for (index, (candidate, _)) in reranked.into_iter().enumerate() {
-        matches[index] = candidate;
-    }
+fn rerank_sorted_matches(
+    matches: &mut [MessageMatch<'_>],
+    model: &FieldRankModel,
+    rerank_limit: usize,
+) {
+    rerank_sorted_prefix(matches, model, rerank_limit, MessageMatch::rank_features);
 }
 
 /// Retain the best candidates after deterministic retrieval and learned
@@ -347,35 +529,26 @@ pub fn select_top_k_with_model(
 
     let pool_limit = matches.len().min(limit.max(rerank_limit));
     select_top_k(matches, pool_limit);
-    sort_matches_with_model(matches, model, rerank_limit.min(pool_limit));
+    rerank_sorted_matches(matches, model, rerank_limit.min(pool_limit));
     matches.truncate(limit);
 }
 
 fn compare_matches(left: &MessageMatch<'_>, right: &MessageMatch<'_>) -> Ordering {
-    Reverse(left.exact_whole_phrase_present)
-        .cmp(&Reverse(right.exact_whole_phrase_present))
-        .then_with(|| {
-            Reverse(&left.exact_subphrase_counts_vector)
-                .cmp(&Reverse(&right.exact_subphrase_counts_vector))
-        })
-        .then_with(|| {
-            Reverse(&left.exact_weighted_positional_coverage_vector)
-                .cmp(&Reverse(&right.exact_weighted_positional_coverage_vector))
-        })
-        .then_with(|| left.exact_field_quality.cmp(&right.exact_field_quality))
-        .then_with(|| left.order_distance.cmp(&right.order_distance))
-        .then_with(|| left.total_gap.cmp(&right.total_gap))
-        .then_with(|| {
-            Reverse(&left.exact_phrase_occurrence_rank)
-                .cmp(&Reverse(&right.exact_phrase_occurrence_rank))
-        })
-        .then_with(|| {
-            Reverse(&left.exact_token_occurrence_rank)
-                .cmp(&Reverse(&right.exact_token_occurrence_rank))
-        })
-        .then_with(|| left.density.cmp(&right.density))
+    compare_relevance(left, right)
         .then_with(|| compare_score_desc(left.score, right.score))
         .then_with(|| compare_key_asc(left.key, right.key))
+}
+
+fn compare_relevance(left: &impl LiteralRank, right: &impl LiteralRank) -> Ordering {
+    Reverse(left.whole_phrase())
+        .cmp(&Reverse(right.whole_phrase()))
+        .then_with(|| Reverse(left.subphrases()).cmp(&Reverse(right.subphrases())))
+        .then_with(|| Reverse(left.coverage()).cmp(&Reverse(right.coverage())))
+        .then_with(|| left.field_quality().cmp(&right.field_quality()))
+        .then_with(|| left.span().cmp(&right.span()))
+        .then_with(|| Reverse(left.phrase_occurrences()).cmp(&Reverse(right.phrase_occurrences())))
+        .then_with(|| Reverse(left.token_occurrences()).cmp(&Reverse(right.token_occurrences())))
+        .then_with(|| left.density().cmp(&right.density()))
 }
 
 pub fn contains_query_signal(
@@ -398,6 +571,153 @@ fn literal_token_match(query: &str, candidate: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn lazy_literal_selection_matches_eager_selection_with_and_without_model() {
+        let texts = [
+            "very very good",
+            "very good",
+            "good very",
+            "very",
+            "good",
+            "server error log",
+            "server log",
+            "xserver",
+            "unrelated",
+        ];
+        let prepared: Vec<_> = texts
+            .iter()
+            .enumerate()
+            .map(|(index, text)| {
+                super::MessageCandidate {
+                    key: text,
+                    score: (index % 3) as f64,
+                    fields: &[super::MessageField {
+                        priority: (index % 2) as u8,
+                        value: text,
+                    }],
+                }
+                .prepare()
+            })
+            .collect();
+        let mut weights = [0.0; crate::fields::model::FIELD_RANK_FEATURE_COUNT];
+        weights[super::feature::CALLER_SCORE] = 1.0;
+        for text in [
+            "very very good",
+            "very good",
+            "server error log",
+            "good",
+            "log server",
+            "absent",
+        ] {
+            let query = super::MessageQuery::new(text).unwrap();
+            let eager: Vec<_> = prepared
+                .iter()
+                .filter_map(|candidate| query.search_rank_prepared(candidate))
+                .collect();
+            for model in [
+                super::FieldRankModel::default(),
+                super::FieldRankModel::new(0.0, weights),
+            ] {
+                for rerank_limit in [0, 1, 3, 50] {
+                    let mut full = eager.clone();
+                    super::sort_matches_with_model(&mut full, &model, rerank_limit);
+                    for limit in 0..=texts.len() + 1 {
+                        let top = query.search_top_k_prepared_with_model(
+                            &prepared,
+                            limit,
+                            &model,
+                            rerank_limit,
+                        );
+                        assert_eq!(
+                            top.iter()
+                                .map(|m| (m.key, m.rank_features()))
+                                .collect::<Vec<_>>(),
+                            full.iter()
+                                .take(limit)
+                                .map(|m| (m.key, m.rank_features()))
+                                .collect::<Vec<_>>()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lazy_literal_comparison_does_not_evaluate_losing_subordinate_stages() {
+        let query = super::MessageQuery::new("server error").unwrap();
+        let full = super::MessageCandidate {
+            key: "full",
+            fields: &[super::MessageField {
+                priority: 0,
+                value: "server error",
+            }],
+            score: 0.0,
+        }
+        .prepare();
+        let partial = super::MessageCandidate {
+            key: "partial",
+            fields: &[super::MessageField {
+                priority: 0,
+                value: "server",
+            }],
+            score: 100.0,
+        }
+        .prepare();
+        let left = super::LiteralRelevance::new(&query, &full.fields);
+        let right = super::LiteralRelevance::new(&query, &partial.fields);
+        assert!(super::compare_relevance(&left, &right).is_lt());
+        for relevance in [&left, &right] {
+            assert!(relevance.phrase.get().is_some());
+            assert!(relevance.subphrases.get().is_none());
+            assert!(relevance.coverage.get().is_none());
+            assert!(relevance.span.get().is_none());
+            assert!(relevance.phrase_occurrences.get().is_none());
+            assert!(relevance.token_occurrences.get().is_none());
+            assert!(relevance.density.get().is_none());
+        }
+    }
+    #[test]
+    fn repeated_query_words_are_preserved_for_phrases_but_not_coverage() {
+        let query = super::MessageQuery::new("very very good").unwrap();
+        let full = [super::MessageField {
+            priority: 0,
+            value: "very very good",
+        }];
+        let shortened = [super::MessageField {
+            priority: 0,
+            value: "very good",
+        }];
+        let full = query
+            .search_rank(super::MessageCandidate {
+                key: "full",
+                fields: &full,
+                score: 0.0,
+            })
+            .unwrap();
+        let shortened = query
+            .search_rank(super::MessageCandidate {
+                key: "shortened",
+                fields: &shortened,
+                score: 100.0,
+            })
+            .unwrap();
+        assert_eq!(full.query_token_count, 3);
+        assert!(full.exact_whole_phrase_present);
+        assert!(!shortened.exact_whole_phrase_present);
+        assert_eq!(
+            full.exact_weighted_positional_coverage_vector
+                .distinct_coverage,
+            2
+        );
+        assert_eq!(
+            shortened
+                .exact_weighted_positional_coverage_vector
+                .distinct_coverage,
+            2
+        );
+        assert!(super::compare_matches(&full, &shortened).is_lt());
+    }
     use super::{
         MessageCandidate, MessageField, MessageQuery, PreparedMessageCandidate,
         contains_query_signal, sort_matches, sort_matches_with_model,
