@@ -51,12 +51,8 @@ pub(crate) fn exact_match_prepared<'a>(
     score: Score,
 ) -> Option<ExactPathMatch<'a>> {
     let evidence = ordered_path_evidence(prepared.normalized(), &keywords)?;
-    let exact_relevance = PathExactRelevance::with_normalized_path(
-        prepared.path(),
-        prepared.normalized_arc(),
-        keywords,
-    )
-    .with_ordered_compound_coverage(evidence.ordered_compound_coverage);
+    let exact_relevance = PathExactRelevance::with_prepared_path(prepared, keywords)
+        .with_ordered_compound_coverage(evidence.ordered_compound_coverage);
 
     Some(ExactPathMatch {
         path: prepared.path(),

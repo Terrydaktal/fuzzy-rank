@@ -1,10 +1,17 @@
-use std::{cell::OnceCell, ops::Range, path, sync::Arc};
+use std::{
+    cell::OnceCell,
+    ops::Range,
+    path,
+    sync::{Arc, OnceLock},
+};
+
+use smallvec::SmallVec;
 
 use crate::core::{
     exact_distinct_coverage_by, exact_phrase_present, exact_subphrase_counts_vector,
     increment_simple_position_vector,
 };
-use crate::text::{iter_path_tokens, split_path_tokens, to_lowercase};
+use crate::text::{iter_path_tokens, to_lowercase};
 
 pub mod fuzzy;
 pub mod literal;
@@ -37,23 +44,40 @@ pub(crate) fn path_depth(path: &str) -> usize {
 pub struct PreparedPath<'a> {
     path: &'a str,
     normalized: Arc<str>,
-    components: Vec<PreparedComponent>,
+    components: OnceLock<Arc<[PreparedComponent]>>,
 }
 
-#[derive(Clone, Debug)]
+impl PartialEq for PreparedPath<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.path == other.path && self.normalized == other.normalized
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
 struct PreparedComponent {
     range: Range<usize>,
-    tokens: Vec<Range<usize>>,
+    tokens: Vec<PreparedToken>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct PreparedToken {
+    normalized: Arc<str>,
+    range: Range<usize>,
+}
+
+impl AsRef<str> for PreparedToken {
+    fn as_ref(&self) -> &str {
+        &self.normalized[self.range.clone()]
+    }
 }
 
 impl<'a> PreparedPath<'a> {
     pub fn new(path: &'a str) -> Self {
         let normalized: Arc<str> = normalize_path(path).into();
-        let components = prepared_components(&normalized);
         Self {
             path,
             normalized,
-            components,
+            components: OnceLock::new(),
         }
     }
 
@@ -70,22 +94,27 @@ impl<'a> PreparedPath<'a> {
     }
 
     pub(crate) fn component_count(&self) -> usize {
-        self.components.len()
+        self.components().len()
     }
 
     pub(crate) fn component(&self, index: usize) -> &str {
-        &self.normalized[self.components[index].range.clone()]
+        &self.normalized[self.components()[index].range.clone()]
     }
 
     pub(crate) fn tokens(&self, component: usize) -> impl Iterator<Item = &str> + '_ {
-        self.components[component]
+        self.components()[component]
             .tokens
             .iter()
-            .map(|range| &self.normalized[range.clone()])
+            .map(AsRef::as_ref)
+    }
+
+    fn components(&self) -> &Arc<[PreparedComponent]> {
+        self.components
+            .get_or_init(|| prepared_components(&self.normalized).into())
     }
 }
 
-fn prepared_components(normalized: &str) -> Vec<PreparedComponent> {
+fn prepared_components(normalized: &Arc<str>) -> Vec<PreparedComponent> {
     let mut components = Vec::new();
     let mut component_start = None;
 
@@ -96,7 +125,13 @@ fn prepared_components(normalized: &str) -> Vec<PreparedComponent> {
         if path::is_separator(character) {
             if let Some(start) = component_start.take() {
                 let range = start..index;
-                let tokens = prepared_token_ranges(&normalized[range.clone()], start);
+                let tokens = prepared_token_ranges(&normalized[range.clone()], start)
+                    .into_iter()
+                    .map(|range| PreparedToken {
+                        normalized: Arc::clone(normalized),
+                        range,
+                    })
+                    .collect();
                 components.push(PreparedComponent { range, tokens });
             }
         } else if component_start.is_none() {
@@ -132,7 +167,7 @@ pub(crate) struct PathExactRelevance<'a> {
     path: &'a str,
     query_tokens: Arc<[String]>,
     normalized_path: Arc<str>,
-    component_tokens: OnceCell<Vec<Vec<String>>>,
+    components: Arc<[PreparedComponent]>,
     whole_basename_component: OnceCell<bool>,
     whole_component: OnceCell<bool>,
     whole_phrase: OnceCell<bool>,
@@ -142,16 +177,15 @@ pub(crate) struct PathExactRelevance<'a> {
 }
 
 impl<'a> PathExactRelevance<'a> {
-    pub(crate) fn with_normalized_path(
-        path: &'a str,
-        normalized_path: Arc<str>,
+    pub(crate) fn with_prepared_path(
+        prepared: &PreparedPath<'a>,
         query_tokens: Arc<[String]>,
     ) -> Self {
         Self {
-            path,
+            path: prepared.path,
             query_tokens,
-            normalized_path,
-            component_tokens: OnceCell::new(),
+            normalized_path: prepared.normalized_arc(),
+            components: Arc::clone(prepared.components()),
             whole_basename_component: OnceCell::new(),
             whole_component: OnceCell::new(),
             whole_phrase: OnceCell::new(),
@@ -168,27 +202,18 @@ impl<'a> PathExactRelevance<'a> {
         self
     }
 
-    fn component_tokens(&self) -> &[Vec<String>] {
-        self.component_tokens.get_or_init(|| {
-            self.normalized_path
-                .split(['/', '\\'])
-                .filter(|component| !component.is_empty())
-                .map(|component| {
-                    split_path_tokens(component)
-                        .into_iter()
-                        .map(str::to_owned)
-                        .collect()
-                })
-                .collect()
-        })
+    fn component_tokens(&self) -> impl Iterator<Item = &[PreparedToken]> {
+        self.components
+            .iter()
+            .map(|component| component.tokens.as_slice())
     }
 
     pub(crate) fn has_exact_token_signal(&self) -> bool {
-        let direct = self.component_tokens().iter().any(|component| {
+        let direct = self.component_tokens().any(|component| {
             component.iter().any(|candidate| {
                 self.query_tokens
                     .iter()
-                    .any(|query| candidate.contains(query))
+                    .any(|query| candidate.as_ref().contains(query))
             })
         });
         direct || self.ordered_compound_coverage() > 0
@@ -213,20 +238,14 @@ impl<'a> PathExactRelevance<'a> {
     }
 
     pub(crate) fn whole_phrase(&self) -> bool {
-        *self.whole_phrase.get_or_init(|| {
-            exact_phrase_present(
-                &self.query_tokens,
-                self.component_tokens().iter().map(Vec::as_slice),
-            )
-        })
+        *self
+            .whole_phrase
+            .get_or_init(|| exact_phrase_present(&self.query_tokens, self.component_tokens()))
     }
 
     pub(crate) fn run_vector(&self) -> &[usize] {
         self.run_vector.get_or_init(|| {
-            exact_subphrase_counts_vector(
-                &self.query_tokens,
-                self.component_tokens().iter().map(Vec::as_slice),
-            )
+            exact_subphrase_counts_vector(&self.query_tokens, self.component_tokens())
         })
     }
 
@@ -234,7 +253,7 @@ impl<'a> PathExactRelevance<'a> {
         *self.distinct_coverage.get_or_init(|| {
             exact_distinct_coverage_by(
                 &self.query_tokens,
-                self.component_tokens().iter().map(Vec::as_slice),
+                self.component_tokens(),
                 |query, candidate| candidate.contains(query),
             )
         })
@@ -443,25 +462,39 @@ pub(crate) fn compound_term_may_match_with_tokens(
     path_tokens: &[PathToken<'_>],
     query: &str,
 ) -> bool {
-    let mut remaining = query;
-    let mut fragments = 0;
-    for token in path_tokens {
-        if remaining.is_empty() {
-            break;
-        }
-        if let Some(next) = remaining.strip_prefix(token.text) {
-            remaining = next;
-            fragments += 1;
-            continue;
-        }
-        if remaining.chars().count() >= 2 && token.text.starts_with(remaining) {
-            remaining = "";
-            fragments += 1;
-            break;
+    let Some(first) = path_tokens
+        .iter()
+        .position(|token| query.starts_with(token.text))
+    else {
+        return false;
+    };
+    // Keep alternative prefixes instead of greedily committing to the first token.
+    // Values encode unreachable, no fragments, one fragment, or at least two.
+    let mut reachable = SmallVec::<[u8; 64]>::from_elem(0, query.len() + 1);
+    reachable[0] = 1;
+    for token in &path_tokens[first..] {
+        // Descending offsets prevent reusing the same candidate token twice.
+        for offset in (0..query.len()).rev() {
+            let fragments = reachable[offset];
+            if fragments == 0 {
+                continue;
+            }
+            let remaining = &query[offset..];
+            if let Some(next) = remaining.strip_prefix(token.text) {
+                if next.is_empty() && fragments >= 2 {
+                    return true;
+                }
+                let end = offset + token.text.len();
+                reachable[end] = reachable[end].max((fragments + 1).min(3));
+            } else if fragments >= 2
+                && remaining.chars().nth(1).is_some()
+                && token.text.starts_with(remaining)
+            {
+                return true;
+            }
         }
     }
-
-    remaining.is_empty() && fragments >= 2
+    false
 }
 
 fn select_direct_matches(path: &str, query_tokens: &[String]) -> Option<Vec<TermMatch>> {
@@ -773,4 +806,25 @@ fn position_penalty(path: &str, start: usize, len: usize) -> usize {
 
 fn is_path_token_separator(character: char) -> bool {
     matches!(character, '/' | '\\' | '-' | '_' | '.') || character.is_whitespace()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PreparedPath;
+
+    #[test]
+    fn lazy_preparation_preserves_thread_safety_and_equality() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<PreparedPath<'static>>();
+
+        let prepared = PreparedPath::new("/home/lewis/Dev/applicationlauncher");
+        let fresh = prepared.clone();
+        assert!(fresh.components.get().is_none());
+        assert_eq!(prepared.component_count(), 4);
+        assert_eq!(prepared, fresh);
+        assert_eq!(prepared, prepared.clone());
+        assert_eq!(fresh.component_count(), 4);
+        assert_eq!(prepared, fresh);
+        assert_ne!(prepared, PreparedPath::new("/home/lewis/Dev/chrome"));
+    }
 }

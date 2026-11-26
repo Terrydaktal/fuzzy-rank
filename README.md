@@ -768,6 +768,10 @@ ordered compound coverage, alignment and order quality, segment and position
 quality, caller score, typo operations, keyboard distance, candidate distance,
 ratio, path depth, and overall query signal.
 
+Alignment, typo, and insertion feature penalties read the worst-first vectors,
+not the first query token. For example `[0, 1000]` and `[1000, 0]` both export
+alignment quality `-1`; query order cannot accidentally hide the worse token.
+
 `PathRankModel` is a small native linear scorer over that vector. Callers can
 load and train weights without adding a runtime, process, or allocator to the
 matching path. `PathRankModel::baseline()` is a conservative starting point,
@@ -777,6 +781,44 @@ signals, model serialization, and the decision about which hard path rules may
 not be overridden. This keeps the generic matcher reusable while allowing a
 caller to rerank only a small high-recall candidate set.
 
+`PathMatch::compare_lexical()` exposes the shared path comparator prefix through
+exact evidence, alignment, query-token order, segment, and position. A
+personalized caller should partition candidates with this comparison before
+applying `PathRankModel`; model inference should only break lexical ties. This
+prevents sparse or early feedback from promoting an unrelated basename over a
+much closer typo match while still allowing learned ordering among genuinely
+equivalent path matches.
+
+### Query execution and caches
+
+`PreparedPath` shares its normalized path and token ranges with lazy exact
+evidence, rather than normalizing and copying tokens again for each ranking
+stage. Component/token ranges are constructed only on first use. `PathMatchScratch`
+can be reused for an entire query through
+`best_match_prepared_with_scratch` or `best_typo_match_prepared_with_scratch`.
+It retains edit buffers and memoizes repeated query-token/component/budget
+comparisons, including failed matches. Caches are bounded and invalidate when
+the query or edit budget changes; they do not persist between processes or
+inspect the filesystem.
+
+Single-token and multi-token path scans both memoize token choices, including
+failed matches. Fragmented alignment uses three rolling rows, retaining the same
+operation and position states without an entire candidate-by-query matrix. The
+last token of a compound partition is evaluated once, even when its alignment
+fails; earlier split points remain fully explored.
+
+`PathMatch::compare_after_lexical` exposes only the remaining tie-break keys.
+Callers may use it only after `compare_lexical` returned equal, so learned-score
+or preference layers can avoid repeating the already-tied lexical prefix without
+changing the final order.
+
+Every path execution strategy retains identical exact phrase/coverage evidence.
+The compatibility method `best_typo_match_prepared_without_exact` skips exact
+admission, not exact relevance. Internal token assignment and compound alignment
+selection use the shared final path comparator; raw edit distance cannot override
+alignment quality or reverse the descending position histogram. Search pruning
+uses lossless character-deficit bounds for admission and alignment quality,
+rather than the raw distance of the current winner or preferred token alignment.
 ### Field reranking features and feedback
 
 `fields::model` provides the corresponding learned layer for `fields::literal`

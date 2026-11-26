@@ -7,12 +7,15 @@ use crate::core::{
 };
 use crate::path::literal::exact_match_prepared;
 use crate::path::{PathExactRelevance, PreparedPath, Score, is_single_path_token};
-use crate::ranking::{PathTypoSortKey, compare_path_typo_sort_keys, path_typo_keys_are_ambiguous};
+use crate::ranking::{
+    PathTypoSortKey, compare_path_lexical_sort_keys, compare_path_typo_sort_keys,
+    compare_path_typo_tiebreak_sort_keys, path_typo_keys_are_ambiguous,
+};
 use crate::text::{split_path_tokens, to_lowercase};
 use crate::token_match::{
-    PositionedToken, TokenMatchScratch, aligned_token_distance, best_token_match,
-    best_token_match_chars_with_scratch, choose_path_token_match_with_scratch,
-    partitioned_token_distance,
+    PositionedToken, SequenceMatchScratch, SingleTokenMatchScratch, TokenMatchScratch,
+    aligned_token_distance_with_scratch, best_token_match, best_token_match_chars_with_scratch,
+    choose_path_token_match_with_scratch, partitioned_token_distance_with_scratch,
 };
 
 /// Number of scalar features exposed by the path reranker.
@@ -57,7 +60,7 @@ pub struct PathRankFeatures {
 
 impl PathRankFeatures {
     pub fn from_match(candidate: &PathMatch<'_>) -> Self {
-        let alignment = candidate.alignment_costs.aligned();
+        let alignment = candidate.alignment_costs.worst_first();
         let typo = candidate.typo_costs.worst_first();
         let insertions = candidate.insertions.worst_first();
         let segment_depth = candidate
@@ -255,6 +258,18 @@ impl<'a> PathMatch<'a> {
             .then_with(|| compare_path_typo_sort_keys(&self.sort_key(), &other.sort_key()))
     }
 
+    /// Compare only the structural and lexical path evidence that a learned
+    /// reranker must not override.
+    pub fn compare_lexical(&self, other: &Self) -> std::cmp::Ordering {
+        compare_exact_relevance(self, other)
+            .then_with(|| compare_path_lexical_sort_keys(&self.sort_key(), &other.sort_key()))
+    }
+
+    /// Compare the remaining keys only after `compare_lexical` has returned equal.
+    pub fn compare_after_lexical(&self, other: &Self) -> std::cmp::Ordering {
+        compare_path_typo_tiebreak_sort_keys(&self.sort_key(), &other.sort_key())
+    }
+
     pub fn exact_whole_phrase(&self) -> bool {
         self.exact_relevance
             .as_ref()
@@ -395,6 +410,10 @@ impl TypoQuery {
         normalized.chars().count() >= self.len.saturating_sub(self.limit)
     }
 
+    pub fn may_match_exact_prepared(&self, path: &PreparedPath<'_>) -> bool {
+        self.may_match_exact_normalized(path.normalized())
+    }
+
     fn may_match_exact_normalized(&self, normalized: &str) -> bool {
         self.keywords.iter().all(|keyword| {
             normalized.contains(keyword)
@@ -417,7 +436,16 @@ impl TypoQuery {
         score: Score,
     ) -> Option<PathMatch<'a>> {
         let mut scratch = PathMatchScratch::default();
-        best_match_with_prepared_path(prepared, score, self, &mut scratch)
+        self.best_match_prepared_with_scratch(prepared, score, &mut scratch)
+    }
+
+    pub fn best_match_prepared_with_scratch<'a>(
+        &self,
+        prepared: &PreparedPath<'a>,
+        score: Score,
+        scratch: &mut PathMatchScratch,
+    ) -> Option<PathMatch<'a>> {
+        best_match_with_prepared_path(prepared, score, self, scratch)
     }
 
     /// Matches only the exact path class without evaluating typo distance.
@@ -467,31 +495,20 @@ impl TypoQuery {
             self.token_count,
             &self.keywords,
             &self.query_chars,
-            &mut scratch.token,
+            scratch,
         )
         .map(|candidate| with_exact_relevance(candidate, Arc::clone(&self.keywords), prepared))
     }
 
+    /// Compatibility alias: skips exact admission, but retains lazy exact evidence
+    /// so the resulting rank is identical to other typo-matching APIs.
     pub fn best_typo_match_prepared_without_exact<'a>(
         &self,
         prepared: &PreparedPath<'a>,
         score: Score,
         scratch: &mut PathMatchScratch,
     ) -> Option<PathMatch<'a>> {
-        if !self.allow_typos || self.len <= 1 {
-            return None;
-        }
-        best_match_inner(
-            prepared,
-            score,
-            &self.text,
-            self.len,
-            self.limit,
-            self.token_count,
-            &self.keywords,
-            &self.query_chars,
-            &mut scratch.token,
-        )
+        self.best_typo_match_prepared_with_scratch(prepared, score, scratch)
     }
 
     pub fn best_basename_match<'a>(&self, path: &'a str, score: Score) -> Option<PathMatch<'a>> {
@@ -507,6 +524,8 @@ fn is_ascii_lowercase_path(path: &str) -> bool {
 #[derive(Default)]
 pub struct PathMatchScratch {
     token: TokenMatchScratch,
+    sequence: SequenceMatchScratch,
+    single: SingleTokenMatchScratch,
 }
 
 pub fn best_match<'a>(path: &'a str, score: Score, query: &str) -> Option<PathMatch<'a>> {
@@ -554,7 +573,7 @@ fn best_match_with_prepared_path<'a>(
             query.token_count,
             &query.keywords,
             &query.query_chars,
-            &mut scratch.token,
+            scratch,
         )?,
         None => return None,
     };
@@ -595,9 +614,8 @@ fn with_exact_relevance<'a>(
     query_tokens: Arc<[String]>,
     prepared: &PreparedPath<'a>,
 ) -> PathMatch<'a> {
-    candidate.exact_relevance = Some(PathExactRelevance::with_normalized_path(
-        candidate.path,
-        prepared.normalized_arc(),
+    candidate.exact_relevance = Some(PathExactRelevance::with_prepared_path(
+        prepared,
         query_tokens,
     ));
     candidate
@@ -647,7 +665,7 @@ fn best_match_inner<'a>(
     query_token_count: usize,
     query_tokens: &[String],
     query_chars: &[char],
-    scratch: &mut TokenMatchScratch,
+    scratch: &mut PathMatchScratch,
 ) -> Option<PathMatch<'a>> {
     let component_count = prepared.component_count();
     if component_count == 0 {
@@ -688,11 +706,11 @@ fn best_match_inner<'a>(
     );
     update_best(
         &mut best,
-        candidate_for_compound_component(&ctx, basename, 0),
+        candidate_for_compound_component(&mut ctx, basename, 0),
     );
     update_best(
         &mut best,
-        candidate_for_component_sequence(prepared, &ctx, component_count),
+        candidate_for_component_sequence(prepared, &mut ctx, component_count),
     );
 
     for idx in 0..basename_idx {
@@ -700,7 +718,7 @@ fn best_match_inner<'a>(
         let path_position = basename_idx - idx;
         update_best(
             &mut best,
-            candidate_for_compound_component(&ctx, component, path_position),
+            candidate_for_compound_component(&mut ctx, component, path_position),
         );
     }
     best
@@ -727,7 +745,7 @@ fn best_basename_match_inner<'a>(
         .into_iter()
         .map(str::to_owned)
         .collect::<Vec<_>>();
-    let mut token_scratch = TokenMatchScratch::default();
+    let mut token_scratch = PathMatchScratch::default();
     let mut ctx = MatchContext {
         path: prepared.path(),
         score,
@@ -764,7 +782,7 @@ fn best_match_single_token<'a>(
     component_count: usize,
     query_tokens: &[String],
     query_chars: &[char],
-    scratch: &mut TokenMatchScratch,
+    scratch: &mut PathMatchScratch,
 ) -> Option<PathMatch<'a>> {
     let basename_idx = component_count - 1;
     let basename = prepared.component(basename_idx);
@@ -781,10 +799,13 @@ fn best_match_single_token<'a>(
     };
 
     let mut best = candidate_for_single_token(&mut ctx, basename, 0);
-    if best
-        .as_ref()
-        .is_some_and(|candidate| candidate.distance <= 1)
-    {
+    if best.as_ref().is_some_and(|candidate| {
+        candidate
+            .alignment_costs
+            .worst_first()
+            .first()
+            .is_some_and(|cost| *cost <= 1_000)
+    }) {
         return best;
     }
     for token in prepared.tokens(basename_idx) {
@@ -792,10 +813,13 @@ fn best_match_single_token<'a>(
             update_best(&mut best, candidate_for_single_token(&mut ctx, token, 0));
         }
     }
-    if best
-        .as_ref()
-        .is_some_and(|candidate| candidate.distance <= 1)
-    {
+    if best.as_ref().is_some_and(|candidate| {
+        candidate
+            .alignment_costs
+            .worst_first()
+            .first()
+            .is_some_and(|cost| *cost <= 1_000)
+    }) {
         return best;
     }
 
@@ -843,7 +867,7 @@ struct MatchContext<'a, 'q> {
     token_count: usize,
     query_tokens: &'q [String],
     query_chars: &'q [char],
-    scratch: &'q mut TokenMatchScratch,
+    scratch: &'q mut PathMatchScratch,
 }
 
 fn candidate_for_single_token<'a>(
@@ -856,8 +880,10 @@ fn candidate_for_single_token<'a>(
     }
 
     let candidate_len = candidate.chars().count();
-    let matched =
-        choose_path_token_match_with_scratch(ctx.query_chars, candidate, ctx.limit, ctx.scratch)?;
+    let matched = ctx
+        .scratch
+        .single
+        .choice(ctx.query_chars, candidate, ctx.limit)?;
     let ratio = matched.distance as f64 / ctx.query_len.max(candidate_len) as f64;
     let minimum_breaks = usize::from(ctx.query_len.abs_diff(candidate_len) <= ctx.limit) + 1;
     if ratio > 0.5 || matched.fragmented && matched.internal_breaks < minimum_breaks {
@@ -1001,11 +1027,14 @@ fn candidate_for_token_sequence<'a>(
                 &query_chars,
                 candidate_token,
                 remaining,
-                ctx.scratch,
+                &mut ctx.scratch.token,
             )?;
         distance += cost;
         increment_simple_position_vector(&mut position, position_rank, 1);
-        let _ = penalty;
+        let token_operations = OperationProfile {
+            insertions: token_operations.insertions + penalty,
+            ..token_operations
+        };
         operations = operations.merge(token_operations);
         typo_costs.push(token_operations.core_typo_cost());
         insertion_costs.push(token_operations.insertions);
@@ -1035,7 +1064,7 @@ fn candidate_for_token_sequence<'a>(
 }
 
 fn candidate_for_compound_component<'a>(
-    ctx: &MatchContext<'a, '_>,
+    ctx: &mut MatchContext<'a, '_>,
     candidate: &str,
     path_position: usize,
 ) -> Option<PathMatch<'a>> {
@@ -1047,7 +1076,12 @@ fn candidate_for_compound_component<'a>(
 
     let query_token_refs = query_tokens.iter().map(String::as_str).collect::<Vec<_>>();
     let (distance, _structure, position, operations, typo_costs, insertion_costs, alignment_costs) =
-        partitioned_token_distance(&query_token_refs, candidate, ctx.limit)?;
+        partitioned_token_distance_with_scratch(
+            &query_token_refs,
+            candidate,
+            ctx.limit,
+            &mut ctx.scratch.sequence,
+        )?;
     let ratio = distance as f64 / ctx.query_len.max(candidate.chars().count()) as f64;
     if ratio > 0.5 {
         return None;
@@ -1079,8 +1113,12 @@ fn candidate_for_partitioned_single_query<'a>(
         return None;
     }
     let candidate_len = candidate.chars().count();
-    let matched =
-        choose_path_token_match_with_scratch(ctx.query_chars, candidate, ctx.limit, ctx.scratch)?;
+    let matched = choose_path_token_match_with_scratch(
+        ctx.query_chars,
+        candidate,
+        ctx.limit,
+        &mut ctx.scratch.token,
+    )?;
     let ratio = matched.distance as f64 / ctx.query_len.max(candidate_len) as f64;
     let minimum_breaks = usize::from(ctx.query_len.abs_diff(candidate_len) <= ctx.limit) + 1;
     if ratio > 0.5 || matched.fragmented && matched.internal_breaks < minimum_breaks {
@@ -1106,7 +1144,7 @@ fn candidate_for_partitioned_single_query<'a>(
 
 fn candidate_for_component_sequence<'a>(
     prepared: &PreparedPath<'a>,
-    ctx: &MatchContext<'a, '_>,
+    ctx: &mut MatchContext<'a, '_>,
     component_count: usize,
 ) -> Option<PathMatch<'a>> {
     let query_tokens = ctx.query_tokens;
@@ -1140,7 +1178,12 @@ fn candidate_for_component_sequence<'a>(
         typo_costs,
         insertion_costs,
         alignment_costs,
-    ) = aligned_token_distance(&query_token_refs, &candidate_tokens, ctx.limit)?;
+    ) = aligned_token_distance_with_scratch(
+        &query_token_refs,
+        &candidate_tokens,
+        ctx.limit,
+        &mut ctx.scratch.sequence,
+    )?;
     let ratio = distance as f64 / ctx.query_len as f64;
     if ratio > 0.5 {
         return None;
@@ -1223,6 +1266,77 @@ fn token_relative_match_shape(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn literal_gate_keeps_alternative_compound_prefixes() {
+        for (query, path) in [
+            ("ababcd", "/ab/aba/bcd"),
+            ("ababcd", "/ab/aba/bcdef"),
+            ("abbc", "/a/ab/bc"),
+            ("\u{e9}ab", "/\u{e9}/\u{e9}a/b"),
+        ] {
+            let query = TypoQuery::new(query).unwrap();
+            let prepared = query.prepare_path(path);
+            assert!(query.best_exact_match_prepared(&prepared, 0.0).is_some());
+            assert!(query.may_match_exact_prepared(&prepared), "{path}");
+        }
+    }
+
+    #[test]
+    fn prepared_execution_strategies_preserve_exact_evidence_and_features() {
+        let paths = [
+            "/audit/alpha/gamma",
+            "/audit/alpha/gamut",
+            "/audit/alphi/gamma",
+            "/home/lewis/Dev/applicationlauncher",
+        ];
+        let mut scratch = PathMatchScratch::default();
+        for text in [
+            "alpha gamam",
+            "gamam alpha",
+            "dev applaunch",
+            "applaunch",
+            "fuxxy",
+        ] {
+            let query = TypoQuery::new(text).unwrap();
+            for path in paths {
+                let prepared = query.prepare_path(path);
+                let normal = query.best_typo_match_prepared(&prepared, 3.0);
+                let fast =
+                    query.best_typo_match_prepared_without_exact(&prepared, 3.0, &mut scratch);
+                assert_eq!(normal.is_some(), fast.is_some(), "{text}: {path}");
+                if let (Some(normal), Some(fast)) = (normal, fast) {
+                    assert!(normal.compare(&fast).is_eq(), "{text}: {path}");
+                    assert_eq!(
+                        normal.rank_features(),
+                        fast.rank_features(),
+                        "{text}: {path}"
+                    );
+                    assert_eq!(
+                        normal.exact_distinct_coverage(),
+                        fast.exact_distinct_coverage()
+                    );
+                    assert_eq!(normal.operations, fast.operations);
+                }
+                let normal = query.best_match_prepared(&prepared, 3.0);
+                let cached = query.best_match_prepared_with_scratch(&prepared, 3.0, &mut scratch);
+                assert_eq!(
+                    normal.as_ref().map(PathMatch::rank_features),
+                    cached.as_ref().map(PathMatch::rank_features)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn model_alignment_feature_uses_worst_token_not_first_query_token() {
+        let first = best_match("/audit/alpha/gamma", 0.0, "alpha gamam").unwrap();
+        let second = best_match("/audit/alpha/gamma", 0.0, "gamam alpha").unwrap();
+        assert_eq!(first.alignment_costs.aligned(), &[0, 1000]);
+        assert_eq!(second.alignment_costs.aligned(), &[1000, 0]);
+        assert_eq!(first.rank_features().get(7), Some(-1.0));
+        assert_eq!(second.rank_features().get(7), Some(-1.0));
+    }
 
     #[test]
     fn typo_matches_basename() {
@@ -1469,6 +1583,19 @@ mod tests {
         assert_eq!(PATH_RANK_FEATURE_NAMES.len(), PATH_RANK_FEATURE_COUNT);
         assert!(features.get(11).unwrap() > 0.0);
         assert!(features.get(13).unwrap() < 0.0);
+    }
+
+    #[test]
+    fn lexical_comparison_protects_close_typos_from_unrelated_basename_matches() {
+        let zoxide = best_match("/home/lewis/repos/zoxide", 0.0, "zoxie").unwrap();
+        let unrelated =
+            best_match("/home/lewis/tasks/windowsvirtualmachine", 0.0, "zoxie").unwrap();
+        assert!(zoxide.compare_lexical(&unrelated).is_lt());
+
+        let qwen = best_match("/home/lewis/tasks/qwen", 0.0, "wqwen").unwrap();
+        let unrelated =
+            best_match("/home/lewis/tasks/tplinkwirelesstransmitter", 0.0, "wqwen").unwrap();
+        assert!(qwen.compare_lexical(&unrelated).is_lt());
     }
 
     #[test]

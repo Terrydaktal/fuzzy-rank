@@ -1,9 +1,11 @@
 use std::collections::HashMap;
 
 use crate::core::{
-    DamerauScratch, OperationProfile, alignment_cost_milli,
-    bounded_damerau_levenshtein_chars_with_scratch, increment_simple_position_vector, max_typos,
+    AlignmentCostVector, DamerauScratch, InsertionVector, OperationProfile, TypoCostVector,
+    alignment_cost_milli, bounded_damerau_levenshtein_chars_with_scratch,
+    increment_simple_position_vector, max_typos,
 };
+use crate::ranking::{PathTypoSortKey, compare_path_typo_sort_keys};
 
 #[derive(Clone, Copy)]
 pub struct PositionedToken<'a> {
@@ -24,6 +26,95 @@ pub(crate) struct TokenMatchScratch {
     candidate_chars: Vec<char>,
     damerau: DamerauScratch,
     fragmented: Vec<Vec<[Option<FragmentCost>; 5]>>,
+}
+
+#[derive(Default)]
+pub(crate) struct SingleTokenMatchScratch {
+    query: Vec<char>,
+    limit: usize,
+    choices: HashMap<String, Option<TokenChoice>>,
+    token: TokenMatchScratch,
+}
+
+impl SingleTokenMatchScratch {
+    pub(crate) fn choice(
+        &mut self,
+        query: &[char],
+        candidate: &str,
+        limit: usize,
+    ) -> Option<TokenChoice> {
+        if self.limit != limit || self.query != query {
+            self.query.clear();
+            self.query.extend_from_slice(query);
+            self.limit = limit;
+            self.choices.clear();
+        }
+        if let Some(choice) = self.choices.get(candidate) {
+            return *choice;
+        }
+        let choice = choose_path_token_match_with_scratch(query, candidate, limit, &mut self.token);
+        if self.choices.len() < 8192 {
+            self.choices.insert(candidate.to_owned(), choice);
+        }
+        choice
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct SequenceMatchScratch {
+    query: Vec<String>,
+    query_chars: Vec<Vec<char>>,
+    limit: usize,
+    choices: HashMap<String, HashMap<(usize, usize), Option<TokenChoice>>>,
+    compounds: HashMap<String, Option<PartitionedTokenDistance>>,
+    partitions: HashMap<(usize, usize, usize), Option<PartitionedTokenDistance>>,
+    boundaries: Vec<usize>,
+    token: TokenMatchScratch,
+}
+
+impl SequenceMatchScratch {
+    fn prepare(&mut self, query: &[&str], limit: usize) {
+        if self.limit == limit
+            && self
+                .query
+                .iter()
+                .map(String::as_str)
+                .eq(query.iter().copied())
+        {
+            return;
+        }
+        self.query = query.iter().map(|token| (*token).to_owned()).collect();
+        self.query_chars = query.iter().map(|token| token.chars().collect()).collect();
+        self.limit = limit;
+        self.choices.clear();
+        self.compounds.clear();
+    }
+
+    fn choice(&mut self, query_idx: usize, candidate: &str, limit: usize) -> Option<TokenChoice> {
+        let key = (query_idx, limit);
+        if let Some(choice) = self
+            .choices
+            .get(candidate)
+            .and_then(|choices| choices.get(&key))
+        {
+            return *choice;
+        }
+        let choice = choose_path_token_match_with_scratch(
+            &self.query_chars[query_idx],
+            candidate,
+            limit,
+            &mut self.token,
+        );
+        if let Some(choices) = self.choices.get_mut(candidate) {
+            choices.insert(key, choice);
+        } else if self.choices.len() < 8192 {
+            self.choices
+                .entry(candidate.to_owned())
+                .or_default()
+                .insert(key, choice);
+        }
+        choice
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -171,23 +262,48 @@ pub fn aligned_token_distance(
     candidate_tokens: &[PositionedToken<'_>],
     limit: usize,
 ) -> Option<AlignedTokenDistance> {
+    aligned_token_distance_with_scratch(
+        query_tokens,
+        candidate_tokens,
+        limit,
+        &mut SequenceMatchScratch::default(),
+    )
+}
+
+pub(crate) fn aligned_token_distance_with_scratch(
+    query_tokens: &[&str],
+    candidate_tokens: &[PositionedToken<'_>],
+    limit: usize,
+    scratch: &mut SequenceMatchScratch,
+) -> Option<AlignedTokenDistance> {
     if candidate_tokens.len() < query_tokens.len() {
         return None;
     }
 
+    scratch.prepare(query_tokens, limit);
+    let mut edit_bounds = Vec::with_capacity(candidate_tokens.len() * query_tokens.len());
+    for candidate in candidate_tokens {
+        scratch.token.candidate_chars.clear();
+        scratch
+            .token
+            .candidate_chars
+            .extend(candidate.token.chars());
+        for query in &scratch.query_chars {
+            edit_bounds.push(character_deficit_lower_bound(
+                query,
+                &scratch.token.candidate_chars,
+            ));
+        }
+    }
     let mut search = AssignmentSearch {
         query_tokens,
-        query_chars: query_tokens
-            .iter()
-            .map(|token| token.chars().collect())
-            .collect(),
         candidate_tokens,
         limit,
         best: None,
         assignment: Vec::with_capacity(query_tokens.len()),
         used: vec![false; query_tokens.len()],
-        pair_cache: HashMap::new(),
-        scratch: TokenMatchScratch::default(),
+        edit_bounds,
+        scratch,
     };
     for start in 0..=candidate_tokens.len() - query_tokens.len() {
         search.search_window(start);
@@ -199,19 +315,18 @@ pub fn aligned_token_distance(
     search.best
 }
 
-struct AssignmentSearch<'a> {
+struct AssignmentSearch<'a, 's> {
     query_tokens: &'a [&'a str],
-    query_chars: Vec<Vec<char>>,
     candidate_tokens: &'a [PositionedToken<'a>],
     limit: usize,
     best: Option<AlignedTokenDistance>,
     assignment: Vec<usize>,
     used: Vec<bool>,
-    pair_cache: HashMap<(usize, usize, usize), Option<TokenChoice>>,
-    scratch: TokenMatchScratch,
+    edit_bounds: Vec<usize>,
+    scratch: &'s mut SequenceMatchScratch,
 }
 
-impl<'a> AssignmentSearch<'a> {
+impl AssignmentSearch<'_, '_> {
     fn search_window(&mut self, start: usize) {
         let len = self.query_tokens.len();
         self.assignment.clear();
@@ -278,13 +393,15 @@ impl<'a> AssignmentSearch<'a> {
             return;
         }
 
-        let Some(lower_bound) = self.distance_lower_bound(window_start, query_idx, distance) else {
+        let Some((distance_bound, alignment_bound)) =
+            self.lower_bound(window_start, query_idx, distance, alignment_costs)
+        else {
             return;
         };
-        if self
-            .best
-            .as_ref()
-            .is_some_and(|current| lower_bound > current.0)
+        if distance_bound > self.limit
+            || self.best.as_ref().is_some_and(|current| {
+                alignment_bound > AlignmentCostVector::from_slice(&current.9)
+            })
         {
             return;
         }
@@ -371,48 +488,46 @@ impl<'a> AssignmentSearch<'a> {
         candidate_idx: usize,
         limit: usize,
     ) -> Option<TokenChoice> {
-        let key = (query_idx, window_start + candidate_idx, limit);
-        if let Some(choice) = self.pair_cache.get(&key) {
-            return *choice;
-        }
-        let choice = choose_path_token_match_with_scratch(
-            &self.query_chars[query_idx],
+        self.scratch.choice(
+            query_idx,
             self.candidate_tokens[window_start + candidate_idx].token,
             limit,
-            &mut self.scratch,
-        );
-        self.pair_cache.insert(key, choice);
-        choice
+        )
     }
 
-    fn distance_lower_bound(
-        &mut self,
+    fn lower_bound(
+        &self,
         window_start: usize,
         query_idx: usize,
         distance: usize,
-    ) -> Option<usize> {
+        alignment_costs: &[usize],
+    ) -> Option<(usize, AlignmentCostVector)> {
         let mut lower_bound = distance;
+        let mut alignment_bound = smallvec::SmallVec::<[usize; 8]>::from_slice(alignment_costs);
         for query_idx in query_idx..self.query_tokens.len() {
-            let mut min_cost: Option<usize> = None;
-            for candidate_idx in 0..self.query_tokens.len() {
-                if self.used[candidate_idx] {
-                    continue;
-                }
-                if let Some(choice) = self.choice(
-                    window_start,
-                    query_idx,
-                    candidate_idx,
-                    self.limit.saturating_sub(distance),
-                ) {
-                    min_cost = Some(
-                        min_cost.map_or(choice.distance, |current| current.min(choice.distance)),
-                    );
-                }
-            }
-            let min_cost = min_cost?;
+            // A preferred alignment can consume more edits than another valid
+            // alignment. Only unavoidable missing characters are a safe bound.
+            let min_cost = (0..self.query_tokens.len())
+                .filter(|candidate_idx| !self.used[*candidate_idx])
+                .map(|candidate_idx| {
+                    self.edit_bounds
+                        [(window_start + candidate_idx) * self.query_tokens.len() + query_idx]
+                })
+                .min()?;
             lower_bound = lower_bound.checked_add(min_cost)?;
+            alignment_bound.push(alignment_cost_milli(
+                OperationProfile {
+                    deletions: min_cost,
+                    ..OperationProfile::default()
+                },
+                false,
+                0,
+            ));
         }
-        Some(lower_bound)
+        Some((
+            lower_bound,
+            AlignmentCostVector::from_slice(&alignment_bound),
+        ))
     }
 
     fn is_perfect(&self, query_len: usize) -> bool {
@@ -435,17 +550,75 @@ fn aligned_match_cmp(
     left: &AlignedTokenDistance,
     right: &AlignedTokenDistance,
 ) -> std::cmp::Ordering {
-    left.0
-        .cmp(&right.0)
-        .then_with(|| left.1.cmp(&right.1))
-        .then_with(|| right.2.cmp(&left.2))
-        .then_with(|| left.3.cmp(&right.3))
-        .then_with(|| left.4.cmp(&right.4))
-        .then_with(|| left.5.cmp(&right.5))
-        .then_with(|| left.6.cmp(&right.6))
-        .then_with(|| left.7.cmp(&right.7))
-        .then_with(|| left.8.cmp(&right.8))
-        .then_with(|| left.9.cmp(&right.9))
+    compare_alignments(
+        AlignmentView {
+            distance: left.0,
+            order: left.1,
+            segment: &left.2,
+            position: &left.3,
+            operations: left.6,
+            typos: &left.7,
+            insertions: &left.8,
+            alignment: &left.9,
+        },
+        AlignmentView {
+            distance: right.0,
+            order: right.1,
+            segment: &right.2,
+            position: &right.3,
+            operations: right.6,
+            typos: &right.7,
+            insertions: &right.8,
+            alignment: &right.9,
+        },
+    )
+}
+
+struct AlignmentView<'a> {
+    distance: usize,
+    order: usize,
+    segment: &'a [usize],
+    position: &'a [usize; 3],
+    operations: OperationProfile,
+    typos: &'a [usize],
+    insertions: &'a [usize],
+    alignment: &'a [usize],
+}
+
+fn compare_alignments(left: AlignmentView<'_>, right: AlignmentView<'_>) -> std::cmp::Ordering {
+    let left_alignment = AlignmentCostVector::from_slice(left.alignment);
+    let right_alignment = AlignmentCostVector::from_slice(right.alignment);
+    let left_typos = TypoCostVector::from_slice(left.typos);
+    let right_typos = TypoCostVector::from_slice(right.typos);
+    let left_insertions = InsertionVector::from_slice(left.insertions);
+    let right_insertions = InsertionVector::from_slice(right.insertions);
+    compare_path_typo_sort_keys(
+        &PathTypoSortKey {
+            distance: left.distance,
+            order_distance: left.order,
+            operations: left.operations,
+            alignment_costs: &left_alignment,
+            typo_costs: &left_typos,
+            insertions: &left_insertions,
+            segment: left.segment,
+            position: left.position,
+            score: 0.0,
+            key: "",
+        },
+        &PathTypoSortKey {
+            distance: right.distance,
+            order_distance: right.order,
+            operations: right.operations,
+            alignment_costs: &right_alignment,
+            typo_costs: &right_typos,
+            insertions: &right_insertions,
+            segment: right.segment,
+            position: right.position,
+            score: 0.0,
+            key: "",
+        },
+    )
+    .then_with(|| left.distance.cmp(&right.distance))
 }
 
 pub fn partitioned_token_distance(
@@ -453,29 +626,50 @@ pub fn partitioned_token_distance(
     candidate: &str,
     limit: usize,
 ) -> Option<PartitionedTokenDistance> {
-    let mut boundaries: Vec<usize> = candidate.char_indices().map(|(idx, _)| idx).collect();
-    boundaries.push(candidate.len());
-    if boundaries.len() <= query_tokens.len() {
+    partitioned_token_distance_with_scratch(
+        query_tokens,
+        candidate,
+        limit,
+        &mut SequenceMatchScratch::default(),
+    )
+}
+
+pub(crate) fn partitioned_token_distance_with_scratch(
+    query_tokens: &[&str],
+    candidate: &str,
+    limit: usize,
+    scratch: &mut SequenceMatchScratch,
+) -> Option<PartitionedTokenDistance> {
+    scratch.prepare(query_tokens, limit);
+    if let Some(cached) = scratch.compounds.get(candidate) {
+        return cached.clone();
+    }
+    scratch.boundaries.clear();
+    scratch
+        .boundaries
+        .extend(candidate.char_indices().map(|(idx, _)| idx));
+    scratch.boundaries.push(candidate.len());
+    if scratch.boundaries.len() <= query_tokens.len() {
         return None;
     }
-
-    let query_chars = query_tokens
-        .iter()
-        .map(|token| token.chars().collect::<Vec<_>>())
-        .collect::<Vec<_>>();
-    let mut cache = HashMap::new();
-    let mut scratch = TokenMatchScratch::default();
-    partitioned_token_distance_impl(
+    scratch.partitions.clear();
+    let result = partitioned_token_distance_impl(
         query_tokens,
-        &query_chars,
+        &scratch.query_chars,
         candidate,
-        &boundaries,
+        &scratch.boundaries,
         0,
         0,
         limit,
-        &mut cache,
-        &mut scratch,
-    )
+        &mut scratch.partitions,
+        &mut scratch.token,
+    );
+    if scratch.compounds.len() < 8192 {
+        scratch
+            .compounds
+            .insert(candidate.to_owned(), result.clone());
+    }
+    result
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -497,6 +691,11 @@ fn partitioned_token_distance_impl(
     let last_token = token_idx + 1 == query_tokens.len();
     let min_end_boundary = start_boundary + 1;
     let max_end_boundary = boundaries.len() - (query_tokens.len() - token_idx);
+    let min_end_boundary = if last_token {
+        max_end_boundary
+    } else {
+        min_end_boundary
+    };
     let mut best: Option<PartitionedTokenDistance> = None;
 
     for end_boundary in min_end_boundary..=max_end_boundary {
@@ -527,6 +726,10 @@ fn partitioned_token_distance_impl(
         let mut position = [0; 3];
         increment_simple_position_vector(&mut position, position_rank, 1);
         let alignment_cost = alignment_cost_milli(operations, false, 0);
+        let operations = OperationProfile {
+            insertions: operations.insertions + structure,
+            ..operations
+        };
         let total = if last_token {
             (
                 cost,
@@ -583,16 +786,29 @@ fn partitioned_token_distance_impl(
         best = Some(match best {
             None => total,
             Some(current)
-                if total
-                    .0
-                    .cmp(&current.0)
-                    .then_with(|| total.1.cmp(&current.1))
-                    .then_with(|| current.2.cmp(&total.2))
-                    .then_with(|| total.3.cmp(&current.3))
-                    .then_with(|| total.4.cmp(&current.4))
-                    .then_with(|| total.5.cmp(&current.5))
-                    .then_with(|| total.6.cmp(&current.6))
-                    .is_lt() =>
+                if compare_alignments(
+                    AlignmentView {
+                        distance: total.0,
+                        order: 0,
+                        segment: &[],
+                        position: &total.2,
+                        operations: total.3,
+                        typos: &total.4,
+                        insertions: &total.5,
+                        alignment: &total.6,
+                    },
+                    AlignmentView {
+                        distance: current.0,
+                        order: 0,
+                        segment: &[],
+                        position: &current.2,
+                        operations: current.3,
+                        typos: &current.4,
+                        insertions: &current.5,
+                        alignment: &current.6,
+                    },
+                )
+                .is_lt() =>
             {
                 total
             }
@@ -762,7 +978,8 @@ fn fragmented_token_match_chars(
     }
 
     let dp = &mut scratch.fragmented;
-    dp.resize_with(n + 1, || vec![[None; 5]; m + 1]);
+    // Only the current row and the next two rows are reachable (including transpositions).
+    dp.resize_with(3, || vec![[None; 5]; m + 1]);
     for row in dp.iter_mut() {
         row.resize(m + 1, [None; 5]);
         row.fill([None; 5]);
@@ -796,7 +1013,7 @@ fn fragmented_token_match_chars(
     for i in 0..=n {
         for j in 0..=m {
             for state_idx in 0..5 {
-                let Some(cost) = dp[i][j][state_idx] else {
+                let Some(cost) = dp[i % 3][j][state_idx] else {
                     continue;
                 };
 
@@ -824,7 +1041,7 @@ fn fragmented_token_match_chars(
                         _ => State::GapStartNonZero,
                     };
                     update(
-                        &mut dp[i + 1][j][next_state as usize],
+                        &mut dp[(i + 1) % 3][j][next_state as usize],
                         next,
                         next_state as usize,
                     );
@@ -846,7 +1063,7 @@ fn fragmented_token_match_chars(
                         _ => State::GapStartNonZero,
                     };
                     update(
-                        &mut dp[i][j + 1][next_state as usize],
+                        &mut dp[i % 3][j + 1][next_state as usize],
                         next,
                         next_state as usize,
                     );
@@ -869,7 +1086,7 @@ fn fragmented_token_match_chars(
                         _ => State::InRunStartNonZero,
                     };
                     update(
-                        &mut dp[i + 1][j + 1][next_state as usize],
+                        &mut dp[(i + 1) % 3][j + 1][next_state as usize],
                         next,
                         next_state as usize,
                     );
@@ -892,12 +1109,15 @@ fn fragmented_token_match_chars(
                         _ => State::InRunStartNonZero,
                     };
                     update(
-                        &mut dp[i + 2][j + 2][next_state as usize],
+                        &mut dp[(i + 2) % 3][j + 2][next_state as usize],
                         next,
                         next_state as usize,
                     );
                 }
             }
+        }
+        if i < n {
+            dp[i % 3].fill([None; 5]);
         }
     }
 
@@ -909,7 +1129,7 @@ fn fragmented_token_match_chars(
     ]
     .into_iter()
     .filter_map(|state| {
-        dp[n][m][state]
+        dp[n % 3][m][state]
             .filter(|cost| cost.internal_breaks > 0)
             .map(|cost| (state, cost))
     })
@@ -947,8 +1167,234 @@ fn character_deficit_lower_bound(query: &[char], candidate: &[char]) -> usize {
 }
 
 #[cfg(test)]
+#[path = "token_match/fragmented_reference.rs"]
+mod fragmented_reference;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rolling_fragmented_alignment_agrees_with_full_matrix() {
+        let words = [
+            "", "a", "b", "ab", "ba", "aa", "aab", "abb", "\u{e9}a", "a\u{e9}", "abca", "aabc",
+        ];
+        let mut actual = TokenMatchScratch::default();
+        let mut reference = TokenMatchScratch::default();
+        for query in words {
+            let chars: Vec<_> = query.chars().collect();
+            for candidate in words {
+                for limit in [0, 1, 2, 4] {
+                    assert_eq!(
+                        fragmented_token_match_chars(&chars, candidate, limit, &mut actual),
+                        fragmented_reference::fragmented_token_match_reference(
+                            &chars,
+                            candidate,
+                            limit,
+                            &mut reference
+                        ),
+                        "query={query:?} candidate={candidate:?} limit={limit}"
+                    );
+                    assert!(actual.fragmented.len() <= 3);
+                }
+            }
+        }
+        for (query, candidate) in [
+            ("applaunch", "applicationlauncher"),
+            ("list", "unsplash"),
+            ("splyush", "unsplash"),
+            ("appliatoin", "applicationlauncher"),
+            ("abcabc", "xabcabcy"),
+        ] {
+            let chars: Vec<_> = query.chars().collect();
+            for limit in [0, 1, 3, 7] {
+                assert_eq!(
+                    fragmented_token_match_chars(&chars, candidate, limit, &mut actual),
+                    fragmented_reference::fragmented_token_match_reference(
+                        &chars,
+                        candidate,
+                        limit,
+                        &mut reference
+                    )
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn single_token_cache_is_query_and_budget_scoped() {
+        let mut cached = SingleTokenMatchScratch::default();
+        for query in ["app", "fuxxy", "applaunch", "app", "\u{e9}a"] {
+            let chars: Vec<_> = query.chars().collect();
+            for limit in [0, 2, 6, 2] {
+                for candidate in ["applicationlauncher", "fuzzy", "home", "\u{e9}a", "xxxx"] {
+                    let expected = choose_path_token_match(query, candidate, limit);
+                    for _ in 0..2 {
+                        assert_eq!(cached.choice(&chars, candidate, limit), expected);
+                    }
+                }
+            }
+        }
+        assert!(cached.choices.contains_key("xxxx"));
+    }
+
+    #[test]
+    fn alignment_pruning_agrees_with_exhaustive_two_token_assignments() {
+        for tokens in [
+            [
+                "xapp",
+                "launch",
+                "application",
+                "launch",
+                "dev",
+                "applaunch",
+            ],
+            ["alpha", "gamam", "gamut", "alphi", "gamma", "applications"],
+            ["very", "good", "verygood", "good", "goood", "vry"],
+        ] {
+            let candidates: Vec<_> = tokens
+                .iter()
+                .enumerate()
+                .map(|(index, token)| PositionedToken {
+                    token,
+                    segment: (index / 2) % 2,
+                })
+                .collect();
+            for query in [
+                ["apq", "launch"],
+                ["dev", "applaunch"],
+                ["alpha", "gamam"],
+                ["very", "good"],
+            ] {
+                for limit in [0, 1, 2, 4, 6] {
+                    let mut expected: Option<AlignedTokenDistance> = None;
+                    for start in 0..candidates.len() - 1 {
+                        for order in [[0, 1], [1, 0]] {
+                            let Some(first) = choose_path_token_match(
+                                query[0],
+                                candidates[start + order[0]].token,
+                                limit,
+                            ) else {
+                                continue;
+                            };
+                            let Some(second) = choose_path_token_match(
+                                query[1],
+                                candidates[start + order[1]].token,
+                                limit - first.distance,
+                            ) else {
+                                continue;
+                            };
+                            let mut segment = vec![0; 2];
+                            for offset in order {
+                                segment[candidates[start + offset].segment] += 1;
+                            }
+                            while segment.last() == Some(&0) {
+                                segment.pop();
+                            }
+                            let mut position = [0; 3];
+                            for matched in [first, second] {
+                                increment_simple_position_vector(
+                                    &mut position,
+                                    matched.position_rank,
+                                    1,
+                                );
+                            }
+                            let total = (
+                                first.distance + second.distance,
+                                usize::from(order[0] > order[1]),
+                                segment,
+                                position,
+                                first.internal_breaks + second.internal_breaks,
+                                first.penalty + second.penalty,
+                                first.operations.merge(second.operations),
+                                vec![
+                                    first.operations.core_typo_cost(),
+                                    second.operations.core_typo_cost(),
+                                ],
+                                vec![first.operations.insertions, second.operations.insertions],
+                                vec![first.alignment_cost, second.alignment_cost],
+                            );
+                            if expected
+                                .as_ref()
+                                .is_none_or(|best| aligned_match_cmp(&total, best).is_lt())
+                            {
+                                expected = Some(total);
+                            }
+                        }
+                    }
+                    let actual = aligned_token_distance(&query, &candidates, limit);
+                    assert_eq!(
+                        actual.is_some(),
+                        expected.is_some(),
+                        "{query:?} {tokens:?} limit={limit}"
+                    );
+                    if let (Some(actual), Some(expected)) = (actual, expected) {
+                        assert!(
+                            aligned_match_cmp(&actual, &expected).is_eq(),
+                            "{query:?} {tokens:?} limit={limit}: {actual:?} != {expected:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn alignment_uses_final_path_position_order() {
+        let tokens: Vec<_> = ["xapp", "launch", "application", "launch"]
+            .into_iter()
+            .map(|token| PositionedToken { token, segment: 0 })
+            .collect();
+        let matched = aligned_token_distance(&["apq", "launch"], &tokens, 4).unwrap();
+        assert_eq!(matched.9, vec![1000, 0]);
+        assert_eq!(matched.3, [2, 0, 0]);
+    }
+
+    #[test]
+    fn sequence_caches_preserve_results_across_queries_and_budgets() {
+        let mut scratch = SequenceMatchScratch::default();
+        let candidates = [
+            "applicationlauncher",
+            "gamam",
+            "launch",
+            "verygood",
+            "fuzzy-rank",
+            "\u{e9}l\u{e9}phant",
+        ];
+        let tokens: Vec<_> = candidates
+            .iter()
+            .enumerate()
+            .map(|(segment, token)| PositionedToken { token, segment })
+            .collect();
+        for query in [
+            ["app", "launch"],
+            ["alpha", "gamam"],
+            ["dev", "applaunch"],
+            ["apq", "launch"],
+            ["app", "launch"],
+        ] {
+            for limit in [4, 1, 0, 6, 4] {
+                for candidate in candidates {
+                    let expected = partitioned_token_distance(&query, candidate, limit);
+                    for _ in 0..2 {
+                        assert_eq!(
+                            partitioned_token_distance_with_scratch(
+                                &query,
+                                candidate,
+                                limit,
+                                &mut scratch
+                            ),
+                            expected
+                        );
+                    }
+                }
+                assert_eq!(
+                    aligned_token_distance_with_scratch(&query, &tokens, limit, &mut scratch),
+                    aligned_token_distance(&query, &tokens, limit)
+                );
+            }
+        }
+    }
 
     #[test]
     fn contiguous_transposition_beats_fragmented_application_alignment() {

@@ -252,12 +252,27 @@ pub fn compare_path_typo_sort_keys(
     left: &PathTypoSortKey<'_>,
     right: &PathTypoSortKey<'_>,
 ) -> Ordering {
+    compare_path_lexical_sort_keys(left, right)
+        .then_with(|| compare_path_typo_tiebreak_sort_keys(left, right))
+}
+
+pub fn compare_path_lexical_sort_keys(
+    left: &PathTypoSortKey<'_>,
+    right: &PathTypoSortKey<'_>,
+) -> Ordering {
     left.alignment_costs
         .cmp(right.alignment_costs)
         .then_with(|| left.order_distance.cmp(&right.order_distance))
         .then_with(|| right.segment.cmp(left.segment))
         .then_with(|| right.position.cmp(left.position))
-        .then_with(|| compare_score_desc(left.score, right.score))
+}
+
+/// Compare only the keys below the lexical prefix, which must already be tied.
+pub fn compare_path_typo_tiebreak_sort_keys(
+    left: &PathTypoSortKey<'_>,
+    right: &PathTypoSortKey<'_>,
+) -> Ordering {
+    compare_score_desc(left.score, right.score)
         .then_with(|| left.typo_costs.cmp(right.typo_costs))
         .then_with(|| left.insertions.cmp(right.insertions))
         .then_with(|| path_depth(left.key).cmp(&path_depth(right.key)))
@@ -268,13 +283,13 @@ pub fn path_typo_keys_are_ambiguous(
     left: &PathTypoSortKey<'_>,
     right: &PathTypoSortKey<'_>,
 ) -> bool {
-    left.alignment_costs == right.alignment_costs
-        && left.typo_costs == right.typo_costs
+    left.alignment_costs.cmp(right.alignment_costs).is_eq()
+        && left.typo_costs.cmp(right.typo_costs).is_eq()
         && left.order_distance == right.order_distance
         && left.segment == right.segment
         && left.position == right.position
         && left.score.total_cmp(&right.score).is_eq()
-        && left.insertions == right.insertions
+        && left.insertions.cmp(right.insertions).is_eq()
 }
 
 #[cfg(test)]
@@ -300,6 +315,32 @@ mod tests {
             score: 0.0,
             key: "/same/depth",
         }
+    }
+
+    #[test]
+    fn ambiguity_uses_sorted_vector_values_not_query_order() {
+        let left_alignment = AlignmentCostVector::from_slice(&[0, 1000]);
+        let right_alignment = AlignmentCostVector::from_slice(&[1000, 0]);
+        let left_typos = TypoCostVector::from_slice(&[0, 6]);
+        let right_typos = TypoCostVector::from_slice(&[6, 0]);
+        let left_insertions = InsertionVector::from_slice(&[0, 1]);
+        let right_insertions = InsertionVector::from_slice(&[1, 0]);
+        let left = path_key(
+            &[2],
+            &[2, 0, 0],
+            &left_alignment,
+            &left_typos,
+            &left_insertions,
+        );
+        let right = path_key(
+            &[2],
+            &[2, 0, 0],
+            &right_alignment,
+            &right_typos,
+            &right_insertions,
+        );
+        assert!(compare_path_typo_sort_keys(&left, &right).is_eq());
+        assert!(path_typo_keys_are_ambiguous(&left, &right));
     }
 
     #[test]
