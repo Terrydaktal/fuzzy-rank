@@ -345,6 +345,8 @@ pub(crate) fn single_term_path_evidence(
             exact_token_prefix,
         )
     } else {
+        // A compound consumes at least two nonempty path tokens.
+        query.chars().nth(1)?;
         let tokens = path_tokens(normalized_path);
         let mut options = compound_options(normalized_path, &tokens, query, normalized_path.len())
             .collect::<Vec<_>>();
@@ -733,6 +735,7 @@ fn direct_term_match(path: &str, start: usize, len: usize) -> TermMatch {
 pub(crate) fn path_tokens(path: &str) -> Vec<PathToken<'_>> {
     let mut tokens = Vec::new();
     let mut token_start = None;
+    let mut segment = path.chars().filter(|ch| path::is_separator(*ch)).count();
     for (index, character) in path.char_indices() {
         if is_path_token_separator(character) {
             if let Some(start) = token_start.take() {
@@ -740,9 +743,10 @@ pub(crate) fn path_tokens(path: &str) -> Vec<PathToken<'_>> {
                     text: &path[start..index],
                     start,
                     end: index,
-                    segment: path_segment_class(path, start),
+                    segment,
                 });
             }
+            segment -= usize::from(path::is_separator(character));
         } else if token_start.is_none() {
             token_start = Some(index);
         }
@@ -752,7 +756,7 @@ pub(crate) fn path_tokens(path: &str) -> Vec<PathToken<'_>> {
             text: &path[start..],
             start,
             end: path.len(),
-            segment: path_segment_class(path, start),
+            segment,
         });
     }
     tokens
@@ -810,7 +814,25 @@ fn is_path_token_separator(character: char) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::PreparedPath;
+    use super::{PreparedPath, path_segment_class, path_tokens};
+
+    #[test]
+    fn token_segment_counts_follow_platform_separators() {
+        for path in [
+            "/foo-bar//baz/",
+            "\\foo\\bar.baz\\",
+            "/\u{e9}\u{2003}x/a_b/c",
+        ] {
+            for token in path_tokens(path) {
+                assert_eq!(
+                    token.segment,
+                    path_segment_class(path, token.start),
+                    "{path}"
+                );
+                assert_eq!(token.text, &path[token.start..token.end]);
+            }
+        }
+    }
 
     #[test]
     fn lazy_preparation_preserves_thread_safety_and_equality() {

@@ -102,6 +102,19 @@ impl PreparedBulkPath {
     ) -> Option<BulkPathMatch<'a>> {
         exact_match_prepared(path, self, query, score)
     }
+
+    /// A necessary condition for a literal or compound match of these terms,
+    /// or of a longer query with the same leading characters.
+    pub fn contains_ordered_query_chars(&self, path: &str, terms: &[String]) -> bool {
+        let mut remaining = self.normalized(path);
+        for character in terms.iter().flat_map(|term| term.chars()) {
+            let Some(index) = remaining.find(character) else {
+                return false;
+            };
+            remaining = &remaining[index + character.len_utf8()..];
+        }
+        true
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -247,6 +260,15 @@ fn exact_match_single_term<'a>(
 
     let mut position = [0; 3];
     position[evidence.position.min(2)] = 1;
+    let mut components = prepared
+        .normalized(path)
+        .rsplit(['/', '\\'])
+        .filter(|component| !component.is_empty());
+    let matches_component =
+        |component: &str| component.trim_matches(crate::path::is_path_token_separator) == keyword;
+    let is_token = crate::path::is_single_path_token(keyword);
+    let basename_hit = is_token && components.next().is_some_and(matches_component);
+    let component_hit = basename_hit || is_token && components.any(matches_component);
 
     Some(BulkPathMatch {
         path,
@@ -254,14 +276,8 @@ fn exact_match_single_term<'a>(
         segment,
         position,
         insertions: InsertionVector::from_slice(&[evidence.insertions]),
-        exact_basename_component_phrase_present: exact_basename_component_phrase_present(
-            prepared.normalized(path),
-            &[keyword.to_string()],
-        ),
-        exact_component_phrase_present: exact_component_phrase_present(
-            prepared.normalized(path),
-            &[keyword.to_string()],
-        ),
+        exact_basename_component_phrase_present: basename_hit,
+        exact_component_phrase_present: component_hit,
         exact_phrase_present: evidence.exact_token_prefix,
         exact_subphrase_counts_vector: Vec::new(),
         exact_coverage: usize::from(!evidence.compound),
@@ -379,6 +395,35 @@ impl HasBulkOrder for BulkPathMatch<'_> {
 mod tests {
     use super::*;
     use crate::path::literal::{compare_exact_path_matches, exact_match as regular_exact_match};
+
+    #[test]
+    fn single_term_component_flags_preserve_token_boundaries() {
+        for path in [
+            "/a/.app/",
+            "/app/bin",
+            "/a/.app-bin",
+            "/a/a.app",
+            "/a/\u{2003}app_",
+        ] {
+            for term in ["app", "a", ".app", "app-bin", "/a"] {
+                let terms = [term.to_owned()];
+                let Some(rank) = exact_match(path, &terms, 0.0) else {
+                    continue;
+                };
+                let normalized = normalize_path(path);
+                assert_eq!(
+                    rank.exact_basename_component_phrase_present,
+                    exact_basename_component_phrase_present(&normalized, &terms),
+                    "{path} {term}"
+                );
+                assert_eq!(
+                    rank.exact_component_phrase_present,
+                    exact_component_phrase_present(&normalized, &terms),
+                    "{path} {term}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn preserves_path_exact_ordering() {
